@@ -1,16 +1,18 @@
 {
-  "name": "m3u8-video-proxy",
+  "name": "coursatk-downloader-server",
   "version": "1.0.0",
-  "description": "Fast M3U8/HLS video proxy",
+  "description": "سيرفر تحميل فيديوهات كورساتك مع لوحة تحكم",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "express": "^4.21.2",
-    "node-fetch": "^2.7.0"
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.2",
+    "crypto-js": "^4.2.0",
+    "m3u8-parser": "^6.0.0",
+    "fs-extra": "^11.2.0",
+    "ws": "^8.14.2"
   }
 }
