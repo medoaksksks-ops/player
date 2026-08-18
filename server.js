@@ -277,14 +277,9 @@ app.get('/dashboard', (req, res) => {
                         let statusClass = 'info';
                         if (log.status === 'success') statusClass = 'success';
                         if (log.status === 'error') statusClass = 'error';
-                        return \`
-                            <div class="log-item \${statusClass}">
-                                <span class="log-time">[\${new Date(log.timestamp).toLocaleTimeString('ar-EG')}]</span>
-                                <span class="log-video">الفيديو #\${log.videoId}</span>
-                                - <span class="log-message">\${log.message}</span>
-                                \${log.dataSize ? \` <span style="color: #4CAF50;">(\${(log.dataSize / 1024 / 1024).toFixed(2)} MB)</span>\` : ''}
-                            </div>
-                        \`;
+                        const size = log.dataSize ? ` <span style="color: #4CAF50;">(${(log.dataSize / 1024 / 1024).toFixed(2)} MB)</span>` : '';
+                        const time = new Date(log.timestamp).toLocaleTimeString('ar-EG');
+                        return `<div class="log-item ${statusClass}"><span class="log-time">[${time}]</span><span class="log-video">الفيديو #${log.videoId}</span> - <span class="log-message">${log.message}</span>${size}</div>`;
                     }).join('')
                 }
             </div>
@@ -534,4 +529,3 @@ process.on('SIGTERM', () => {
         process.exit(0);
     });
 });
-            
