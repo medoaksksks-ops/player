@@ -2,7 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const axios = require('axios');
-require('dotenv').config();
+
+// اختياري للتطوير المحلي فقط
+try {
+    require('dotenv').config();
+} catch (e) {
+    // Railway توفر المتغيرات تلقائياً
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -258,4 +264,4 @@ process.on('SIGTERM', () => {
         process.exit(0);
     });
 });
-            
+                               
