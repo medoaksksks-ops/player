@@ -29,7 +29,7 @@ const MAX_CONCURRENT = 5;
 const TEST_SEGMENTS = 5;
 const CHUNK_TIMEOUT = 20000;
 const JOB_RETENTION_MS = 60 * 60 * 1000;
-const APP_VERSION = 'v4.0 • TEST-5';
+const APP_VERSION = 'v4.0 TEST-5';
 
 // إنشاء المجلدات
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
