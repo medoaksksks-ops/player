@@ -25,8 +25,31 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const PORT = process.env.PORT || 3000;
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 const TEMP_DIR = path.join(__dirname, 'temp');
-const MAX_CONCURRENT = 5;
-const CHUNK_TIMEOUT = 10000;
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT || 5));
+const CHUNK_TIMEOUT = Math.max(5000, Number(process.env.CHUNK_TIMEOUT || 20000));
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+const MAX_JSON_SIZE = 10 * 1024 * 1024;
+
+function decodeBuffer(value) {
+    if (Buffer.isBuffer(value)) return value;
+    if (Array.isArray(value)) return Buffer.from(value);
+    if (typeof value !== 'string') return Buffer.from(value || []);
+
+    if (/^[0-9a-fA-F]+$/.test(value) && value.length % 2 === 0) {
+        try { return Buffer.from(value, 'hex'); } catch (_) {}
+    }
+
+    try {
+        const decoded = Buffer.from(value, 'base64');
+        if (decoded.length > 0) return decoded;
+    } catch (_) {}
+
+    return Buffer.from(value);
+}
+
+function safeFilename(name) {
+    return path.basename(String(name || '')).replace(/[^a-zA-Z0-9._-]/g, '_');
+}
 
 // إنشاء المجلدات
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -35,7 +58,7 @@ if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 // إعداد رفع الملفات
 const upload = multer({ 
     storage: multer.memoryStorage(),
-    limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+    limits: { fileSize: MAX_JSON_SIZE } // 10MB
 });
 
 // =========================================================
@@ -49,8 +72,8 @@ class VideoProcessor {
         this.videoId = data.videoId;
         this.segments = data.segments || [];
         this.token = data.token;
-        this.wrappedKey = data.wrappedKey.data;
-        this.iv = data.iv.data;
+        this.wrappedKey = data.wrappedKey?.data ?? data.wrappedKey;
+        this.iv = data.iv?.data ?? data.iv;
         
         this.progress = 0;
         this.status = 'initializing';
@@ -143,8 +166,16 @@ class VideoProcessor {
         this.log(`🔐 فك التشفير...`);
         this.setProgress(82, 'decrypting', 'فك التشفير');
         
-        const key = Buffer.from(this.wrappedKey);
-        const iv = Buffer.from(this.iv);
+        const key = decodeBuffer(this.wrappedKey);
+        const iv = decodeBuffer(this.iv);
+
+        if (key.length !== 16) {
+            throw new Error(`مفتاح AES غير صالح: المتوقع 16 بايت، الموجود ${key.length}`);
+        }
+        if (iv.length !== 16) {
+            throw new Error(`IV غير صالح: المتوقع 16 بايت، الموجود ${iv.length}`);
+        }
+
         const decryptedSegments = [];
         
         for (let i = 0; i < this.total; i++) {
@@ -203,6 +234,16 @@ class VideoProcessor {
 
     async process() {
         try {
+            if (!Array.isArray(this.segments) || this.segments.length === 0) {
+                throw new Error('لا توجد مقاطع فيديو في ملف JSON');
+            }
+            if (!this.token) {
+                throw new Error('Token غير موجود في ملف JSON');
+            }
+            if (this.wrappedKey == null || this.iv == null) {
+                throw new Error('بيانات المفتاح أو IV غير موجودة في ملف JSON');
+            }
+
             await this.downloadSegmentsParallel();
             const decryptedSegments = await this.decryptSegments();
             await this.mergeSegments(decryptedSegments);
@@ -714,6 +755,10 @@ const dashboardHTML = `
 
                     if (!status.success) {
                         clearInterval(interval);
+                        const jobHTML = document.getElementById(\`job-\${jobId}\`);
+                        if (jobHTML) {
+                            jobHTML.innerHTML += \`<div class="error-message"><strong>❌ خطأ:</strong> \${status.error || 'تعذر العثور على المعالجة'}</div>\`;
+                        }
                         return;
                     }
 
@@ -750,7 +795,7 @@ const dashboardHTML = `
                 'failed': '❌ فشل'
             }[status.status] || status.status;
 
-            let elapsedTime = Math.floor((Date.now() - Date.now()) / 1000);
+            let elapsedTime = Number(status.elapsedTime || 0);
             let timeStr = \`\${Math.floor(elapsedTime / 60)}د \${elapsedTime % 60}ث\`;
 
             let html = \`
@@ -863,6 +908,16 @@ const dashboardHTML = `
 // المسارات
 // =========================================================
 
+// فحص صحة السيرفر
+app.get('/health', (req, res) => {
+    res.json({
+        success: true,
+        status: 'ok',
+        uptime: Math.floor(process.uptime()),
+        jobs: processingJobs.size
+    });
+});
+
 // الصفحة الرئيسية
 app.get('/', (req, res) => {
     res.send(dashboardHTML);
@@ -882,10 +937,24 @@ app.post('/api/upload', upload.single('jsonFile'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'ملف JSON غير صحيح' });
         }
 
-        if (!data.videoId || !data.segments || !data.token) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'البيانات ناقصة - تأكد من وجود videoId, segments, token' 
+        if (!data.videoId || !Array.isArray(data.segments) || data.segments.length === 0 || !data.token) {
+            return res.status(400).json({
+                success: false,
+                error: 'البيانات ناقصة - تأكد من وجود videoId, segments, token'
+            });
+        }
+
+        if (data.wrappedKey == null || data.iv == null) {
+            return res.status(400).json({
+                success: false,
+                error: 'البيانات ناقصة - wrappedKey و iv مطلوبان للمعالجة المصرح بها'
+            });
+        }
+
+        if (data.segments.some(s => typeof s !== 'string' || !/^https?:\/\//i.test(s))) {
+            return res.status(400).json({
+                success: false,
+                error: 'يوجد رابط مقطع غير صالح داخل segments'
             });
         }
 
@@ -901,14 +970,10 @@ app.post('/api/upload', upload.single('jsonFile'), async (req, res) => {
 
         // معالجة غير متزامنة
         processor.process()
-            .then(result => {
-                // Keep the job in memory so the browser can receive the
-                // final "completed" status and download URL.
+            .then(() => {
                 processor.log(`✅ اكتملت المعالجة`);
             })
             .catch(error => {
-                // Keep the failed job as well so the browser can display
-                // the actual error instead of receiving a 404.
                 processor.log(`❌ خطأ في المعالجة: ${error.message}`);
             });
 
@@ -959,10 +1024,11 @@ app.get('/api/status/:jobId', (req, res) => {
 // تحميل الملف
 app.get('/download/:filename', (req, res) => {
     try {
-        const filename = req.params.filename;
-        const filepath = path.join(DOWNLOADS_DIR, filename);
+        const filename = safeFilename(req.params.filename);
+        const filepath = path.resolve(DOWNLOADS_DIR, filename);
+        const downloadsRoot = path.resolve(DOWNLOADS_DIR);
 
-        if (!filepath.startsWith(DOWNLOADS_DIR)) {
+        if (!filepath.startsWith(downloadsRoot + path.sep)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -971,7 +1037,7 @@ app.get('/download/:filename', (req, res) => {
         }
 
         const stat = fs.statSync(filepath);
-        res.setHeader('Content-Type', 'video/mp2ts');
+        res.setHeader('Content-Type', 'video/mp2t');
         res.setHeader('Content-Length', stat.size);
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
@@ -1011,10 +1077,11 @@ app.get('/api/files', (req, res) => {
 // حذف الملف
 app.delete('/api/files/:filename', (req, res) => {
     try {
-        const filename = req.params.filename;
-        const filepath = path.join(DOWNLOADS_DIR, filename);
+        const filename = safeFilename(req.params.filename);
+        const filepath = path.resolve(DOWNLOADS_DIR, filename);
+        const downloadsRoot = path.resolve(DOWNLOADS_DIR);
 
-        if (!filepath.startsWith(DOWNLOADS_DIR)) {
+        if (!filepath.startsWith(downloadsRoot + path.sep)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
@@ -1029,6 +1096,46 @@ app.delete('/api/files/:filename', (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
+});
+
+// الاحتفاظ بالـ Job حتى تظهر النتيجة والرابط، ثم تنظيفه بعد ساعة
+setInterval(() => {
+    try {
+        const now = Date.now();
+
+        for (const [jobId, processor] of processingJobs.entries()) {
+            const finished =
+                processor.status === 'completed' ||
+                processor.status === 'failed';
+
+            if (finished && now - processor.startTime > JOB_RETENTION_MS) {
+                processingJobs.delete(jobId);
+            }
+        }
+    } catch (e) {
+        console.error('خطأ في تنظيف المعالجات:', e);
+    }
+}, 10 * 60 * 1000);
+
+// أخطاء الرفع والطلبات غير المعالجة
+app.use((err, req, res, next) => {
+    console.error('[EXPRESS ERROR]', err);
+
+    if (res.headersSent) return next(err);
+
+    if (err instanceof multer.MulterError) {
+        return res.status(400).json({
+            success: false,
+            error: err.code === 'LIMIT_FILE_SIZE'
+                ? 'ملف JSON أكبر من الحد المسموح (10MB)'
+                : err.message
+        });
+    }
+
+    res.status(500).json({
+        success: false,
+        error: err.message || 'حدث خطأ غير متوقع'
+    });
 });
 
 // =========================================================
@@ -1062,22 +1169,6 @@ setInterval(() => {
         console.error('خطأ في التنظيف:', e);
     }
 }, 24 * 60 * 60 * 1000);
-
-// تنظيف المعالجات المنتهية بعد ساعة، مع إبقاءها متاحة للواجهة أثناء المعالجة
-setInterval(() => {
-    try {
-        const now = Date.now();
-        for (const [jobId, processor] of processingJobs.entries()) {
-            const age = now - processor.startTime;
-            const finished = processor.status === 'completed' || processor.status === 'failed';
-            if (finished && age > 60 * 60 * 1000) {
-                processingJobs.delete(jobId);
-            }
-        }
-    } catch (e) {
-        console.error('خطأ في تنظيف المعالجات:', e);
-    }
-}, 10 * 60 * 1000);
 
 // بدء الخادم
 app.listen(PORT, () => {
