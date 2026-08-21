@@ -1,5 +1,5 @@
 /**
- * 🎬 Coursatk Video Decryption Server v3.0 - reference download mode
+ * 🎬 Coursatk Video Decryption Server v4.0 TEST-5
  * مع لوحة تحكم ويب كاملة
  * 
  * npm install
@@ -25,8 +25,11 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 const PORT = process.env.PORT || 3000;
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 const TEMP_DIR = path.join(__dirname, 'temp');
-const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT || 5));
-const CHUNK_TIMEOUT = 10000;
+const MAX_CONCURRENT = 5;
+const TEST_SEGMENTS = 5;
+const CHUNK_TIMEOUT = 20000;
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+const APP_VERSION = 'v4.0 • TEST-5';
 
 // إنشاء المجلدات
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -49,8 +52,11 @@ class VideoProcessor {
         this.videoId = data.videoId;
         this.segments = data.segments || [];
         this.token = data.token;
-        this.wrappedKey = data.wrappedKey.data;
-        this.iv = data.iv.data;
+        this.wrappedKey = data.wrappedKey?.data ?? data.wrappedKey;
+        this.iv = data.iv?.data ?? data.iv;
+
+        // TEST-5: only process the first five segments for this deployment.
+        this.segments = (data.segments || []).slice(0, TEST_SEGMENTS);
         
         this.progress = 0;
         this.status = 'initializing';
@@ -87,41 +93,25 @@ class VideoProcessor {
         }
     }
 
-    async downloadSegment(url, retries = 3) {
+    async downloadSegment(url, retries = 2) {
         for (let i = 0; i < retries; i++) {
             try {
-                // نفس نمط السكربت المرجعي: Bearer + الرابط الموقّع كما هو.
                 const response = await axios.get(url, {
-                    headers: {
-                        'Authorization': `Bearer ${this.token}`,
-                        'Accept': '*/*'
-                    },
+                    headers: { 'Authorization': `Bearer ${this.token}` },
                     responseType: 'arraybuffer',
-                    timeout: CHUNK_TIMEOUT,
-                    maxContentLength: Infinity,
-                    maxBodyLength: Infinity,
-                    validateStatus: status => status >= 200 && status < 300
+                    timeout: CHUNK_TIMEOUT
                 });
-
                 return Buffer.from(response.data);
             } catch (e) {
-                const status = e.response?.status;
-                const detail = status ? `HTTP ${status}` : e.code || e.message;
-
-                if (i === retries - 1) {
-                    throw new Error(`فشل تحميل المقطع بعد ${retries} محاولات: ${detail}`);
-                }
-
-                this.log(`⏳ المقطع فشل (${detail}) — إعادة المحاولة ${i + 2}/${retries}...`);
-                await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+                if (i === retries - 1) throw e;
+                this.log(`⏳ إعادة محاولة ${i + 2}/${retries}...`);
+                await new Promise(r => setTimeout(r, 500 * (i + 1)));
             }
         }
     }
 
     async downloadSegmentsParallel() {
         this.log(`📥 تحميل ${this.total} مقطع...`);
-        this.log(`🧪 اختبار التحميل: أول دفعة = ${Math.min(MAX_CONCURRENT, this.total)} مقاطع`);
-        if (this.segments[0]) this.log(`🔗 أول رابط: ${safeLogUrl(this.segments[0])}`);
         this.setProgress(5, 'downloading', 'تحميل المقاطع');
         
         for (let i = 0; i < this.total; i += MAX_CONCURRENT) {
@@ -186,7 +176,7 @@ class VideoProcessor {
         this.log(`🔄 دمج المقاطع...`);
         this.setProgress(93, 'merging', 'دمج الملفات');
         
-        this.fileName = `video_${this.videoId}_${Date.now()}.ts`;
+        this.fileName = `video_${this.videoId}_TEST5_${Date.now()}.ts`;
         const outputPath = path.join(DOWNLOADS_DIR, this.fileName);
 
         return new Promise((resolve, reject) => {
@@ -273,7 +263,7 @@ const dashboardHTML = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🎬 Coursatk Video Downloader</title>
+    <title>Video Studio • v4 TEST-5</title>
     <style>
         * {
             margin: 0;
@@ -281,82 +271,142 @@ const dashboardHTML = `
             box-sizing: border-box;
         }
 
+        :root {
+            --bg: #070b16;
+            --panel: #0f1728;
+            --panel-2: #111d31;
+            --line: rgba(255,255,255,.09);
+            --text: #eef4ff;
+            --muted: #8ea0bd;
+            --accent: #38bdf8;
+            --accent-2: #6366f1;
+            --ok: #22c55e;
+            --danger: #fb7185;
+        }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #0f0f1e 0%, #1a1a2e 100%);
-            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+            background:
+                radial-gradient(circle at 15% 0%, rgba(56,189,248,.15), transparent 28%),
+                radial-gradient(circle at 90% 10%, rgba(99,102,241,.18), transparent 30%),
+                var(--bg);
+            color: var(--text);
             min-height: 100vh;
-            padding: 20px;
+            padding: 18px;
         }
 
         .container {
-            max-width: 900px;
+            max-width: 980px;
             margin: 0 auto;
+        }
+
+        .topbar {
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            padding:14px 16px;
+            margin-bottom:18px;
+            background:rgba(15,23,40,.82);
+            border:1px solid var(--line);
+            border-radius:18px;
+            backdrop-filter:blur(16px);
+            position:sticky;
+            top:10px;
+            z-index:10;
+        }
+
+        .brand {
+            display:flex;
+            align-items:center;
+            gap:11px;
+            font-weight:800;
+        }
+
+        .brand-icon {
+            width:38px;
+            height:38px;
+            display:grid;
+            place-items:center;
+            border-radius:12px;
+            background:linear-gradient(135deg,var(--accent),var(--accent-2));
+            box-shadow:0 8px 30px rgba(56,189,248,.2);
+        }
+
+        .version {
+            font-size:11px;
+            color:#dbeafe;
+            background:rgba(56,189,248,.10);
+            border:1px solid rgba(56,189,248,.25);
+            padding:7px 10px;
+            border-radius:999px;
+            white-space:nowrap;
         }
 
         .header {
             text-align: center;
-            margin-bottom: 30px;
+            margin: 22px 0 26px;
         }
 
         .header h1 {
             font-size: 32px;
             margin-bottom: 10px;
-            background: linear-gradient(135deg, #FF9800, #FFB74D);
+            background: linear-gradient(135deg, #38bdf8, #818cf8);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
 
         .header p {
-            color: #aaa;
+            color: var(--muted);
             font-size: 14px;
         }
 
         .card {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 20px;
-            backdrop-filter: blur(10px);
+            background: linear-gradient(180deg, rgba(17,29,49,.94), rgba(15,23,40,.88));
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            padding: 22px;
+            margin-bottom: 18px;
+            box-shadow: 0 20px 55px rgba(0,0,0,.24);
+            backdrop-filter: blur(14px);
         }
 
         .upload-section h2 {
             font-size: 18px;
             margin-bottom: 16px;
-            color: #FFB74D;
+            color: #c9eaff;
         }
 
         .upload-area {
-            border: 2px dashed #FF9800;
+            border: 1.5px dashed rgba(56,189,248,.55);
             border-radius: 12px;
             padding: 40px;
             text-align: center;
             cursor: pointer;
             transition: all 0.3s;
-            background: rgba(255, 152, 0, 0.05);
+            background: rgba(56,189,248,.045);
         }
 
         .upload-area:hover {
             background: rgba(255, 152, 0, 0.1);
-            border-color: #FFB74D;
+            border-color: #c9eaff;
         }
 
         .upload-area.dragover {
             background: rgba(255, 152, 0, 0.2);
-            border-color: #FFB74D;
+            border-color: #c9eaff;
         }
 
         .upload-area p {
             font-size: 14px;
-            color: #aaa;
+            color: var(--muted);
             margin: 10px 0;
         }
 
         .upload-area strong {
             font-size: 16px;
-            color: #FFB74D;
+            color: #c9eaff;
             display: block;
             margin-bottom: 10px;
         }
@@ -377,9 +427,10 @@ const dashboardHTML = `
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, #FF9800, #F57C00);
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
             color: white;
             width: 100%;
+            box-shadow: 0 10px 30px rgba(56,189,248,.16);
         }
 
         .btn-primary:hover:not(:disabled) {
@@ -417,7 +468,7 @@ const dashboardHTML = `
         .job-section h2 {
             font-size: 18px;
             margin-bottom: 16px;
-            color: #FFB74D;
+            color: #c9eaff;
         }
 
         .job-card {
@@ -437,7 +488,7 @@ const dashboardHTML = `
 
         .job-title {
             font-weight: bold;
-            color: #FFB74D;
+            color: #c9eaff;
         }
 
         .job-status {
@@ -495,7 +546,7 @@ const dashboardHTML = `
 
         .job-info {
             font-size: 12px;
-            color: #aaa;
+            color: var(--muted);
             display: grid;
             grid-template-columns: 1fr 1fr 1fr;
             gap: 12px;
@@ -503,7 +554,7 @@ const dashboardHTML = `
         }
 
         .job-info-item strong {
-            color: #FFB74D;
+            color: #c9eaff;
             display: block;
             font-size: 13px;
         }
@@ -540,7 +591,7 @@ const dashboardHTML = `
         .files-section h2 {
             font-size: 18px;
             margin-bottom: 16px;
-            color: #FFB74D;
+            color: #c9eaff;
         }
 
         .file-item {
@@ -557,7 +608,7 @@ const dashboardHTML = `
         .file-name {
             flex: 1;
             font-size: 13px;
-            color: #aaa;
+            color: var(--muted);
             word-break: break-all;
         }
 
@@ -588,9 +639,16 @@ const dashboardHTML = `
 </head>
 <body>
     <div class="container">
+        <div class="topbar">
+            <div class="brand">
+                <div class="brand-icon">▶</div>
+                <div>Video Studio</div>
+            </div>
+            <div class="version">LIVE • ${APP_VERSION}</div>
+        </div>
         <!-- الرأس -->
         <div class="header">
-            <h1>🎬 Coursatk Video Downloader</h1>
+            <h1>Video Studio</h1>
             <p>السيرفر يقوم بالتحميل وفك التشفير - موبايلك آمان 100%</p>
         </div>
 
@@ -730,6 +788,10 @@ const dashboardHTML = `
 
                     if (!status.success) {
                         clearInterval(interval);
+                        const jobHTML = document.getElementById(\`job-\${jobId}\`);
+                        if (jobHTML) {
+                            jobHTML.innerHTML = '<div class="error-message"><strong>❌ خطأ:</strong> ' + (status.error || 'تعذر قراءة حالة المعالجة') + '</div>';
+                        }
                         return;
                     }
 
@@ -766,7 +828,7 @@ const dashboardHTML = `
                 'failed': '❌ فشل'
             }[status.status] || status.status;
 
-            let elapsedTime = Math.floor((Date.now() - Date.now()) / 1000);
+            let elapsedTime = 0;
             let timeStr = \`\${Math.floor(elapsedTime / 60)}د \${elapsedTime % 60}ث\`;
 
             let html = \`
@@ -881,6 +943,12 @@ const dashboardHTML = `
 
 // الصفحة الرئيسية
 app.get('/', (req, res) => {
+    res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+        'X-App-Version': APP_VERSION
+    });
     res.send(dashboardHTML);
 });
 
@@ -898,10 +966,17 @@ app.post('/api/upload', upload.single('jsonFile'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'ملف JSON غير صحيح' });
         }
 
-        if (!data.videoId || !data.segments || !data.token) {
-            return res.status(400).json({ 
-                success: false, 
-                error: 'البيانات ناقصة - تأكد من وجود videoId, segments, token' 
+        if (!data.videoId || !Array.isArray(data.segments) || data.segments.length === 0 || !data.token) {
+            return res.status(400).json({
+                success: false,
+                error: 'البيانات ناقصة - تأكد من وجود videoId, segments, token'
+            });
+        }
+
+        if (data.wrappedKey == null || data.iv == null) {
+            return res.status(400).json({
+                success: false,
+                error: 'بيانات المفتاح أو IV غير موجودة في ملف JSON'
             });
         }
 
@@ -917,14 +992,10 @@ app.post('/api/upload', upload.single('jsonFile'), async (req, res) => {
 
         // معالجة غير متزامنة
         processor.process()
-            .then(result => {
-                // Keep the job in memory so the browser can receive the
-                // final "completed" status and download URL.
+            .then(() => {
                 processor.log(`✅ اكتملت المعالجة`);
             })
             .catch(error => {
-                // Keep the failed job as well so the browser can display
-                // the actual error instead of receiving a 404.
                 processor.log(`❌ خطأ في المعالجة: ${error.message}`);
             });
 
@@ -975,7 +1046,7 @@ app.get('/api/status/:jobId', (req, res) => {
 // تحميل الملف
 app.get('/download/:filename', (req, res) => {
     try {
-        const filename = req.params.filename;
+        const filename = path.basename(req.params.filename);
         const filepath = path.join(DOWNLOADS_DIR, filename);
 
         if (!filepath.startsWith(DOWNLOADS_DIR)) {
@@ -987,7 +1058,7 @@ app.get('/download/:filename', (req, res) => {
         }
 
         const stat = fs.statSync(filepath);
-        res.setHeader('Content-Type', 'video/mp2ts');
+        res.setHeader('Content-Type', 'video/mp2t');
         res.setHeader('Content-Length', stat.size);
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
@@ -1027,7 +1098,7 @@ app.get('/api/files', (req, res) => {
 // حذف الملف
 app.delete('/api/files/:filename', (req, res) => {
     try {
-        const filename = req.params.filename;
+        const filename = path.basename(req.params.filename);
         const filepath = path.join(DOWNLOADS_DIR, filename);
 
         if (!filepath.startsWith(DOWNLOADS_DIR)) {
@@ -1078,22 +1149,6 @@ setInterval(() => {
         console.error('خطأ في التنظيف:', e);
     }
 }, 24 * 60 * 60 * 1000);
-
-// تنظيف المعالجات المنتهية بعد ساعة، مع إبقاءها متاحة للواجهة أثناء المعالجة
-setInterval(() => {
-    try {
-        const now = Date.now();
-        for (const [jobId, processor] of processingJobs.entries()) {
-            const age = now - processor.startTime;
-            const finished = processor.status === 'completed' || processor.status === 'failed';
-            if (finished && age > 60 * 60 * 1000) {
-                processingJobs.delete(jobId);
-            }
-        }
-    } catch (e) {
-        console.error('خطأ في تنظيف المعالجات:', e);
-    }
-}, 10 * 60 * 1000);
 
 // بدء الخادم
 app.listen(PORT, () => {
