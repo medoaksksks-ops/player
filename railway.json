@@ -4,7 +4,7 @@
     "builder": "dockerfile"
   },
   "deploy": {
-    "startCommand": "node server_v2_with_dashboard.js",
+    "startCommand": "node server.js",
     "restartPolicyMaxRetries": 5,
     "restartPolicyWindowMs": 60000
   }
