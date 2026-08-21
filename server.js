@@ -70,7 +70,9 @@ class VideoProcessor {
     constructor(jobId, data) {
         this.jobId = jobId;
         this.videoId = data.videoId;
-        this.segments = data.segments || [];
+        this.sourceTotal = Array.isArray(data.segments) ? data.segments.length : 0;
+        // اختبار الإصدار: تحميل أول 5 مقاطع فقط.
+        this.segments = (data.segments || []).slice(0, 5);
         this.token = data.token;
         this.wrappedKey = data.wrappedKey?.data ?? data.wrappedKey;
         this.iv = data.iv?.data ?? data.iv;
@@ -113,10 +115,14 @@ class VideoProcessor {
     async downloadSegment(url, retries = 2) {
         for (let i = 0; i < retries; i++) {
             try {
+                // Use the signed segment URL exactly as supplied by the authorized source.
+                // Do not manufacture browser identity headers or override its per-segment token.
                 const response = await axios.get(url, {
-                    headers: { 'Authorization': `Bearer ${this.token}` },
                     responseType: 'arraybuffer',
-                    timeout: CHUNK_TIMEOUT
+                    timeout: CHUNK_TIMEOUT,
+                    maxContentLength: Infinity,
+                    maxBodyLength: Infinity,
+                    validateStatus: status => status >= 200 && status < 300
                 });
                 return Buffer.from(response.data);
             } catch (e) {
@@ -128,8 +134,8 @@ class VideoProcessor {
     }
 
     async downloadSegmentsParallel() {
-        this.log(`📥 تحميل ${this.total} مقطع...`);
-        this.setProgress(5, 'downloading', 'تحميل المقاطع');
+        this.log(`🧪 إصدار v2 - اختبار: تحميل ${this.total} من أصل ${this.sourceTotal} مقطع...`);
+        this.setProgress(5, 'downloading', `تحميل أول ${this.total} مقاطع (اختبار)`);
         
         for (let i = 0; i < this.total; i += MAX_CONCURRENT) {
             const batch = [];
@@ -201,7 +207,7 @@ class VideoProcessor {
         this.log(`🔄 دمج المقاطع...`);
         this.setProgress(93, 'merging', 'دمج الملفات');
         
-        this.fileName = `video_${this.videoId}_${Date.now()}.ts`;
+        this.fileName = `server_pro_v2_test5_video_${this.videoId}_${Date.now()}.ts`;
         const outputPath = path.join(DOWNLOADS_DIR, this.fileName);
 
         return new Promise((resolve, reject) => {
@@ -236,6 +242,9 @@ class VideoProcessor {
         try {
             if (!Array.isArray(this.segments) || this.segments.length === 0) {
                 throw new Error('لا توجد مقاطع فيديو في ملف JSON');
+            }
+            if (this.sourceTotal < 5) {
+                this.log(`⚠️ الملف يحتوي على ${this.sourceTotal} مقاطع فقط؛ سيتم اختبار المتاح.`);
             }
             if (!this.token) {
                 throw new Error('Token غير موجود في ملف JSON');
