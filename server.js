@@ -902,12 +902,14 @@ app.post('/api/upload', upload.single('jsonFile'), async (req, res) => {
         // معالجة غير متزامنة
         processor.process()
             .then(result => {
-                processingJobs.delete(jobId);
+                // Keep the job in memory so the browser can receive the
+                // final "completed" status and download URL.
                 processor.log(`✅ اكتملت المعالجة`);
             })
             .catch(error => {
-                processingJobs.delete(jobId);
-                processor.log(`❌ خطأ في المعالجة`);
+                // Keep the failed job as well so the browser can display
+                // the actual error instead of receiving a 404.
+                processor.log(`❌ خطأ في المعالجة: ${error.message}`);
             });
 
         res.json({
@@ -1060,6 +1062,22 @@ setInterval(() => {
         console.error('خطأ في التنظيف:', e);
     }
 }, 24 * 60 * 60 * 1000);
+
+// تنظيف المعالجات المنتهية بعد ساعة، مع إبقاءها متاحة للواجهة أثناء المعالجة
+setInterval(() => {
+    try {
+        const now = Date.now();
+        for (const [jobId, processor] of processingJobs.entries()) {
+            const age = now - processor.startTime;
+            const finished = processor.status === 'completed' || processor.status === 'failed';
+            if (finished && age > 60 * 60 * 1000) {
+                processingJobs.delete(jobId);
+            }
+        }
+    } catch (e) {
+        console.error('خطأ في تنظيف المعالجات:', e);
+    }
+}, 10 * 60 * 1000);
 
 // بدء الخادم
 app.listen(PORT, () => {
