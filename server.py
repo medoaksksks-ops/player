@@ -338,5 +338,56 @@ def health():
     return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
 
 
+# =========================================================
+# اختبار سريع مباشر (بالباسورد بس، من غير تسجيل دخول أو PIN)
+# =========================================================
+@app.route("/debug/subjects/<int:year_id>", methods=["GET"])
+def debug_subjects(year_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/user/subjects/{year_id}")
+    return jsonify(body), status
+
+
+@app.route("/debug/subjects/<int:subject_id>/teachers", methods=["GET"])
+def debug_teachers(subject_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/user/subjects/{subject_id}/teachers")
+    return jsonify(body), status
+
+
+@app.route("/debug/teachers/<int:teacher_id>/chapters", methods=["GET"])
+def debug_chapters(teacher_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/user/teachers/{teacher_id}/chapters")
+    return jsonify(body), status
+
+
+@app.route("/debug/chapters/<int:chapter_id>/lectures", methods=["GET"])
+def debug_lectures(chapter_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/user/chapters/{chapter_id}/lectures")
+    return jsonify(body), status
+
+
+@app.route("/debug/lectures/<int:lecture_id>/content", methods=["GET"])
+def debug_content(lecture_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/user/lectures/{lecture_id}/content")
+    return jsonify(body), status
+
+
+@app.route("/debug/video/<int:video_id>/platforms", methods=["GET"])
+def debug_video_platforms(video_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_get(f"/video/{video_id}/platforms")
+    return jsonify(body), status
+
+
 if __name__ == "__main__":
     app.run(debug=True)
