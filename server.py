@@ -384,6 +384,23 @@ def admin_update_token():
 
 
 # =========================================================
+# الأدمن: فحص الاتصال
+# =========================================================
+@app.route("/admin/ping", methods=["GET", "OPTIONS"])
+def admin_ping():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    token = get_coursatk_token()
+    return jsonify({
+        "success": True,
+        "coursatk_token_saved": bool(token),
+        "token_length": len(token) if token else 0
+    })
+
+
+# =========================================================
 # الأدمن: إدارة الطلاب
 # =========================================================
 @app.route("/admin/students", methods=["GET"])
@@ -499,14 +516,45 @@ def health():
 
 
 # =========================================================
+# الأدمن: إنشاء جلسة تشغيل من Coursatk
+# =========================================================
+@app.route("/admin/video/<int:video_id>/play", methods=["GET", "OPTIONS"])
+def admin_play_video(video_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    body, status = coursatk_post(f"/video/{video_id}/stream-weave/play")
+    return jsonify(body), status
+
+
+# =========================================================
 # اختبار سريع مباشر (بالباسورد بس، من غير تسجيل دخول أو PIN)
 # =========================================================
+@app.route("/admin/subjects/<int:year_id>", methods=["GET", "OPTIONS"])
+def admin_debug_subjects(year_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_subjects(year_id)
+
+
 @app.route("/debug/subjects/<int:year_id>", methods=["GET"])
 def debug_subjects(year_id):
     if not check_admin(request):
         return jsonify({"success": False, "message": "باسورد غلط"}), 401
     body, status = coursatk_get(f"/user/subjects/{year_id}")
     return jsonify(body), status
+
+
+@app.route("/admin/subjects/<int:subject_id>/teachers", methods=["GET", "OPTIONS"])
+def admin_debug_teachers(subject_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_teachers(subject_id)
 
 
 @app.route("/debug/subjects/<int:subject_id>/teachers", methods=["GET"])
@@ -517,12 +565,30 @@ def debug_teachers(subject_id):
     return jsonify(body), status
 
 
+@app.route("/admin/teachers/<int:teacher_id>/chapters", methods=["GET", "OPTIONS"])
+def admin_debug_chapters(teacher_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_chapters(teacher_id)
+
+
 @app.route("/debug/teachers/<int:teacher_id>/chapters", methods=["GET"])
 def debug_chapters(teacher_id):
     if not check_admin(request):
         return jsonify({"success": False, "message": "باسورد غلط"}), 401
     body, status = coursatk_get(f"/user/teachers/{teacher_id}/chapters")
     return jsonify(body), status
+
+
+@app.route("/admin/chapters/<int:chapter_id>/lectures", methods=["GET", "OPTIONS"])
+def admin_debug_lectures(chapter_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_lectures(chapter_id)
 
 
 @app.route("/debug/chapters/<int:chapter_id>/lectures", methods=["GET"])
@@ -533,12 +599,30 @@ def debug_lectures(chapter_id):
     return jsonify(body), status
 
 
+@app.route("/admin/lectures/<int:lecture_id>/content", methods=["GET", "OPTIONS"])
+def admin_debug_content(lecture_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_content(lecture_id)
+
+
 @app.route("/debug/lectures/<int:lecture_id>/content", methods=["GET"])
 def debug_content(lecture_id):
     if not check_admin(request):
         return jsonify({"success": False, "message": "باسورد غلط"}), 401
     body, status = coursatk_get(f"/user/lectures/{lecture_id}/content")
     return jsonify(body), status
+
+
+@app.route("/admin/video/<int:video_id>/platforms", methods=["GET", "OPTIONS"])
+def admin_debug_video_platforms(video_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return debug_video_platforms(video_id)
 
 
 @app.route("/debug/video/<int:video_id>/platforms", methods=["GET"])
@@ -550,4 +634,4 @@ def debug_video_platforms(video_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
