@@ -154,7 +154,7 @@ def login():
 # =========================================================
 # تشغيل الفيديو - Stream Weave Integration
 # =========================================================
-STREAM_WEAVE_BASE = "https://suo4.floravon.shop"  # Host اللي بيرد السيجمنتس مباشرة
+STREAM_WEAVE_BASE = "https://api.stream-weave.com"
 
 def coursatk_post(path, data=None):
     """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
@@ -204,45 +204,6 @@ def stream_weave_request(method, path, data=None, token=None):
         return {"success": False, "message": str(e)}, 502
 
 
-def rewrite_manifest_urls(manifest_content, base_path="/stream/segment"):
-    """
-    تعديل روابط السيجمنتس في الـ M3U8 بحيث تروح عبر السيرفر بتاعنا
-    بدل ما تروح مباشرة لـ Stream Weave
-    """
-    import re
-    
-    lines = manifest_content.split('\n')
-    new_lines = []
-    
-    for line in lines:
-        # تخطي التعليقات والـ tags
-        if line.startswith('#'):
-            new_lines.append(line)
-            continue
-        
-        # إذا كان الـ line عبارة عن URL للسيجمنت
-        if line.strip() and not line.startswith('#'):
-            # إذا كانت بداية الـ line بـ http أو / (مسار مطلق)
-            if line.startswith('http'):
-                # استخرج اسم الملف من الـ URL
-                match = re.search(r'/([^/?#]+)(?:\?.*)?$', line)
-                if match:
-                    filename = match.group(1)
-                    query = re.search(r'(\?[^#]*)', line)
-                    query_str = query.group(1) if query else ""
-                    # نقل الـ URL ليروح عبر السيرفر
-                    new_line = f"{base_path}/{filename}{query_str}"
-                    new_lines.append(new_line)
-                else:
-                    new_lines.append(line)
-            else:
-                new_lines.append(line)
-        else:
-            new_lines.append(line)
-    
-    return '\n'.join(new_lines)
-
-
 @app.route("/video/<int:video_id>/play", methods=["GET"])
 def play_video(video_id):
     """تشغيل الفيديو - بيرجع stream URL و token و كل البيانات المطلوبة"""
@@ -250,7 +211,7 @@ def play_video(video_id):
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
 
-    # 1. طلب stream-weave/play من كورساتك (بس عشان نحصل على البيانات)
+    # 1. طلب stream-weave/play من كورساتك
     play_body, play_status = coursatk_post(f"/video/{video_id}/stream-weave/play")
     
     if play_status != 200:
@@ -260,12 +221,6 @@ def play_video(video_id):
         return jsonify(play_body), 400
     
     stream_data = play_body.get("data", {})
-    
-    # 2. تعديل الـ manifestUrl بحيث يروح عبر السيرفر بتاعنا
-    # (بدل ما يروح مباشرة لـ Stream Weave)
-    original_manifest = stream_data.get("manifestUrl", "")
-    if original_manifest:
-        stream_data["manifestUrl"] = f"/stream/manifest/{video_id}"
     stream_token = stream_data.get("token")
     
     if not stream_token:
@@ -558,115 +513,6 @@ def admin_delete_device(student_id, device_id):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
-
-
-# =========================================================
-# جلب السيجمنتس والمانيفستس مباشرة من Stream Weave
-# =========================================================
-@app.route("/stream/manifest/<int:video_id>", methods=["GET"])
-def get_manifest(video_id):
-    """بيجيب الـ manifest (M3U8) مباشرة من Stream Weave"""
-    student = get_valid_session(request)
-    if not student:
-        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-    
-    # طلب الـ manifest من Coursatk (ده فيه التوكن الحقيقي)
-    body, status = coursatk_post(f"/video/{video_id}/stream-weave/manifest")
-    
-    if status != 200:
-        return jsonify(body), status
-    
-    if not body.get("success"):
-        return jsonify(body), 400
-    
-    manifest_data = body.get("data", {})
-    manifest_url = manifest_data.get("manifestUrl", "")
-    stream_token = manifest_data.get("token", "")
-    
-    if not manifest_url:
-        return jsonify({"success": False, "message": "ما في manifest URL"}), 500
-    
-    # طلب الـ manifest من Stream Weave
-    headers = {}
-    if stream_token:
-        headers["authorization"] = f"Bearer {stream_token}"
-    
-    try:
-        r = requests.get(manifest_url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            # معالجة المانيفست: تبديل روابط السيجمنتس لتروح عبر السيرفر
-            manifest_content = r.text
-            rewritten_manifest = rewrite_manifest_urls(manifest_content, f"/stream/segment")
-            return rewritten_manifest, 200, {"Content-Type": "application/vnd.apple.mpegurl"}
-        else:
-            return jsonify({"success": False, "message": f"Stream Weave returned {r.status_code}"}), r.status_code
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 502
-
-
-@app.route("/stream/segment/<path:segment_path>", methods=["GET"])
-def get_segment(segment_path):
-    """بيجيب السيجمنت (TS أو WOFF2 أو أي حاجة تانية) مباشرة من Stream Weave"""
-    student = get_valid_session(request)
-    if not student:
-        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-    
-    # الـ query params (expires, token)
-    query_string = request.query_string.decode('utf-8')
-    
-    # بناء الـ URL الكامل
-    segment_url = f"{STREAM_WEAVE_BASE}/{segment_path}"
-    if query_string:
-        segment_url += f"?{query_string}"
-    
-    try:
-        # طلب السيجمنت من Stream Weave بدون أي توكن (الـ expires و token في الـ URL نفسه)
-        r = requests.get(segment_url, timeout=15, stream=True)
-        
-        if r.status_code == 200:
-            # فوّت المحتوى للكلايينت
-            return r.content, 200, {
-                "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-                "Content-Length": r.headers.get("Content-Length", ""),
-                "Cache-Control": "public, max-age=31536000",  # كاش لمدة سنة
-            }
-        else:
-            return jsonify({"success": False, "message": f"Stream Weave returned {r.status_code}"}), r.status_code
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 502
-
-
-@app.route("/stream/proxy", methods=["GET"])
-def proxy_stream_request():
-    """
-    Proxy عام لأي طلب من Stream Weave
-    params: url, token (optional)
-    """
-    student = get_valid_session(request)
-    if not student:
-        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-    
-    target_url = request.args.get("url")
-    token = request.args.get("token")
-    
-    if not target_url:
-        return jsonify({"success": False, "message": "URL مفقود"}), 400
-    
-    # تأكد إن الـ URL بتاع Stream Weave بالفعل
-    if not target_url.startswith("https://suo4.floravon.shop"):
-        return jsonify({"success": False, "message": "URL مش من Stream Weave"}), 403
-    
-    headers = {}
-    if token:
-        headers["authorization"] = f"Bearer {token}"
-    
-    try:
-        r = requests.get(target_url, headers=headers, timeout=15, stream=True)
-        return r.content, r.status_code, {
-            "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-        }
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 502
 
 
 # =========================================================
