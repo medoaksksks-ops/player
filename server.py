@@ -1,0 +1,342 @@
+"""
+سيرفر كورساتك - مستقل تماماً، مالوش أي علاقة بأي منصة تانية
+================================================================
+الفكرة:
+- الأدمن بيحط توكن الـ JWT بتاع كورساتك مرة واحدة في السيرفر (مش في المتصفح)
+- الطالب يدخل PIN -> يرجع Session Token خاص بيه
+- أي طلب بعد كده (مواد / مدرسين / شهور / محاضرات / فيديو) بيعدي من عندنا،
+  إحنا اللي بنكلم كورساتك بالتوكن الحقيقي، والطالب مايشوفش التوكن ده خالص
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import firebase_admin
+from firebase_admin import credentials, db
+import requests
+import time
+import os
+import json
+import secrets
+
+app = Flask(__name__)
+CORS(app)
+
+# =========================================================
+ADMIN_PASSWORD = "Coursatk#2026$Secure!Panel77"
+DATABASE_URL = "https://english-73376-default-rtdb.firebaseio.com"
+SERVICE_ACCOUNT_PATH = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+
+COURSATK_BASE = "https://api.coursatk.online/api/v1"
+
+# كل بيانات المنصة دي تحت مسار واحد منفصل خالص في قاعدة البيانات
+NODE_STUDENTS = "coursatk_students"
+NODE_CONFIG = "coursatk_config"
+NODE_SESSIONS = "coursatk_sessions"
+# =========================================================
+
+firebase_env_creds = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+if firebase_env_creds:
+    cred = credentials.Certificate(json.loads(firebase_env_creds))
+else:
+    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+
+firebase_admin.initialize_app(cred, {"databaseURL": DATABASE_URL})
+
+
+def check_admin(req):
+    return req.headers.get("X-Admin-Password", "") == ADMIN_PASSWORD
+
+
+def get_session_token(req):
+    auth = req.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return None
+
+
+def get_valid_session(req):
+    """يتحقق من الـ session token ويرجع بيانات الطالب لو صحيح، وإلا None"""
+    token = get_session_token(req)
+    if not token:
+        return None
+    session = db.reference(f"{NODE_SESSIONS}/{token}").get()
+    if not session:
+        return None
+    student_id = session.get("studentId")
+    student = db.reference(f"{NODE_STUDENTS}/{student_id}").get()
+    if not student or not student.get("active", True):
+        db.reference(f"{NODE_SESSIONS}/{token}").delete()
+        return None
+    return student
+
+
+def get_coursatk_token():
+    config = db.reference(NODE_CONFIG).get() or {}
+    return config.get("token", "")
+
+
+def coursatk_get(path):
+    """بيبعت طلب لكورساتك بالتوكن المخزن عندنا، ويرجع (json_body, status_code)"""
+    token = get_coursatk_token()
+    if not token:
+        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
+
+    headers = {
+        "authorization": f"Bearer {token}",
+        "accept": "*/*"
+    }
+    try:
+        r = requests.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=15)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return body, r.status_code
+    except Exception as e:
+        return {"success": False, "message": str(e)}, 502
+
+
+# =========================================================
+# الطالب: تسجيل الدخول
+# =========================================================
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    pin = str(data.get("pin", "")).strip()
+    device_id = str(data.get("deviceId", "")).strip()
+
+    if not pin or len(pin) != 6 or not pin.isdigit():
+        return jsonify({"success": False, "message": "الكود لازم يكون 6 أرقام"}), 400
+    if not device_id:
+        return jsonify({"success": False, "message": "معرف الجهاز مفقود"}), 400
+
+    students = db.reference(NODE_STUDENTS).get() or {}
+    student_id, student = None, None
+    for sid, info in students.items():
+        if info.get("code") == pin:
+            student_id, student = sid, info
+            break
+
+    if not student:
+        return jsonify({"success": False, "message": "الكود غير صحيح"}), 404
+    if not student.get("active", True):
+        return jsonify({"success": False, "message": "هذا الحساب معطل"}), 403
+
+    devices = student.get("devices", {}) or {}
+    max_devices = student.get("maxDevices", 1)
+
+    if device_id in devices:
+        if isinstance(devices[device_id], dict) and devices[device_id].get("blocked"):
+            return jsonify({"success": False, "message": "تم حظر هذا الجهاز"}), 403
+    else:
+        if len(devices) >= max_devices:
+            return jsonify({
+                "success": False,
+                "message": f"تم الوصول للحد الأقصى لعدد الأجهزة ({max_devices})"
+            }), 403
+        devices[device_id] = {"firstSeen": int(time.time())}
+        db.reference(f"{NODE_STUDENTS}/{student_id}/devices").set(devices)
+
+    session_token = secrets.token_hex(32)
+    db.reference(f"{NODE_SESSIONS}/{session_token}").set({
+        "studentId": student_id,
+        "deviceId": device_id,
+        "createdAt": int(time.time())
+    })
+
+    return jsonify({
+        "success": True,
+        "sessionToken": session_token,
+        "studentName": student.get("name", "")
+    })
+
+
+# =========================================================
+# الطالب: كل طلبات المحتوى (بروكسي كامل - التوكن الحقيقي مايتشافش خالص)
+# =========================================================
+@app.route("/subjects/<int:year_id>", methods=["GET"])
+def get_subjects(year_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/user/subjects/{year_id}")
+    return jsonify(body), status
+
+
+@app.route("/subjects/<int:subject_id>/teachers", methods=["GET"])
+def get_teachers(subject_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/user/subjects/{subject_id}/teachers")
+    return jsonify(body), status
+
+
+@app.route("/teachers/<int:teacher_id>/chapters", methods=["GET"])
+def get_chapters(teacher_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/user/teachers/{teacher_id}/chapters")
+    return jsonify(body), status
+
+
+@app.route("/chapters/<int:chapter_id>/lectures", methods=["GET"])
+def get_lectures(chapter_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/user/chapters/{chapter_id}/lectures")
+    return jsonify(body), status
+
+
+@app.route("/lectures/<int:lecture_id>/content", methods=["GET"])
+def get_lecture_content(lecture_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/user/lectures/{lecture_id}/content")
+    return jsonify(body), status
+
+
+@app.route("/video/<int:video_id>/platforms", methods=["GET"])
+def get_video_platforms(video_id):
+    if not get_valid_session(request):
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+    body, status = coursatk_get(f"/video/{video_id}/platforms")
+    return jsonify(body), status
+
+
+# =========================================================
+# الأدمن: تحديث توكن كورساتك
+# =========================================================
+@app.route("/admin/token", methods=["GET"])
+def admin_get_token():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    config = db.reference(NODE_CONFIG).get() or {}
+    return jsonify({"success": True, "token": config.get("token", "")})
+
+
+@app.route("/admin/token", methods=["POST"])
+def admin_update_token():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    data = request.get_json(silent=True) or {}
+    token = data.get("token", "").strip()
+    db.reference(NODE_CONFIG).set({"token": token, "updatedAt": int(time.time())})
+    return jsonify({"success": True})
+
+
+# =========================================================
+# الأدمن: إدارة الطلاب
+# =========================================================
+@app.route("/admin/students", methods=["GET"])
+def admin_list_students():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    return jsonify({"success": True, "students": db.reference(NODE_STUDENTS).get() or {}})
+
+
+@app.route("/admin/students", methods=["POST"])
+def admin_add_student():
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code", "")).strip()
+    name = data.get("name", "").strip()
+    max_devices = int(data.get("maxDevices", 1))
+
+    if not code or len(code) != 6 or not code.isdigit():
+        return jsonify({"success": False, "message": "الكود لازم يكون 6 أرقام"}), 400
+    if not name:
+        return jsonify({"success": False, "message": "لازم تحط اسم الطالب"}), 400
+
+    students = db.reference(NODE_STUDENTS).get() or {}
+    for info in students.values():
+        if info.get("code") == code:
+            return jsonify({"success": False, "message": "الكود ده مستخدم بالفعل"}), 400
+
+    student_id = str(int(time.time() * 1000))
+    db.reference(f"{NODE_STUDENTS}/{student_id}").set({
+        "code": code,
+        "name": name,
+        "maxDevices": max_devices,
+        "devices": {},
+        "active": True,
+        "createdAt": int(time.time())
+    })
+    return jsonify({"success": True, "id": student_id})
+
+
+@app.route("/admin/students/<student_id>", methods=["PUT"])
+def admin_update_student(student_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+
+    data = request.get_json(silent=True) or {}
+    ref = db.reference(f"{NODE_STUDENTS}/{student_id}")
+    existing = ref.get()
+    if not existing:
+        return jsonify({"success": False, "message": "الطالب مش موجود"}), 404
+
+    updated = {**existing}
+    if "code" in data:
+        updated["code"] = str(data["code"]).strip()
+    if "name" in data:
+        updated["name"] = data["name"].strip()
+    if "maxDevices" in data:
+        updated["maxDevices"] = int(data["maxDevices"])
+    if "active" in data:
+        updated["active"] = bool(data["active"])
+
+    ref.set(updated)
+    return jsonify({"success": True})
+
+
+@app.route("/admin/students/<student_id>", methods=["DELETE"])
+def admin_delete_student(student_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    db.reference(f"{NODE_STUDENTS}/{student_id}").delete()
+    return jsonify({"success": True})
+
+
+@app.route("/admin/students/<student_id>/reset-devices", methods=["POST"])
+def admin_reset_devices(student_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    ref = db.reference(f"{NODE_STUDENTS}/{student_id}")
+    if not ref.get():
+        return jsonify({"success": False, "message": "الطالب مش موجود"}), 404
+    ref.child("devices").set({})
+    return jsonify({"success": True})
+
+
+@app.route("/admin/students/<student_id>/devices/<device_id>", methods=["PUT"])
+def admin_update_device(student_id, device_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    data = request.get_json(silent=True) or {}
+    device_ref = db.reference(f"{NODE_STUDENTS}/{student_id}/devices/{device_id}")
+    existing = device_ref.get()
+    if not existing:
+        return jsonify({"success": False, "message": "الجهاز مش موجود"}), 404
+    updated = existing if isinstance(existing, dict) else {}
+    if "blocked" in data:
+        updated["blocked"] = bool(data["blocked"])
+    device_ref.set(updated)
+    return jsonify({"success": True})
+
+
+@app.route("/admin/students/<student_id>/devices/<device_id>", methods=["DELETE"])
+def admin_delete_device(student_id, device_id):
+    if not check_admin(request):
+        return jsonify({"success": False, "message": "باسورد غلط"}), 401
+    db.reference(f"{NODE_STUDENTS}/{student_id}/devices/{device_id}").delete()
+    return jsonify({"success": True})
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
