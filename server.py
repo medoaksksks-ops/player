@@ -8,7 +8,7 @@
   إحنا اللي بنكلم كورساتك بالتوكن الحقيقي، والطالب مايشوفش التوكن ده خالص
 """
 
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, db
@@ -513,60 +513,6 @@ def admin_delete_device(student_id, device_id):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
-
-
-# =========================================================
-# بروكسي مقاطع الفيديو (Segments) - عشان نضبط الهيدرز
-# =========================================================
-@app.route("/proxy/segment", methods=["GET", "OPTIONS"])
-def proxy_segment():
-    if request.method == "OPTIONS":
-        response = app.make_default_options_response()
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-        return response
-
-    # لازم يكون الطالب مسجل عشان محدش يستغل البروكسي من بره
-    student = get_valid_session(request)
-    if not student:
-        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-
-    target_url = request.args.get("url")
-    if not target_url:
-        return jsonify({"success": False, "message": "الرابط مطلوب"}), 400
-
-    # الهيدرز المظبوطة اللي بتخلي الـ CDN يرضى
-    headers = {
-        "User-Agent": request.headers.get("User-Agent", "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/152.0.7977.64 Mobile Safari/537.36"),
-        "Accept": request.headers.get("Accept", "*/*"),
-        "Accept-Language": request.headers.get("Accept-Language", "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6"),
-        "Origin": "https://coursatk.online",
-        "Referer": "https://coursatk.online/",
-        "Accept-Encoding": "gzip, deflate, br"
-    }
-
-    # لو الكلاينت طلب جزء معين (Range) بنمرره عشان التحميل الجزئي
-    if "Range" in request.headers:
-        headers["Range"] = request.headers["Range"]
-
-    try:
-        resp = requests.get(target_url, headers=headers, stream=True, timeout=30)
-
-        # بناخد الهيدرز المهمة من الـ CDN ونبعت منها للكلاينت
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded_headers]
-
-        def generate():
-            for chunk in resp.raw.stream(1024 * 1024):
-                yield chunk
-
-        return Response(stream_with_context(generate()),
-                        status=resp.status_code,
-                        headers=response_headers)
-
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
 
 
 # =========================================================
