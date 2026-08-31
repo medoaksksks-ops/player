@@ -1,5 +1,5 @@
-flask
-flask-cors
-firebase-admin
-requests
-gunicorn
+Flask==2.3.3
+Flask-CORS==4.0.0
+firebase-admin==6.1.0
+requests==2.31.0
+Werkzeug==2.3.7

@@ -152,6 +152,166 @@ def login():
 
 
 # =========================================================
+# تشغيل الفيديو - Stream Weave Integration
+# =========================================================
+STREAM_WEAVE_BASE = "https://api.stream-weave.com"
+
+def coursatk_post(path, data=None):
+    """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
+    token = get_coursatk_token()
+    if not token:
+        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
+
+    headers = {
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json",
+        "accept": "*/*"
+    }
+    try:
+        r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=15)
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return body, r.status_code
+    except Exception as e:
+        return {"success": False, "message": str(e)}, 502
+
+
+def stream_weave_request(method, path, data=None, token=None):
+    """طلبات لـ stream weave بالتوكن المأخوذ من الرد بتاع كورساتك"""
+    headers = {}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    headers["accept"] = "*/*"
+    
+    url = f"{STREAM_WEAVE_BASE}{path}"
+    try:
+        if method.upper() == "GET":
+            r = requests.get(url, headers=headers, timeout=15)
+        elif method.upper() == "POST":
+            headers["content-type"] = "application/json"
+            r = requests.post(url, json=data or {}, headers=headers, timeout=15)
+        else:
+            return {"success": False}, 400
+        
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return body, r.status_code
+    except Exception as e:
+        return {"success": False, "message": str(e)}, 502
+
+
+@app.route("/video/<int:video_id>/play", methods=["GET"])
+def play_video(video_id):
+    """تشغيل الفيديو - بيرجع stream URL و token و كل البيانات المطلوبة"""
+    student = get_valid_session(request)
+    if not student:
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+
+    # 1. طلب stream-weave/play من كورساتك
+    play_body, play_status = coursatk_post(f"/video/{video_id}/stream-weave/play")
+    
+    if play_status != 200:
+        return jsonify(play_body), play_status
+    
+    if not play_body.get("success"):
+        return jsonify(play_body), 400
+    
+    stream_data = play_body.get("data", {})
+    stream_token = stream_data.get("token")
+    
+    if not stream_token:
+        return jsonify({"success": False, "message": "ما قدرش نحصل على الـ token"}), 500
+
+    # ربما الكلايينت (الواجهة) هتبعت طلبات heartbeat لوحدها
+    # بس احنا هنرجع كل البيانات اللي محتاجها
+    
+    return jsonify({
+        "success": True,
+        "data": stream_data,
+        "streamToken": stream_token
+    })
+
+
+@app.route("/video/stream-weave/heartbeat", methods=["POST"])
+def video_heartbeat():
+    """بيحافظ على الـ session اللي مع stream-weave"""
+    student = get_valid_session(request)
+    if not student:
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("sessionId")
+    token = data.get("token")
+    
+    if not session_id or not token:
+        return jsonify({"success": False, "message": "sessionId و token مطلوبين"}), 400
+
+    # طلب heartbeat لـ stream-weave
+    body, status = stream_weave_request(
+        "POST",
+        f"/playback/session/{session_id}/heartbeat",
+        token=token
+    )
+    
+    return jsonify(body), status
+
+
+@app.route("/video/stream-weave/m3u8", methods=["GET"])
+def video_m3u8():
+    """جلب الـ M3U8 playlist"""
+    student = get_valid_session(request)
+    if not student:
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+
+    video_id = request.args.get("videoId")
+    token = request.args.get("token")
+    
+    if not video_id or not token:
+        return jsonify({"success": False, "message": "videoId و token مطلوبين"}), 400
+
+    body, status = stream_weave_request(
+        "GET",
+        f"/videos/{video_id}/stream/master.m3u8",
+        token=token
+    )
+    
+    if status != 200:
+        return jsonify({"success": False, "message": "ما قدرش نجيب الـ playlist"}), status
+    
+    # لو كانت الرد ده M3U8 text
+    if isinstance(body, str):
+        return body, 200, {'Content-Type': 'application/vnd.apple.mpegurl'}
+    
+    return jsonify(body), status
+
+
+@app.route("/video/stream-weave/key", methods=["GET"])
+def video_key():
+    """جلب مفتاح فك التشفير"""
+    student = get_valid_session(request)
+    if not student:
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+
+    video_id = request.args.get("videoId")
+    token = request.args.get("token")
+    
+    if not video_id or not token:
+        return jsonify({"success": False, "message": "videoId و token مطلوبين"}), 400
+
+    body, status = stream_weave_request(
+        "GET",
+        f"/videos/{video_id}/key",
+        token=token
+    )
+    
+    return jsonify(body) if status != 200 else (body, 200, {'Content-Type': 'application/octet-stream'})
+
+
+# =========================================================
 # الطالب: كل طلبات المحتوى (بروكسي كامل - التوكن الحقيقي مايتشافش خالص)
 # =========================================================
 @app.route("/subjects/<int:year_id>", methods=["GET"])
