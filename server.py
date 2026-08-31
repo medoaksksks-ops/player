@@ -8,7 +8,7 @@
   إحنا اللي بنكلم كورساتك بالتوكن الحقيقي، والطالب مايشوفش التوكن ده خالص
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, db
@@ -17,6 +17,24 @@ import time
 import os
 import json
 import secrets
+
+# =========================================================
+# استخدام cloudscraper لتجاوز Cloudflare
+# =========================================================
+try:
+    import cloudscraper
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        }
+    )
+    USE_SCRAPER = True
+    print("✅ Cloudscraper loaded successfully")
+except ImportError:
+    print("⚠️ Cloudscraper not installed, using requests")
+    USE_SCRAPER = False
 
 app = Flask(__name__)
 CORS(app)
@@ -75,22 +93,86 @@ def get_coursatk_token():
     return config.get("token", "")
 
 
+# =========================================================
+# هيدرز موحدة لتجاوز Cloudflare
+# =========================================================
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "https://coursatk.online",
+    "Referer": "https://coursatk.online/",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site"
+}
+
+
 def coursatk_get(path):
     """بيبعت طلب لكورساتك بالتوكن المخزن عندنا، ويرجع (json_body, status_code)"""
     token = get_coursatk_token()
     if not token:
         return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
 
-    headers = {
-        "authorization": f"Bearer {token}",
-        "accept": "*/*"
-    }
+    headers = dict(DEFAULT_HEADERS)
+    headers["authorization"] = f"Bearer {token}"
+    
     try:
-        r = requests.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=15)
+        if USE_SCRAPER:
+            r = scraper.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=30)
+        else:
+            r = requests.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=30)
+        
+        # لو رجع HTML (يعني Cloudflare) نحاول تاني مع سيشين جديد
+        if r.text and r.text.startswith('<!DOCTYPE html>') or '<title>Just a moment' in r.text:
+            print("⚠️ Cloudflare detected, retrying...")
+            time.sleep(2)
+            if USE_SCRAPER:
+                r = scraper.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=30)
+            else:
+                r = requests.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=30)
+        
         try:
             body = r.json()
         except Exception:
-            body = {"raw": r.text}
+            body = {"raw": r.text[:500] + "..." if len(r.text) > 500 else r.text}
+        return body, r.status_code
+    except Exception as e:
+        return {"success": False, "message": str(e)}, 502
+
+
+def coursatk_post(path, data=None):
+    """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
+    token = get_coursatk_token()
+    if not token:
+        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
+
+    headers = dict(DEFAULT_HEADERS)
+    headers["authorization"] = f"Bearer {token}"
+    headers["content-type"] = "application/json"
+    
+    try:
+        if USE_SCRAPER:
+            r = scraper.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=30)
+        else:
+            r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=30)
+        
+        if r.text and r.text.startswith('<!DOCTYPE html>') or '<title>Just a moment' in r.text:
+            print("⚠️ Cloudflare detected, retrying...")
+            time.sleep(2)
+            if USE_SCRAPER:
+                r = scraper.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=30)
+            else:
+                r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=30)
+        
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text[:500] + "..." if len(r.text) > 500 else r.text}
         return body, r.status_code
     except Exception as e:
         return {"success": False, "message": str(e)}, 502
@@ -156,34 +238,15 @@ def login():
 # =========================================================
 STREAM_WEAVE_BASE = "https://api.stream-weave.com"
 
-def coursatk_post(path, data=None):
-    """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
-    token = get_coursatk_token()
-    if not token:
-        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
-
-    headers = {
-        "authorization": f"Bearer {token}",
-        "content-type": "application/json",
-        "accept": "*/*"
-    }
-    try:
-        r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=15)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        return body, r.status_code
-    except Exception as e:
-        return {"success": False, "message": str(e)}, 502
-
 
 def stream_weave_request(method, path, data=None, token=None):
     """طلبات لـ stream weave بالتوكن المأخوذ من الرد بتاع كورساتك"""
-    headers = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "accept": "*/*"
+    }
     if token:
         headers["authorization"] = f"Bearer {token}"
-    headers["accept"] = "*/*"
     
     url = f"{STREAM_WEAVE_BASE}{path}"
     try:
@@ -226,9 +289,6 @@ def play_video(video_id):
     if not stream_token:
         return jsonify({"success": False, "message": "ما قدرش نحصل على الـ token"}), 500
 
-    # ربما الكلايينت (الواجهة) هتبعت طلبات heartbeat لوحدها
-    # بس احنا هنرجع كل البيانات اللي محتاجها
-    
     return jsonify({
         "success": True,
         "data": stream_data,
@@ -250,7 +310,6 @@ def video_heartbeat():
     if not session_id or not token:
         return jsonify({"success": False, "message": "sessionId و token مطلوبين"}), 400
 
-    # طلب heartbeat لـ stream-weave
     body, status = stream_weave_request(
         "POST",
         f"/playback/session/{session_id}/heartbeat",
@@ -282,7 +341,6 @@ def video_m3u8():
     if status != 200:
         return jsonify({"success": False, "message": "ما قدرش نجيب الـ playlist"}), status
     
-    # لو كانت الرد ده M3U8 text
     if isinstance(body, str):
         return body, 200, {'Content-Type': 'application/vnd.apple.mpegurl'}
     
@@ -513,6 +571,56 @@ def admin_delete_device(student_id, device_id):
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
+
+
+# =========================================================
+# بروكسي مقاطع الفيديو (Segments) - عشان نضبط الهيدرز
+# =========================================================
+@app.route("/proxy/segment", methods=["GET", "OPTIONS"])
+def proxy_segment():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        return response
+
+    student = get_valid_session(request)
+    if not student:
+        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
+
+    target_url = request.args.get("url")
+    if not target_url:
+        return jsonify({"success": False, "message": "الرابط مطلوب"}), 400
+
+    headers = {
+        "User-Agent": request.headers.get("User-Agent", "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/152.0.7977.64 Mobile Safari/537.36"),
+        "Accept": request.headers.get("Accept", "*/*"),
+        "Accept-Language": request.headers.get("Accept-Language", "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6"),
+        "Origin": "https://coursatk.online",
+        "Referer": "https://coursatk.online/",
+        "Accept-Encoding": "gzip, deflate, br"
+    }
+
+    if "Range" in request.headers:
+        headers["Range"] = request.headers["Range"]
+
+    try:
+        resp = requests.get(target_url, headers=headers, stream=True, timeout=30)
+
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        response_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded_headers]
+
+        def generate():
+            for chunk in resp.raw.stream(1024 * 1024):
+                yield chunk
+
+        return Response(stream_with_context(generate()),
+                        status=resp.status_code,
+                        headers=response_headers)
+
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 # =========================================================
