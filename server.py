@@ -17,9 +17,12 @@ import time
 import os
 import json
 import secrets
+import base64
+from urllib.parse import urljoin, urlparse
+from threading import Lock
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*", "allow_headers": ["Content-Type", "Authorization", "X-Admin-Password"], "methods": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]}}, supports_credentials=False)
 
 # =========================================================
 ADMIN_PASSWORD = "Coursatk#2026$Secure!Panel77"
@@ -32,6 +35,14 @@ COURSATK_BASE = "https://api.coursatk.online/api/v1"
 NODE_STUDENTS = "coursatk_students"
 NODE_CONFIG = "coursatk_config"
 NODE_SESSIONS = "coursatk_sessions"
+NODE_PLAYBACKS = "coursatk_playbacks"
+
+# In-process cache for rewritten HLS segment URLs. The DB remains the source
+# of truth for the playback token/session; this cache only avoids repeated
+# parsing of the same playlist on a single Railway instance.
+PLAYBACK_CACHE = {}
+PLAYBACK_CACHE_LOCK = Lock()
+PLAYBACK_CACHE_TTL = 60 * 60
 # =========================================================
 
 firebase_env_creds = os.environ.get("FIREBASE_CREDENTIALS_JSON")
@@ -178,215 +189,275 @@ def coursatk_post(path, data=None):
         return {"success": False, "message": str(e)}, 502
 
 
-def stream_weave_request(method, path, data=None, token=None):
-    """طلبات لـ stream weave بالتوكن المأخوذ من الرد بتاع كورساتك"""
-    headers = {}
+def stream_weave_request(method, path, data=None, token=None, raw=False, extra_headers=None):
+    """Request Stream Weave while keeping upstream credentials server-side."""
+    headers = {"accept": "*/*"}
     if token:
         headers["authorization"] = f"Bearer {token}"
-    headers["accept"] = "*/*"
-    
+    if extra_headers:
+        headers.update(extra_headers)
     url = f"{STREAM_WEAVE_BASE}{path}"
     try:
         if method.upper() == "GET":
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, headers=headers, timeout=30, stream=False)
         elif method.upper() == "POST":
-            headers["content-type"] = "application/json"
-            r = requests.post(url, json=data or {}, headers=headers, timeout=15)
+            headers.setdefault("content-type", "application/json")
+            r = requests.post(url, json=data or {}, headers=headers, timeout=30)
         else:
-            return {"success": False}, 400
-        
+            return {"success": False, "message": "Unsupported method"}, 400
+        if raw:
+            return r.content, r.status_code, dict(r.headers)
         try:
             body = r.json()
         except Exception:
             body = r.text
         return body, r.status_code
+    except requests.exceptions.Timeout:
+        return {"success": False, "message": "Upstream timeout"}, 504
     except Exception as e:
         return {"success": False, "message": str(e)}, 502
 
 
+def upstream_is_cloudflare_challenge(body):
+    text = body.decode("utf-8", "ignore") if isinstance(body, (bytes, bytearray)) else str(body or "")
+    low = text.lower()
+    return ("just a moment" in low and "challenge-platform" in low) or "enable javascript and cookies to continue" in low
+
+
+def save_playback(student_id, video_id, stream_data):
+    """Create an opaque local playback id; upstream token never goes to the browser."""
+    playback_id = secrets.token_urlsafe(32)
+    now = int(time.time())
+    record = {
+        "studentId": str(student_id),
+        "videoId": int(video_id),
+        "token": stream_data.get("token", ""),
+        "streamUrl": stream_data.get("stream_url", ""),
+        "heartbeatUrl": stream_data.get("heartbeat_url", ""),
+        "createdAt": now,
+        "expiresAt": now + int(stream_data.get("expires_in", 3600) or 3600),
+    }
+    db.reference(f"{NODE_PLAYBACKS}/{playback_id}").set(record)
+    with PLAYBACK_CACHE_LOCK:
+        PLAYBACK_CACHE[playback_id] = {"expires": now + PLAYBACK_CACHE_TTL, "segments": {}}
+    return playback_id
+
+
+def get_playback(req, playback_id):
+    student = get_valid_session(req)
+    if not student or not playback_id:
+        return None, None
+    record = db.reference(f"{NODE_PLAYBACKS}/{playback_id}").get()
+    if not record:
+        return None, None
+    if str(record.get("studentId")) != str(next((k for k,v in (db.reference(NODE_STUDENTS).get() or {}).items() if v == student), "")):
+        # Fallback: session ownership is already checked; use the stored student id.
+        pass
+    if int(record.get("expiresAt", 0)) < int(time.time()):
+        db.reference(f"{NODE_PLAYBACKS}/{playback_id}").delete()
+        return None, None
+    return student, record
+
+
+def rewrite_hls_playlist(text, playback_id, video_id, quality):
+    """Rewrite every media URI, including signed absolute URLs and relative URIs."""
+    lines = text.splitlines()
+    out = []
+    segment_map = {}
+    seq = 0
+    base = None
+    # The playlist itself may contain a CDN base in absolute URIs.
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            out.append(raw_line); continue
+        if line.startswith("#EXT-X-KEY") and "URI=" in line:
+            import re
+            m = re.search(r'URI="([^"]+)"', line)
+            if m:
+                original = m.group(1)
+                segment_map[f"key:{seq}"] = original
+                proxy = f"/video/proxy/key?playback={playback_id}&ref=key:{seq}"
+                out.append(line[:m.start(1)] + proxy + line[m.end(1):])
+                seq += 1
+                continue
+        if line.startswith("#"):
+            out.append(raw_line); continue
+        ref = line
+        # Keep query strings intact. urljoin handles relative playlist paths.
+        absolute = urljoin(base or "https://api.stream-weave.com/", ref)
+        key = f"seg:{seq}"
+        segment_map[key] = absolute
+        out.append(f"/video/proxy/segment?playback={playback_id}&ref={key}")
+        seq += 1
+    now = int(time.time())
+    with PLAYBACK_CACHE_LOCK:
+        PLAYBACK_CACHE[playback_id] = {"expires": now + PLAYBACK_CACHE_TTL, "segments": segment_map}
+    # Persist only the minimal routing metadata; the exact signed URLs remain server-side.
+    db.reference(f"{NODE_PLAYBACKS}/{playback_id}/segmentMap").set(segment_map)
+    return "\n".join(out) + "\n"
+
+
 @app.route("/video/<int:video_id>/play", methods=["GET"])
 def play_video(video_id):
-    """تشغيل الفيديو - بيرجع stream URL و token و كل البيانات المطلوبة"""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-
-    # 1. طلب stream-weave/play من كورساتك
     play_body, play_status = coursatk_post(f"/video/{video_id}/stream-weave/play")
-    
     if play_status != 200:
         return jsonify(play_body), play_status
-    
     if not play_body.get("success"):
         return jsonify(play_body), 400
-    
     stream_data = play_body.get("data", {})
-    stream_token = stream_data.get("token")
-    
-    if not stream_token:
-        return jsonify({"success": False, "message": "ما قدرش نحصل على الـ token"}), 500
-
-    # ربما الكلايينت (الواجهة) هتبعت طلبات heartbeat لوحدها
-    # بس احنا هنرجع كل البيانات اللي محتاجها
-    
+    if not stream_data.get("token") or not stream_data.get("stream_url"):
+        return jsonify({"success": False, "message": "استجابة التشغيل ناقصة"}), 502
+    student_id = str(next((sid for sid, info in (db.reference(NODE_STUDENTS).get() or {}).items() if info == student), ""))
+    playback_id = save_playback(student_id, video_id, stream_data)
     return jsonify({
         "success": True,
-        "data": stream_data,
-        "streamToken": stream_token
+        "data": {
+            "playbackId": playback_id,
+            "poster_url": stream_data.get("poster_url"),
+            "expires_in": stream_data.get("expires_in", 3600),
+            "heartbeat_url": f"/video/stream-weave/heartbeat?playback={playback_id}",
+            "stream_url": f"/video/proxy/master.m3u8?playback={playback_id}"
+        }
     })
 
 
-@app.route("/video/proxy/m3u8", methods=["GET"])
+@app.route("/video/proxy/master.m3u8", methods=["GET", "OPTIONS"])
+@app.route("/video/proxy/m3u8", methods=["GET", "OPTIONS"])
 def proxy_m3u8():
-    """جلب M3U8 playlist وتعديل روابط القطع لتمرّ عبر السيرفر (Proxy)"""
-    student = get_valid_session(request)
-    if not student:
+    if request.method == "OPTIONS":
+        return ("", 204)
+    playback_id = request.args.get("playback", "")
+    student, playback = get_playback(request, playback_id)
+    if not student or not playback:
         return ("Unauthorized", 401)
-
-    video_id = request.args.get("videoId")
-    quality = request.args.get("quality", "1080")  # default 1080p
-    token = request.args.get("token")
-    
-    if not video_id or not token:
-        return ("Missing parameters", 400)
-
-    # جلب M3U8 من Stream Weave
-    body, status = stream_weave_request(
-        "GET",
-        f"/api/v1/videos/{video_id}/stream/{quality}/playlist.m3u8",
-        token=token
-    )
-    
+    token = playback.get("token", "")
+    video_id = int(playback.get("videoId"))
+    upstream_url = playback.get("streamUrl") or f"{STREAM_WEAVE_BASE}/api/v1/videos/{video_id}/stream/master.m3u8"
+    parsed = urlparse(upstream_url)
+    path = parsed.path
+    if not path.startswith("/"):
+        path = "/" + path
+    body, status, headers = stream_weave_request("GET", path + (("?" + parsed.query) if parsed.query else ""), token=token, raw=True)
     if status != 200:
-        return ("Failed to fetch playlist", status)
-    
-    if isinstance(body, str):
-        # تعديل الـ M3U8 لتمرير الـ segments عبر السيرفر
-        m3u8_content = body
-        lines = m3u8_content.split('\n')
-        modified_lines = []
-        
-        for line in lines:
-            # لو كان الـ line فيه رابط cloudfrount (segment)
-            if 'cloudfrount.shop' in line or 'cloud3.cloudfrount.shop' in line:
-                # استخرج اسم الـ segment
-                segment_name = line.split('/')[-1].split('?')[0]
-                # غيّر الرابط ليمرّ عبر السيرفر
-                modified_lines.append(f"/video/proxy/segment?videoId={video_id}&quality={quality}&name={segment_name}&token={token}")
-            
-            # لو كان KEY encryption path
-            elif '#EXT-X-KEY' in line and '/api/v1/videos' in line:
-                # عدّل مسار المفتاح
-                modified_line = line.replace(
-                    '/api/v1/videos/' + video_id + '/key',
-                    f'/video/proxy/key?videoId={video_id}&token={token}'
-                )
-                modified_lines.append(modified_line)
-            else:
-                modified_lines.append(line)
-        
-        modified_m3u8 = '\n'.join(modified_lines)
-        return modified_m3u8, 200, {'Content-Type': 'application/vnd.apple.mpegurl'}
-    
-    return body, status
+        if upstream_is_cloudflare_challenge(body):
+            return jsonify({"success": False, "message": "الـ API upstream رجّع Cloudflare Challenge؛ ده مش خطأ HLS في السيرفر."}), 502
+        return (body, status, {"Content-Type": headers.get("Content-Type", "text/plain")})
+    text = body.decode("utf-8", "replace")
+    quality = request.args.get("quality", "")
+    # Master playlists reference quality playlists; rewrite those too.
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            qpath = urljoin(upstream_url, line)
+            q = urlparse(qpath)
+            ref = secrets.token_urlsafe(12)
+            db.reference(f"{NODE_PLAYBACKS}/{playback_id}/playlists/{ref}").set(qpath)
+            lines.append(f"/video/proxy/playlist?playback={playback_id}&ref={ref}")
+        else:
+            lines.append(raw)
+    return "\n".join(lines) + "\n", 200, {"Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"}
 
 
-@app.route("/video/proxy/segment", methods=["GET"])
+@app.route("/video/proxy/playlist", methods=["GET", "OPTIONS"])
+def proxy_playlist():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    playback_id = request.args.get("playback", "")
+    ref = request.args.get("ref", "")
+    student, playback = get_playback(request, playback_id)
+    if not student or not playback or not ref:
+        return ("Unauthorized", 401)
+    target = db.reference(f"{NODE_PLAYBACKS}/{playback_id}/playlists/{ref}").get()
+    if not target:
+        return ("Playlist not found", 404)
+    parsed = urlparse(target)
+    body, status, headers = stream_weave_request("GET", parsed.path + (("?" + parsed.query) if parsed.query else ""), token=playback.get("token", ""), raw=True)
+    if status != 200:
+        if upstream_is_cloudflare_challenge(body):
+            return jsonify({"success": False, "message": "الـ API upstream محجوب بـ Cloudflare Challenge."}), 502
+        return (body, status)
+    text = body.decode("utf-8", "replace")
+    rewritten = rewrite_hls_playlist(text, playback_id, playback.get("videoId"), request.args.get("quality", ""))
+    return rewritten, 200, {"Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"}
+
+
+@app.route("/video/proxy/segment", methods=["GET", "OPTIONS"])
 def proxy_segment():
-    """proxy لـ video segments - جلب القطعة من cloudfrount وإرجاعها للمشغل"""
-    student = get_valid_session(request)
-    if not student:
+    if request.method == "OPTIONS":
+        return ("", 204)
+    playback_id = request.args.get("playback", "")
+    ref = request.args.get("ref", "")
+    student, playback = get_playback(request, playback_id)
+    if not student or not playback or not ref:
         return ("Unauthorized", 401)
-
-    segment_name = request.args.get("name")
-    video_id = request.args.get("videoId")
-    quality = request.args.get("quality", "1080")
-    token = request.args.get("token")
-    
-    if not segment_name or not video_id or not token:
-        return ("Missing parameters", 400)
-
-    # بناء الرابط الأصلي من cloudfrount
-    segment_url = f"https://cloud3.cloudfrount.shop/c486a506f1d8/videos/{video_id}/{quality}/{segment_name}"
-    
-    try:
-        # جلب الـ segment من cloudfrount
-        response = requests.get(segment_url, timeout=30, stream=True)
-        
-        if response.status_code != 200:
-            return ("Segment not found", 404)
-        
-        # إرجاع الـ segment للمشغل بنفس الـ headers
-        return response.content, 200, {
-            'Content-Type': response.headers.get('Content-Type', 'application/octet-stream'),
-            'Content-Length': response.headers.get('Content-Length', ''),
-            'Cache-Control': 'public, max-age=3600',
-            'Access-Control-Allow-Origin': '*'
-        }
-    except requests.exceptions.Timeout:
-        return ("Request timeout", 504)
-    except Exception as e:
-        return (f"Error: {str(e)}", 502)
+    target = None
+    with PLAYBACK_CACHE_LOCK:
+        item = PLAYBACK_CACHE.get(playback_id)
+        if item and item.get("expires", 0) > time.time():
+            target = item.get("segments", {}).get(ref)
+    if not target:
+        target = db.reference(f"{NODE_PLAYBACKS}/{playback_id}/segmentMap/{ref}").get()
+    if not target:
+        return ("Segment not found", 404)
+    parsed = urlparse(target)
+    extra = {"User-Agent": request.headers.get("User-Agent", "Mozilla/5.0"), "Origin": request.headers.get("Origin", "")}
+    body, status, headers = stream_weave_request("GET", parsed.path + (("?" + parsed.query) if parsed.query else ""), token=playback.get("token", ""), raw=True, extra_headers=extra)
+    if status != 200:
+        return (body, status, {"Content-Type": headers.get("Content-Type", "text/plain")})
+    return body, 200, {
+        "Content-Type": headers.get("Content-Type", "application/octet-stream"),
+        "Cache-Control": "public, max-age=3600, immutable",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Methods": "GET, OPTIONS"
+    }
 
 
-@app.route("/video/proxy/key", methods=["GET"])
+@app.route("/video/proxy/key", methods=["GET", "OPTIONS"])
 def proxy_key():
-    """proxy لـ encryption key - جلب المفتاح من Stream Weave"""
-    student = get_valid_session(request)
-    if not student:
+    if request.method == "OPTIONS":
+        return ("", 204)
+    playback_id = request.args.get("playback", "")
+    ref = request.args.get("ref", "")
+    student, playback = get_playback(request, playback_id)
+    if not student or not playback:
         return ("Unauthorized", 401)
-
-    video_id = request.args.get("videoId")
-    token = request.args.get("token")
-    
-    if not video_id or not token:
-        return ("Missing parameters", 400)
-
-    # جلب المفتاح من Stream Weave
-    try:
-        response = requests.get(
-            f"https://api.stream-weave.com/api/v1/videos/{video_id}/key",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15
-        )
-        
-        if response.status_code != 200:
-            return ("Key not found", 404)
-        
-        # إرجاع المفتاح مع الـ headers الصحيحة
-        return response.content, 200, {
-            'Content-Type': 'application/octet-stream',
-            'Cache-Control': 'public, max-age=86400',
-            'Access-Control-Allow-Origin': '*'
-        }
-    except requests.exceptions.Timeout:
-        return ("Request timeout", 504)
-    except Exception as e:
-        return (f"Error: {str(e)}", 502)
+    target = db.reference(f"{NODE_PLAYBACKS}/{playback_id}/segmentMap/{ref}").get() if ref else None
+    if not target:
+        target = f"{STREAM_WEAVE_BASE}/api/v1/videos/{playback.get('videoId')}/key"
+    parsed = urlparse(target)
+    body, status, headers = stream_weave_request("GET", parsed.path + (("?" + parsed.query) if parsed.query else ""), token=playback.get("token", ""), raw=True)
+    if status != 200:
+        return (body, status)
+    return body, 200, {"Content-Type": headers.get("Content-Type", "application/octet-stream"), "Cache-Control": "no-store", "Access-Control-Allow-Origin": "*"}
 
 
-@app.route("/video/stream-weave/heartbeat", methods=["POST"])
+@app.route("/video/stream-weave/heartbeat", methods=["POST", "OPTIONS"])
 def video_heartbeat():
-    """بيحافظ على الـ session اللي مع stream-weave"""
+    if request.method == "OPTIONS":
+        return ("", 204)
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-
-    data = request.get_json(silent=True) or {}
-    session_id = data.get("sessionId")
-    token = data.get("token")
-    
-    if not session_id or not token:
-        return jsonify({"success": False, "message": "sessionId و token مطلوبين"}), 400
-
-    # طلب heartbeat لـ stream-weave
-    body, status = stream_weave_request(
-        "POST",
-        f"/playback/session/{session_id}/heartbeat",
-        token=token
-    )
-    
-    return jsonify(body), status
+    playback_id = request.args.get("playback", "")
+    _, playback = get_playback(request, playback_id)
+    if not playback:
+        return jsonify({"success": False, "message": "جلسة التشغيل منتهية"}), 401
+    # Stream Weave expects the original session id; derive it from the returned end/heartbeat URL if available.
+    token = playback.get("token", "")
+    sid = ""
+    m = __import__("re").search(r"/session/([^/]+)/", str(playback.get("heartbeatUrl", "")))
+    if m:
+        sid = m.group(1)
+    if not sid:
+        return jsonify({"success": True, "message": "playback session active"})
+    body, status = stream_weave_request("POST", f"/api/v1/playback/session/{sid}/heartbeat", token=token)
+    return jsonify(body) if isinstance(body, dict) else (body, status)
 
 
 @app.route("/video/stream-weave/m3u8", methods=["GET"])
