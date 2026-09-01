@@ -18,6 +18,7 @@ import os
 import json
 import secrets
 import base64
+import re
 from urllib.parse import urljoin, urlparse
 
 app = Flask(__name__)
@@ -213,62 +214,52 @@ def stream_weave_request(method, path, data=None, token=None):
 
 @app.route("/video/<int:video_id>/play", methods=["GET"])
 def play_video(video_id):
-    """تشغيل الفيديو - بيرجع stream URL و token و كل البيانات المطلوبة"""
+    """Student playback: create the same internal HLS proxy session."""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
 
-    # 1. طلب stream-weave/play من كورساتك
-    play_body, play_status = coursatk_post(f"/video/{video_id}/stream-weave/play")
-    
-    if play_status != 200:
-        return jsonify(play_body), play_status
-    
-    if not play_body.get("success"):
-        return jsonify(play_body), 400
-    
-    stream_data = play_body.get("data", {})
-    stream_token = stream_data.get("token")
-    
-    if not stream_token:
-        return jsonify({"success": False, "message": "ما قدرش نحصل على الـ token"}), 500
+    body, status = coursatk_post(f"/video/{video_id}/stream-weave/play")
+    if status != 200:
+        return jsonify(body), status
+    if not isinstance(body, dict) or not body.get("success"):
+        return jsonify(body), status
 
-    # ربما الكلايينت (الواجهة) هتبعت طلبات heartbeat لوحدها
-    # بس احنا هنرجع كل البيانات اللي محتاجها
-    
+    stream_data = body.get("data") or {}
+    if not stream_data.get("token") or not stream_data.get("stream_url"):
+        return jsonify({"success": False, "message": "بيانات جلسة الفيديو ناقصة"}), 502
+    if _host(stream_data["stream_url"]) not in INITIAL_HLS_HOSTS:
+        return jsonify({"success": False, "message": "مصدر الـ master غير مسموح به"}), 502
+
+    sid = _create_hls_session(video_id, stream_data)
     return jsonify({
         "success": True,
-        "data": stream_data,
-        "streamToken": stream_token
+        "data": {
+            "video_id": stream_data.get("video_id"),
+            "session_id": stream_data.get("session_id"),
+            "expires_in": stream_data.get("expires_in"),
+            "poster_url": f"/hls/{sid}/poster",
+            "stream_url": f"/hls/{sid}/master.m3u8",
+            "heartbeat_url": f"/hls/{sid}/heartbeat",
+            "end_url": f"/hls/{sid}/end"
+        }
     })
 
-
-
 # =========================================================
-# HLS INTERNAL PROXY
+# INTERNAL HLS PROXY
 # =========================================================
-# The browser receives only our own URLs. The upstream Stream-Weave
-# access token stays server-side in this process.
-#
-# Flow:
-#   /admin/video/<id>/play
-#       -> Coursatk /stream-weave/play
-#       -> server stores the upstream playback token
-#       -> returns /admin/hls/<session>/master.m3u8
-#
-#   master.m3u8 / variant.m3u8 / key / .ts / .m4s / .woff2
-#       -> fetched by this server and returned to the browser.
-# =========================================================
+# The browser gets only our session URLs. The upstream Stream-Weave JWT
+# remains server-side. Playlists are rewritten recursively so variants,
+# keys, maps and media segments all come back through this server.
 
 HLS_SESSIONS = {}
 HLS_SESSION_TTL = 8 * 60 * 60
 
-# Only these upstream hosts are accepted by the internal proxy.
-# This prevents the proxy from becoming an arbitrary SSRF endpoint.
-ALLOWED_HLS_HOSTS = {
+# The first upstream must be Stream-Weave. Additional media hosts are learned
+# only from URLs actually present in that video's playlists.
+INITIAL_HLS_HOSTS = {
     "api.stream-weave.com",
     "api.streamweave.com",
-    "stream-weave.com",
 }
 
 def _b64e(value):
@@ -280,26 +271,25 @@ def _b64d(value):
 
 def _cleanup_hls_sessions():
     now = time.time()
-    expired = [
-        sid for sid, item in HLS_SESSIONS.items()
-        if now - item.get("createdAt", 0) > HLS_SESSION_TTL
-    ]
-    for sid in expired:
-        HLS_SESSIONS.pop(sid, None)
+    for sid, item in list(HLS_SESSIONS.items()):
+        if now > item.get("expiresAt", 0):
+            HLS_SESSIONS.pop(sid, None)
 
 def _create_hls_session(video_id, stream_data):
     _cleanup_hls_sessions()
     sid = secrets.token_urlsafe(32)
-
+    now = time.time()
+    ttl = min(int(stream_data.get("expires_in") or HLS_SESSION_TTL), HLS_SESSION_TTL)
     HLS_SESSIONS[sid] = {
         "videoId": int(video_id),
         "token": stream_data.get("token", ""),
         "sessionId": stream_data.get("session_id", ""),
-        "createdAt": time.time(),
-        "expiresAt": time.time() + min(
-            int(stream_data.get("expires_in") or HLS_SESSION_TTL),
-            HLS_SESSION_TTL
-        ),
+        # IMPORTANT: keep the exact UUID-based upstream master URL returned
+        # by Coursatk. Do not reconstruct it from the numeric video id.
+        "masterUrl": stream_data.get("stream_url", ""),
+        "createdAt": now,
+        "expiresAt": now + max(60, ttl),
+        "allowedHosts": set(INITIAL_HLS_HOSTS),
     }
     return sid
 
@@ -312,26 +302,35 @@ def _get_hls_session(sid):
         return None
     return item
 
-def _allowed_upstream(url):
+def _host(url):
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+def _allowed_for_session(url, sess):
     try:
         p = urlparse(url)
-        return p.scheme in ("https", "http") and p.hostname in ALLOWED_HLS_HOSTS
+        if p.scheme not in ("https", "http") or not p.hostname:
+            return False
+        return p.hostname.lower() in sess.get("allowedHosts", set())
     except Exception:
         return False
 
-def _upstream_get(url, token, stream=True):
+def _remember_host(url, sess):
+    h = _host(url)
+    if h:
+        sess.setdefault("allowedHosts", set()).add(h)
+
+def _upstream_get(url, sess, stream=True):
     headers = {
         "Accept": "*/*",
-        "User-Agent": request.headers.get("User-Agent", "Coursatk-Internal-HLS-Proxy/1.0"),
+        "User-Agent": request.headers.get("User-Agent", "Coursatk-HLS-Proxy/1.0"),
     }
-
-    # Forward Range because media players may request partial content.
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
-
-    # Stream-Weave API resources require the playback JWT.
-    if urlparse(url).hostname in {"api.stream-weave.com", "api.streamweave.com"} and token:
-        headers["Authorization"] = f"Bearer {token}"
+    if _host(url) in INITIAL_HLS_HOSTS and sess.get("token"):
+        headers["Authorization"] = f"Bearer {sess['token']}"
 
     return requests.get(
         url,
@@ -341,74 +340,53 @@ def _upstream_get(url, token, stream=True):
         allow_redirects=True,
     )
 
-def _rewrite_playlist(text, sid, current_url):
-    """
-    Rewrite every URI-bearing HLS line to an internal proxy URL.
+def _proxy_url(sid, upstream_url):
+    return f"/admin/hls/{sid}/resource?u={_b64e(upstream_url)}"
 
-    This covers:
-      - master playlist variant URIs
-      - media playlist .ts/.m4s/.woff2 URIs
-      - EXT-X-KEY URI="..."
-      - EXT-X-MAP URI="..."
-      - EXT-X-PART URI="..."
-      - EXT-X-PRELOAD-HINT URI="..."
-      - EXT-X-MEDIA URI="..."
-      - other URI="..." attributes
-    """
-    lines = text.splitlines()
+def _rewrite_playlist(text, sid, current_url, sess):
+    """Rewrite every URI in an HLS playlist to our own proxy."""
     out = []
+    for original in text.splitlines():
+        line = original
 
-    for line in lines:
-        stripped = line.strip()
-
-        # URI="..." inside HLS tags.
-        def repl_uri(match):
+        # URI="..." attributes: EXT-X-KEY, EXT-X-MAP, EXT-X-PART,
+        # EXT-X-PRELOAD-HINT, EXT-X-MEDIA, etc.
+        def replace_uri(match):
             raw = match.group(1)
             absolute = urljoin(current_url, raw)
-            if not _allowed_upstream(absolute):
+            # A playlist is authoritative for the media hosts it references;
+            # remember those hosts so subsequent segment requests are allowed.
+            if not (absolute.startswith("http://") or absolute.startswith("https://")):
                 return match.group(0)
-            return 'URI="/admin/hls/{}/resource?u={}"'.format(
-                sid, _b64e(absolute)
-            )
+            _remember_host(absolute, sess)
+            return f'URI="{_proxy_url(sid, absolute)}"'
 
-        line = re.sub(r'URI="([^"]+)"', repl_uri, line)
+        line = re.sub(r'URI="([^"]+)"', replace_uri, line, flags=re.I)
 
-        # Bare URI line (common for variant playlists and segments).
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             absolute = urljoin(current_url, stripped)
-            if _allowed_upstream(absolute):
-                line = "/admin/hls/{}/resource?u={}".format(
-                    sid, _b64e(absolute)
-                )
+            if absolute.startswith(("http://", "https://")):
+                _remember_host(absolute, sess)
+                line = _proxy_url(sid, absolute)
 
         out.append(line)
 
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
-def _serve_upstream_response(resp, content_type=None):
+def _serve_upstream_response(resp, cache="no-store"):
     excluded = {
-        "content-length",
-        "content-encoding",
-        "transfer-encoding",
-        "connection",
-        "server",
-        "date",
+        "content-length", "content-encoding", "transfer-encoding",
+        "connection", "server", "date", "access-control-allow-origin",
     }
-
     headers = {}
     for k, v in resp.headers.items():
         if k.lower() not in excluded:
             headers[k] = v
-
-    if content_type:
-        headers["Content-Type"] = content_type
-
-    # HLS clients need these response headers.
     headers["Access-Control-Allow-Origin"] = "*"
-    headers["Access-Control-Allow-Headers"] = "Range, Authorization, Content-Type"
+    headers["Access-Control-Allow-Headers"] = "Range, Content-Type, Authorization"
     headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
-    headers["Cache-Control"] = "no-store"
+    headers["Cache-Control"] = cache
 
     def generate():
         try:
@@ -418,81 +396,37 @@ def _serve_upstream_response(resp, content_type=None):
         finally:
             resp.close()
 
-    return Response(
-        stream_with_context(generate()),
-        status=resp.status_code,
-        headers=headers,
-    )
-
-
-    if not isinstance(body, dict) or not body.get("success"):
-        return jsonify(body), status
-
-    stream_data = body.get("data") or {}
-    upstream_token = stream_data.get("token")
-    upstream_master = stream_data.get("stream_url")
-
-    if not upstream_token or not upstream_master:
-        return jsonify({
-            "success": False,
-            "message": "رد تشغيل الفيديو ناقص: token أو stream_url غير موجود"
-        }), 502
-
-    if not _allowed_upstream(upstream_master):
-        return jsonify({
-            "success": False,
-            "message": "رابط الـ master غير مسموح به من الـ proxy"
-        }), 502
-
-    sid = _create_hls_session(video_id, stream_data)
-
-    # Never return the upstream JWT to the browser.
-    return jsonify({
-        "success": True,
-        "data": {
-            "video_id": stream_data.get("video_id"),
-            "session_id": stream_data.get("session_id"),
-            "expires_in": stream_data.get("expires_in"),
-            "poster_url": f"/admin/hls/{sid}/poster",
-            "stream_url": f"/admin/hls/{sid}/master.m3u8",
-            "heartbeat_url": f"/admin/hls/{sid}/heartbeat",
-        }
-    })
+    return Response(stream_with_context(generate()), status=resp.status_code, headers=headers)
 
 @app.route("/admin/video/<int:video_id>/play", methods=["GET", "OPTIONS"])
 def admin_play_video(video_id):
     if request.method == "OPTIONS":
         return ("", 204)
-
     if not check_admin(request):
         return jsonify({"success": False, "message": "باسورد غلط"}), 401
 
     body, status = coursatk_post(f"/video/{video_id}/stream-weave/play")
     if status != 200:
         return jsonify(body), status
-
     if not isinstance(body, dict) or not body.get("success"):
         return jsonify(body), status
 
     stream_data = body.get("data") or {}
     upstream_token = stream_data.get("token")
     upstream_master = stream_data.get("stream_url")
-
     if not upstream_token or not upstream_master:
         return jsonify({
             "success": False,
             "message": "رد تشغيل الفيديو ناقص: token أو stream_url غير موجود"
         }), 502
 
-    if not _allowed_upstream(upstream_master):
+    if _host(upstream_master) not in INITIAL_HLS_HOSTS:
         return jsonify({
             "success": False,
-            "message": "رابط الـ master غير مسموح به من الـ proxy"
+            "message": "مصدر الـ master غير مسموح به"
         }), 502
 
     sid = _create_hls_session(video_id, stream_data)
-
-    # لا نُرجع JWT الخاص بـ Stream-Weave إلى المتصفح.
     return jsonify({
         "success": True,
         "data": {
@@ -506,59 +440,39 @@ def admin_play_video(video_id):
         }
     })
 
+# HLS routes intentionally do NOT require the admin password. Native video
+# and HLS.js cannot reliably attach a custom admin header to every media URI.
+# The high-entropy session id is the capability for this playback session.
 @app.route("/admin/hls/<sid>/master.m3u8", methods=["GET", "OPTIONS"])
+@app.route("/hls/<sid>/master.m3u8", methods=["GET", "OPTIONS"])
 def admin_hls_master(sid):
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-
     sess = _get_hls_session(sid)
     if not sess:
         return jsonify({"success": False, "message": "جلسة الفيديو انتهت"}), 410
 
-    # Reconstruct the API master URL from the video id.
-    video_id = sess["videoId"]
-    upstream_url = (
-        f"{STREAM_WEAVE_BASE}/api/v1/videos/"
-        f"{video_id}/stream/master.m3u8"
-    )
+    upstream_url = sess.get("masterUrl")
+    if not upstream_url or not _allowed_for_session(upstream_url, sess):
+        return jsonify({"success": False, "message": "master غير صالح"}), 502
 
     try:
-        resp = _upstream_get(upstream_url, sess["token"], stream=False)
+        resp = _upstream_get(upstream_url, sess, stream=False)
         if resp.status_code != 200:
-            return Response(
-                resp.content,
-                status=resp.status_code,
-                content_type=resp.headers.get(
-                    "Content-Type", "text/plain; charset=utf-8"
-                ),
-            )
-
+            return _serve_upstream_response(resp)
         text = resp.text
-        rewritten = _rewrite_playlist(text, sid, upstream_url)
-
-        return Response(
-            rewritten,
-            status=200,
-            content_type="application/vnd.apple.mpegurl",
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-store",
-            },
-        )
+        rewritten = _rewrite_playlist(text, sid, upstream_url, sess)
+        resp.close()
+        return Response(rewritten, 200, content_type="application/vnd.apple.mpegurl",
+                        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"})
     except requests.RequestException as e:
         return jsonify({"success": False, "message": f"Upstream error: {e}"}), 502
 
 @app.route("/admin/hls/<sid>/resource", methods=["GET", "OPTIONS"])
+@app.route("/hls/<sid>/resource", methods=["GET", "OPTIONS"])
 def admin_hls_resource(sid):
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-
     sess = _get_hls_session(sid)
     if not sess:
         return jsonify({"success": False, "message": "جلسة الفيديو انتهت"}), 410
@@ -566,112 +480,79 @@ def admin_hls_resource(sid):
     encoded = request.args.get("u", "")
     if not encoded:
         return jsonify({"success": False, "message": "الرابط مفقود"}), 400
-
     try:
         upstream_url = _b64d(encoded)
     except Exception:
         return jsonify({"success": False, "message": "رابط غير صالح"}), 400
 
-    if not _allowed_upstream(upstream_url):
-        return jsonify({"success": False, "message": "Upstream غير مسموح"}), 403
+    if not _allowed_for_session(upstream_url, sess):
+        return jsonify({"success": False, "message": "مصدر غير مسموح للجلسة"}), 403
 
-    # For media playlists, rewrite again so their nested segment URLs
-    # also stay inside our proxy.
     try:
-        resp = _upstream_get(upstream_url, sess["token"], stream=False)
-
-        if resp.status_code != 200:
+        resp = _upstream_get(upstream_url, sess, stream=False)
+        if resp.status_code != 200 and resp.status_code != 206:
             return _serve_upstream_response(resp)
 
-        content_type = (resp.headers.get("Content-Type") or "").lower()
+        ctype = (resp.headers.get("Content-Type") or "").lower()
         looks_like_playlist = (
-            upstream_url.lower().endswith(".m3u8")
-            or "mpegurl" in content_type
+            upstream_url.lower().split("?", 1)[0].endswith(".m3u8")
+            or "mpegurl" in ctype
             or resp.text.lstrip().startswith("#EXTM3U")
         )
-
         if looks_like_playlist:
-            rewritten = _rewrite_playlist(
-                resp.text, sid, upstream_url
-            )
+            rewritten = _rewrite_playlist(resp.text, sid, upstream_url, sess)
             resp.close()
-            return Response(
-                rewritten,
-                status=200,
-                content_type="application/vnd.apple.mpegurl",
-                headers={
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-store",
-                },
-            )
+            return Response(rewritten, 200, content_type="application/vnd.apple.mpegurl",
+                            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"})
 
         return _serve_upstream_response(resp)
-
     except requests.RequestException as e:
         return jsonify({"success": False, "message": f"Upstream error: {e}"}), 502
 
 @app.route("/admin/hls/<sid>/poster", methods=["GET", "OPTIONS"])
+@app.route("/hls/<sid>/poster", methods=["GET", "OPTIONS"])
 def admin_hls_poster(sid):
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-
     sess = _get_hls_session(sid)
     if not sess:
         return jsonify({"success": False, "message": "جلسة الفيديو انتهت"}), 410
-
     url = f"{STREAM_WEAVE_BASE}/api/v1/videos/{sess['videoId']}/poster"
-
     try:
-        resp = _upstream_get(url, sess["token"], stream=True)
-        return _serve_upstream_response(resp)
+        resp = _upstream_get(url, sess, stream=True)
+        return _serve_upstream_response(resp, cache="public, max-age=300")
     except requests.RequestException as e:
         return jsonify({"success": False, "message": f"Upstream error: {e}"}), 502
 
 @app.route("/admin/hls/<sid>/heartbeat", methods=["POST", "OPTIONS"])
+@app.route("/hls/<sid>/heartbeat", methods=["POST", "OPTIONS"])
 def admin_hls_heartbeat(sid):
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-
     sess = _get_hls_session(sid)
     if not sess:
         return jsonify({"success": False, "message": "جلسة الفيديو انتهت"}), 410
-
     if not sess.get("sessionId") or not sess.get("token"):
         return jsonify({"success": False, "message": "بيانات الجلسة ناقصة"}), 500
 
     body, status = stream_weave_request(
-        "POST",
-        f"/api/v1/playback/session/{sess['sessionId']}/heartbeat",
-        token=sess["token"]
+        "POST", f"/api/v1/playback/session/{sess['sessionId']}/heartbeat", token=sess["token"]
     )
     return jsonify(body), status
 
 @app.route("/admin/hls/<sid>/end", methods=["POST", "OPTIONS"])
+@app.route("/hls/<sid>/end", methods=["POST", "OPTIONS"])
 def admin_hls_end(sid):
     if request.method == "OPTIONS":
         return ("", 204)
-
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-
     sess = HLS_SESSIONS.pop(sid, None)
     if not sess:
         return jsonify({"success": True})
-
     if sess.get("sessionId") and sess.get("token"):
         body, status = stream_weave_request(
-            "POST",
-            f"/api/v1/playback/session/{sess['sessionId']}/end",
-            token=sess["token"]
+            "POST", f"/api/v1/playback/session/{sess['sessionId']}/end", token=sess["token"]
         )
         return jsonify(body), status
-
     return jsonify({"success": True})
 
 @app.route("/video/stream-weave/heartbeat", methods=["POST"])
