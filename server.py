@@ -434,18 +434,24 @@ def video_segment_proxy():
 
     parsed = urlparse(url)
 
-    # حماية من SSRF: لا نقبل إلا CDN المعروف الذي ظهر في الـ playlist.
-    if parsed.scheme != "https" or parsed.hostname != "suo2.floravon.online":
+    # 🔥 التغيير: السماح بأي hostname من floravon.online
+    if parsed.scheme != "https" or not parsed.hostname.endswith(".floravon.online"):
         return jsonify({"success": False, "message": "مصدر الفيديو غير مسموح"}), 400
 
     try:
+        # 🔥 إضافة الهيدرز المطلوبة
+        headers = {
+            "authorization": f"Bearer {token}",
+            "accept": "*/*",
+            "referer": "https://coursatk.online/",
+            "origin": "https://coursatk.online",
+            "accept-encoding": "identity",
+            "user-agent": request.headers.get("User-Agent", "Mozilla/5.0")
+        }
+        
         r = requests.get(
             url,
-            headers={
-                "authorization": f"Bearer {token}",
-                "accept": "*/*",
-                "referer": "https://coursatk.online/"
-            },
+            headers=headers,
             timeout=30,
             stream=True
         )
@@ -954,17 +960,24 @@ def video_test_segment():
 
     parsed = urlparse(url)
 
-    if parsed.scheme != "https" or parsed.hostname != "suo2.floravon.online":
+    # 🔥 التغيير: السماح بأي hostname من floravon.online
+    if parsed.scheme != "https" or not parsed.hostname.endswith(".floravon.online"):
         return jsonify({"success": False, "message": "مصدر الفيديو غير مسموح"}), 400
 
     try:
+        # 🔥 إضافة الهيدرز المطلوبة
+        headers = {
+            "authorization": f"Bearer {token}",
+            "accept": "*/*",
+            "referer": "https://coursatk.online/",
+            "origin": "https://coursatk.online",
+            "accept-encoding": "identity",
+            "user-agent": request.headers.get("User-Agent", "Mozilla/5.0")
+        }
+        
         r = requests.get(
             url,
-            headers={
-                "authorization": f"Bearer {token}",
-                "accept": "*/*",
-                "referer": "https://coursatk.online/"
-            },
+            headers=headers,
             timeout=30,
             stream=True
         )
