@@ -1,11 +1,5 @@
 """
 سيرفر كورساتك - مستقل تماماً، مالوش أي علاقة بأي منصة تانية
-================================================================
-الفكرة:
-- الأدمن بيحط توكن الـ JWT بتاع كورساتك مرة واحدة في السيرفر (مش في المتصفح)
-- الطالب يدخل PIN -> يرجع Session Token خاص بيه
-- أي طلب بعد كده (مواد / مدرسين / شهور / محاضرات / فيديو) بيعدي من عندنا،
-  إحنا اللي بنكلم كورساتك بالتوكن الحقيقي، والطالب مايشوفش التوكن ده خالص
 """
 
 from flask import Flask, request, jsonify
@@ -28,7 +22,6 @@ SERVICE_ACCOUNT_PATH = os.path.join(os.path.dirname(__file__), "serviceAccountKe
 
 COURSATK_BASE = "https://api.coursatk.online/api/v1"
 
-# كل بيانات المنصة دي تحت مسار واحد منفصل خالص في قاعدة البيانات
 NODE_STUDENTS = "coursatk_students"
 NODE_CONFIG = "coursatk_config"
 NODE_SESSIONS = "coursatk_sessions"
@@ -55,7 +48,6 @@ def get_session_token(req):
 
 
 def get_valid_session(req):
-    """يتحقق من الـ session token ويرجع بيانات الطالب لو صحيح، وإلا None"""
     token = get_session_token(req)
     if not token:
         return None
@@ -76,22 +68,68 @@ def get_coursatk_token():
 
 
 def coursatk_get(path):
-    """بيبعت طلب لكورساتك بالتوكن المخزن عندنا، ويرجع (json_body, status_code)"""
+    """بيبعت طلب لكورساتك بالتوكن المخزن عندنا"""
     token = get_coursatk_token()
     if not token:
         return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
 
     headers = {
         "authorization": f"Bearer {token}",
-        "accept": "*/*"
+        "accept": "*/*",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
+    
     try:
         r = requests.get(f"{COURSATK_BASE}{path}", headers=headers, timeout=15)
+        
+        # 🔥 كشف Cloudflare challenge
+        if "text/html" in r.headers.get("content-type", ""):
+            return {
+                "success": False, 
+                "message": "Cloudflare protection - جرب خلال دقيقة",
+                "cloudflare": True
+            }, 403
+        
         try:
             body = r.json()
         except Exception:
             body = {"raw": r.text}
         return body, r.status_code
+        
+    except Exception as e:
+        return {"success": False, "message": str(e)}, 502
+
+
+def coursatk_post(path, data=None):
+    """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
+    token = get_coursatk_token()
+    if not token:
+        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
+
+    headers = {
+        "authorization": f"Bearer {token}",
+        "content-type": "application/json",
+        "accept": "*/*",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    
+    try:
+        r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=15)
+        
+        # 🔥 كشف Cloudflare challenge
+        if "text/html" in r.headers.get("content-type", ""):
+            return {
+                "success": False, 
+                "message": "Cloudflare protection - جرب خلال دقيقة",
+                "cloudflare": True
+            }, 403
+        
+        try:
+            body = r.json()
+        except Exception:
+            body = {"raw": r.text}
+        return body, r.status_code
+        
     except Exception as e:
         return {"success": False, "message": str(e)}, 502
 
@@ -156,27 +194,6 @@ def login():
 # =========================================================
 STREAM_WEAVE_BASE = "https://api.stream-weave.com"
 
-def coursatk_post(path, data=None):
-    """بيبعت POST request لكورساتك بالتوكن المخزن عندنا"""
-    token = get_coursatk_token()
-    if not token:
-        return {"success": False, "message": "التوكن لسه متسجلش في اللوحة"}, 500
-
-    headers = {
-        "authorization": f"Bearer {token}",
-        "content-type": "application/json",
-        "accept": "*/*"
-    }
-    try:
-        r = requests.post(f"{COURSATK_BASE}{path}", json=data or {}, headers=headers, timeout=15)
-        try:
-            body = r.json()
-        except Exception:
-            body = {"raw": r.text}
-        return body, r.status_code
-    except Exception as e:
-        return {"success": False, "message": str(e)}, 502
-
 
 def stream_weave_request(method, path, data=None, token=None):
     """طلبات لـ stream weave بالتوكن المأخوذ من الرد بتاع كورساتك"""
@@ -206,12 +223,10 @@ def stream_weave_request(method, path, data=None, token=None):
 
 @app.route("/video/<int:video_id>/play", methods=["GET"])
 def play_video(video_id):
-    """تشغيل الفيديو - بيرجع stream URL و token و كل البيانات المطلوبة"""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
 
-    # 1. طلب stream-weave/play من كورساتك
     play_body, play_status = coursatk_post(f"/video/{video_id}/stream-weave/play")
     
     if play_status != 200:
@@ -225,9 +240,6 @@ def play_video(video_id):
     
     if not stream_token:
         return jsonify({"success": False, "message": "ما قدرش نحصل على الـ token"}), 500
-
-    # ربما الكلايينت (الواجهة) هتبعت طلبات heartbeat لوحدها
-    # بس احنا هنرجع كل البيانات اللي محتاجها
     
     return jsonify({
         "success": True,
@@ -238,7 +250,6 @@ def play_video(video_id):
 
 @app.route("/video/stream-weave/heartbeat", methods=["POST"])
 def video_heartbeat():
-    """بيحافظ على الـ session اللي مع stream-weave"""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
@@ -250,7 +261,6 @@ def video_heartbeat():
     if not session_id or not token:
         return jsonify({"success": False, "message": "sessionId و token مطلوبين"}), 400
 
-    # طلب heartbeat لـ stream-weave
     body, status = stream_weave_request(
         "POST",
         f"/playback/session/{session_id}/heartbeat",
@@ -262,7 +272,6 @@ def video_heartbeat():
 
 # =========================================================
 # Stream Weave HLS proxy chain
-# master.m3u8 -> variant playlist -> AES key -> segments
 # =========================================================
 
 def _hls_response(body, status=200):
@@ -270,7 +279,6 @@ def _hls_response(body, status=200):
 
 
 def _stream_weave_get(url, token):
-    """GET مسموح فقط لعناوين Stream Weave."""
     if not url.startswith(STREAM_WEAVE_BASE + "/"):
         return None, 400
 
@@ -287,7 +295,6 @@ def _stream_weave_get(url, token):
 
 @app.route("/video/stream-weave/m3u8", methods=["GET"])
 def video_m3u8():
-    """يجلب master.m3u8 ويحوّل روابط الـ variant إلى السيرفر."""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
@@ -311,7 +318,6 @@ def video_m3u8():
     out = []
     for line in r.text.splitlines():
         s = line.strip()
-
         if s and not s.startswith("#"):
             variant_url = urljoin(r.url, s)
             out.append(
@@ -328,7 +334,6 @@ def video_m3u8():
 
 @app.route("/video/stream-weave/playlist", methods=["GET"])
 def video_variant_playlist():
-    """يجلب playlist الجودة ويحوّل key والـ segments إلى endpoints عندنا."""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
@@ -383,7 +388,6 @@ def video_variant_playlist():
 
 @app.route("/video/stream-weave/key-proxy", methods=["GET"])
 def video_key_proxy():
-    """يمرر مفتاح AES-128 من Stream Weave."""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
@@ -418,7 +422,6 @@ def video_key_proxy():
 
 @app.route("/video/stream-weave/segment", methods=["GET"])
 def video_segment_proxy():
-    """يمرر segment الفيديو من الـ CDN إلى المشغل."""
     student = get_valid_session(request)
     if not student:
         return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
@@ -434,12 +437,11 @@ def video_segment_proxy():
 
     parsed = urlparse(url)
 
-    # 🔥 التغيير: السماح بأي hostname من floravon.online
+    # السماح بأي hostname من floravon.online
     if parsed.scheme != "https" or not parsed.hostname.endswith(".floravon.online"):
         return jsonify({"success": False, "message": "مصدر الفيديو غير مسموح"}), 400
 
     try:
-        # 🔥 إضافة الهيدرز المطلوبة
         headers = {
             "authorization": f"Bearer {token}",
             "accept": "*/*",
@@ -449,12 +451,7 @@ def video_segment_proxy():
             "user-agent": request.headers.get("User-Agent", "Mozilla/5.0")
         }
         
-        r = requests.get(
-            url,
-            headers=headers,
-            timeout=30,
-            stream=True
-        )
+        r = requests.get(url, headers=headers, timeout=30, stream=True)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 502
 
@@ -469,37 +466,12 @@ def video_segment_proxy():
         r.iter_content(chunk_size=64 * 1024),
         status=200,
         content_type=r.headers.get("Content-Type", "video/mp2t"),
-        headers={
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes"
-        }
+        headers={"Cache-Control": "no-store", "Accept-Ranges": "bytes"}
     )
-
-
-@app.route("/video/stream-weave/key", methods=["GET"])
-def video_key():
-    """جلب مفتاح فك التشفير"""
-    student = get_valid_session(request)
-    if not student:
-        return jsonify({"success": False, "message": "سجل دخول تاني"}), 401
-
-    video_id = request.args.get("videoId")
-    token = request.args.get("token")
-    
-    if not video_id or not token:
-        return jsonify({"success": False, "message": "videoId و token مطلوبين"}), 400
-
-    body, status = stream_weave_request(
-        "GET",
-        f"/videos/{video_id}/key",
-        token=token
-    )
-    
-    return jsonify(body) if status != 200 else (body, 200, {'Content-Type': 'application/octet-stream'})
 
 
 # =========================================================
-# الطالب: كل طلبات المحتوى (بروكسي كامل - التوكن الحقيقي مايتشافش خالص)
+# الطالب: كل طلبات المحتوى
 # =========================================================
 @app.route("/subjects/<int:year_id>", methods=["GET"])
 def get_subjects(year_id):
@@ -550,7 +522,7 @@ def get_video_platforms(video_id):
 
 
 # =========================================================
-# الأدمن: تحديث توكن كورساتك
+# الأدمن
 # =========================================================
 @app.route("/admin/token", methods=["GET"])
 def admin_get_token():
@@ -570,9 +542,6 @@ def admin_update_token():
     return jsonify({"success": True})
 
 
-# =========================================================
-# الأدمن: فحص الاتصال
-# =========================================================
 @app.route("/admin/ping", methods=["GET", "OPTIONS"])
 def admin_ping():
     if request.method == "OPTIONS":
@@ -587,9 +556,6 @@ def admin_ping():
     })
 
 
-# =========================================================
-# الأدمن: إدارة الطلاب
-# =========================================================
 @app.route("/admin/students", methods=["GET"])
 def admin_list_students():
     if not check_admin(request):
@@ -673,333 +639,11 @@ def admin_reset_devices(student_id):
     return jsonify({"success": True})
 
 
-@app.route("/admin/students/<student_id>/devices/<device_id>", methods=["PUT"])
-def admin_update_device(student_id, device_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    data = request.get_json(silent=True) or {}
-    device_ref = db.reference(f"{NODE_STUDENTS}/{student_id}/devices/{device_id}")
-    existing = device_ref.get()
-    if not existing:
-        return jsonify({"success": False, "message": "الجهاز مش موجود"}), 404
-    updated = existing if isinstance(existing, dict) else {}
-    if "blocked" in data:
-        updated["blocked"] = bool(data["blocked"])
-    device_ref.set(updated)
-    return jsonify({"success": True})
-
-
-@app.route("/admin/students/<student_id>/devices/<device_id>", methods=["DELETE"])
-def admin_delete_device(student_id, device_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    db.reference(f"{NODE_STUDENTS}/{student_id}/devices/{device_id}").delete()
-    return jsonify({"success": True})
-
-
-
-# =========================================================
-# TEMP TEST PAGE
-# بدون PIN / Session / Admin password - للاختبار فقط
-# =========================================================
-
-@app.route("/video-test", methods=["GET"])
-def video_test_page():
-    return r"""<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Video Stream Test</title>
-<style>
-body{font-family:Arial,sans-serif;background:#111;color:#eee;margin:0;padding:20px}
-.box{max-width:900px;margin:auto;background:#1b1b1b;padding:20px;border-radius:14px}
-input,button{font-size:16px;padding:12px;border-radius:8px;border:0;margin:5px}
-input{width:220px}
-button{cursor:pointer}
-video{width:100%;margin-top:20px;background:#000;border-radius:10px}
-pre{white-space:pre-wrap;direction:ltr;text-align:left;background:#080808;padding:15px;border-radius:10px;max-height:350px;overflow:auto}
-</style>
-</head>
-<body>
-<div class="box">
-<h2>اختبار تشغيل الفيديو</h2>
-<p>حط Video ID فقط واضغط تشغيل.</p>
-
-<input id="videoId" type="number" placeholder="Video ID">
-<button onclick="startVideo()">تشغيل</button>
-
-<video id="player" controls playsinline></video>
-
-<h3>النتيجة</h3>
-<pre id="log">جاهز...</pre>
-</div>
-
-<script>
-const logBox = document.getElementById("log");
-const player = document.getElementById("player");
-
-function log(x) {
-    logBox.textContent =
-        typeof x === "string" ? x : JSON.stringify(x, null, 2);
-}
-
-async function startVideo() {
-    const id = document.getElementById("videoId").value.trim();
-
-    if (!id) {
-        log("اكتب Video ID");
-        return;
-    }
-
-    log("جاري إنشاء جلسة التشغيل...");
-
-    try {
-        const playRes = await fetch(`/video-test/${encodeURIComponent(id)}/play`);
-        const playBody = await playRes.json();
-
-        if (!playRes.ok || !playBody.success) {
-            log(playBody);
-            return;
-        }
-
-        log(playBody);
-
-        const data = playBody.data;
-        const videoId = data.video_id || data.videoId;
-        const token = data.token;
-
-        if (!videoId || !token) {
-            log({
-                error: "الـ play response لم يرجع video_id/token",
-                response: playBody
-            });
-            return;
-        }
-
-        // عنوان الـ M3U8 المحلي؛ السيرفر يكمل باقي سلسلة HLS.
-        const manifest =
-            `/video-test/m3u8?videoId=${encodeURIComponent(videoId)}&token=${encodeURIComponent(token)}`;
-
-        logBox.textContent += "\n\nManifest:\n" + manifest;
-
-        // دعم HLS الأصلي في Safari/iOS.
-        if (player.canPlayType("application/vnd.apple.mpegurl")) {
-            player.src = manifest;
-            await player.play().catch(() => {});
-            return;
-        }
-
-        // hls.js لو متاح في المتصفح.
-        if (window.Hls && Hls.isSupported()) {
-            const hls = new Hls();
-            hls.loadSource(manifest);
-            hls.attachMedia(player);
-            hls.on(Hls.Events.ERROR, (_, data) => {
-                logBox.textContent += "\n\nHLS ERROR:\n" + JSON.stringify(data, null, 2);
-            });
-            return;
-        }
-
-        logBox.textContent += "\n\nالمتصفح لا يدعم HLS مباشرة.";
-    } catch (e) {
-        log(String(e));
-    }
-}
-</script>
-
-<!-- hls.js -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-</body>
-</html>"""
-
-
-@app.route("/video-test/<int:video_id>/play", methods=["GET"])
-def video_test_play(video_id):
-    """اختبار مؤقت: لا PIN ولا Session ولا Admin password."""
-    body, status = coursatk_post(f"/video/{video_id}/stream-weave/play")
-
-    if status != 200:
-        return jsonify(body), status
-
-    if not body.get("success"):
-        return jsonify(body), 400
-
-    return jsonify(body), 200
-
-
-@app.route("/video-test/m3u8", methods=["GET"])
-def video_test_m3u8():
-    """نسخة اختبار من master.m3u8 بدون Session check."""
-    from urllib.parse import quote, urljoin
-
-    video_id = request.args.get("videoId", "").strip()
-    token = request.args.get("token", "").strip()
-
-    if not video_id or not token:
-        return jsonify({"success": False, "message": "videoId و token مطلوبين"}), 400
-
-    r, status = _stream_weave_get(
-        f"{STREAM_WEAVE_BASE}/api/v1/videos/{video_id}/stream/master.m3u8",
-        token
-    )
-
-    if not r or status != 200:
-        return jsonify({"success": False, "message": "فشل جلب master playlist"}), status
-
-    out = []
-
-    for line in r.text.splitlines():
-        s = line.strip()
-
-        if s and not s.startswith("#"):
-            variant_url = urljoin(r.url, s)
-            out.append(
-                "/video-test/playlist?url="
-                + quote(variant_url, safe="")
-                + "&token="
-                + quote(token, safe="")
-            )
-        else:
-            out.append(line)
-
-    return _hls_response("\n".join(out) + "\n")
-
-
-@app.route("/video-test/playlist", methods=["GET"])
-def video_test_playlist():
-    """نسخة اختبار من quality playlist بدون Session check."""
-    from urllib.parse import quote, urljoin
-    import re
-
-    url = request.args.get("url", "").strip()
-    token = request.args.get("token", "").strip()
-
-    if not url or not token:
-        return jsonify({"success": False, "message": "url و token مطلوبين"}), 400
-
-    if not url.startswith(STREAM_WEAVE_BASE + "/"):
-        return jsonify({"success": False, "message": "عنوان غير مسموح"}), 400
-
-    r, status = _stream_weave_get(url, token)
-
-    if not r or status != 200:
-        return jsonify({"success": False, "message": "فشل جلب quality playlist"}), status
-
-    out = []
-
-    for line in r.text.splitlines():
-        s = line.strip()
-
-        if s.startswith("#EXT-X-KEY:"):
-            m = re.search(r'URI="([^"]+)"', line)
-            if m:
-                key_url = urljoin(r.url, m.group(1))
-                proxy_key = (
-                    "/video-test/key?url="
-                    + quote(key_url, safe="")
-                    + "&token="
-                    + quote(token, safe="")
-                )
-                line = line.replace(m.group(1), proxy_key)
-            out.append(line)
-
-        elif s and not s.startswith("#"):
-            segment_url = urljoin(r.url, s)
-            out.append(
-                "/video-test/segment?url="
-                + quote(segment_url, safe="")
-                + "&token="
-                + quote(token, safe="")
-            )
-        else:
-            out.append(line)
-
-    return _hls_response("\n".join(out) + "\n")
-
-
-@app.route("/video-test/key", methods=["GET"])
-def video_test_key():
-    """اختبار مؤقت لجلب AES key."""
-    url = request.args.get("url", "").strip()
-    token = request.args.get("token", "").strip()
-
-    if not url or not token:
-        return jsonify({"success": False, "message": "url و token مطلوبين"}), 400
-
-    if not url.startswith(STREAM_WEAVE_BASE + "/api/v1/videos/") or not url.endswith("/key"):
-        return jsonify({"success": False, "message": "عنوان المفتاح غير مسموح"}), 400
-
-    try:
-        r = requests.get(
-            url,
-            headers={"authorization": f"Bearer {token}", "accept": "*/*"},
-            timeout=20
-        )
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 502
-
-    return (
-        r.content,
-        r.status_code,
-        {"Content-Type": r.headers.get("Content-Type", "application/octet-stream")}
-    )
-
-
-@app.route("/video-test/segment", methods=["GET"])
-def video_test_segment():
-    """اختبار مؤقت لتمرير segments."""
-    from urllib.parse import urlparse
-    from flask import Response
-
-    url = request.args.get("url", "").strip()
-    token = request.args.get("token", "").strip()
-
-    if not url or not token:
-        return jsonify({"success": False, "message": "url و token مطلوبين"}), 400
-
-    parsed = urlparse(url)
-
-    # 🔥 التغيير: السماح بأي hostname من floravon.online
-    if parsed.scheme != "https" or not parsed.hostname.endswith(".floravon.online"):
-        return jsonify({"success": False, "message": "مصدر الفيديو غير مسموح"}), 400
-
-    try:
-        # 🔥 إضافة الهيدرز المطلوبة
-        headers = {
-            "authorization": f"Bearer {token}",
-            "accept": "*/*",
-            "referer": "https://coursatk.online/",
-            "origin": "https://coursatk.online",
-            "accept-encoding": "identity",
-            "user-agent": request.headers.get("User-Agent", "Mozilla/5.0")
-        }
-        
-        r = requests.get(
-            url,
-            headers=headers,
-            timeout=30,
-            stream=True
-        )
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 502
-
-    return Response(
-        r.iter_content(chunk_size=64 * 1024),
-        status=r.status_code,
-        content_type=r.headers.get("Content-Type", "video/mp2t"),
-        headers={"Cache-Control": "no-store"}
-    )
-
-
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "سيرفر كورساتك شغال"})
 
 
-# =========================================================
-# الأدمن: إنشاء جلسة تشغيل من Coursatk
-# =========================================================
 @app.route("/admin/video/<int:video_id>/play", methods=["GET", "OPTIONS"])
 def admin_play_video(video_id):
     if request.method == "OPTIONS":
@@ -1007,111 +651,6 @@ def admin_play_video(video_id):
     if not check_admin(request):
         return jsonify({"success": False, "message": "باسورد غلط"}), 401
     body, status = coursatk_post(f"/video/{video_id}/stream-weave/play")
-    return jsonify(body), status
-
-
-# =========================================================
-# اختبار سريع مباشر (بالباسورد بس، من غير تسجيل دخول أو PIN)
-# =========================================================
-@app.route("/admin/subjects/<int:year_id>", methods=["GET", "OPTIONS"])
-def admin_debug_subjects(year_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_subjects(year_id)
-
-
-@app.route("/debug/subjects/<int:year_id>", methods=["GET"])
-def debug_subjects(year_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/user/subjects/{year_id}")
-    return jsonify(body), status
-
-
-@app.route("/admin/subjects/<int:subject_id>/teachers", methods=["GET", "OPTIONS"])
-def admin_debug_teachers(subject_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_teachers(subject_id)
-
-
-@app.route("/debug/subjects/<int:subject_id>/teachers", methods=["GET"])
-def debug_teachers(subject_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/user/subjects/{subject_id}/teachers")
-    return jsonify(body), status
-
-
-@app.route("/admin/teachers/<int:teacher_id>/chapters", methods=["GET", "OPTIONS"])
-def admin_debug_chapters(teacher_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_chapters(teacher_id)
-
-
-@app.route("/debug/teachers/<int:teacher_id>/chapters", methods=["GET"])
-def debug_chapters(teacher_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/user/teachers/{teacher_id}/chapters")
-    return jsonify(body), status
-
-
-@app.route("/admin/chapters/<int:chapter_id>/lectures", methods=["GET", "OPTIONS"])
-def admin_debug_lectures(chapter_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_lectures(chapter_id)
-
-
-@app.route("/debug/chapters/<int:chapter_id>/lectures", methods=["GET"])
-def debug_lectures(chapter_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/user/chapters/{chapter_id}/lectures")
-    return jsonify(body), status
-
-
-@app.route("/admin/lectures/<int:lecture_id>/content", methods=["GET", "OPTIONS"])
-def admin_debug_content(lecture_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_content(lecture_id)
-
-
-@app.route("/debug/lectures/<int:lecture_id>/content", methods=["GET"])
-def debug_content(lecture_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/user/lectures/{lecture_id}/content")
-    return jsonify(body), status
-
-
-@app.route("/admin/video/<int:video_id>/platforms", methods=["GET", "OPTIONS"])
-def admin_debug_video_platforms(video_id):
-    if request.method == "OPTIONS":
-        return ("", 204)
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    return debug_video_platforms(video_id)
-
-
-@app.route("/debug/video/<int:video_id>/platforms", methods=["GET"])
-def debug_video_platforms(video_id):
-    if not check_admin(request):
-        return jsonify({"success": False, "message": "باسورد غلط"}), 401
-    body, status = coursatk_get(f"/video/{video_id}/platforms")
     return jsonify(body), status
 
 
