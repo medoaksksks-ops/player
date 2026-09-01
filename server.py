@@ -236,6 +236,135 @@ def play_video(video_id):
     })
 
 
+@app.route("/video/proxy/m3u8", methods=["GET"])
+def proxy_m3u8():
+    """جلب M3U8 playlist وتعديل روابط القطع لتمرّ عبر السيرفر (Proxy)"""
+    student = get_valid_session(request)
+    if not student:
+        return ("Unauthorized", 401)
+
+    video_id = request.args.get("videoId")
+    quality = request.args.get("quality", "1080")  # default 1080p
+    token = request.args.get("token")
+    
+    if not video_id or not token:
+        return ("Missing parameters", 400)
+
+    # جلب M3U8 من Stream Weave
+    body, status = stream_weave_request(
+        "GET",
+        f"/api/v1/videos/{video_id}/stream/{quality}/playlist.m3u8",
+        token=token
+    )
+    
+    if status != 200:
+        return ("Failed to fetch playlist", status)
+    
+    if isinstance(body, str):
+        # تعديل الـ M3U8 لتمرير الـ segments عبر السيرفر
+        m3u8_content = body
+        lines = m3u8_content.split('\n')
+        modified_lines = []
+        
+        for line in lines:
+            # لو كان الـ line فيه رابط cloudfrount (segment)
+            if 'cloudfrount.shop' in line or 'cloud3.cloudfrount.shop' in line:
+                # استخرج اسم الـ segment
+                segment_name = line.split('/')[-1].split('?')[0]
+                # غيّر الرابط ليمرّ عبر السيرفر
+                modified_lines.append(f"/video/proxy/segment?videoId={video_id}&quality={quality}&name={segment_name}&token={token}")
+            
+            # لو كان KEY encryption path
+            elif '#EXT-X-KEY' in line and '/api/v1/videos' in line:
+                # عدّل مسار المفتاح
+                modified_line = line.replace(
+                    '/api/v1/videos/' + video_id + '/key',
+                    f'/video/proxy/key?videoId={video_id}&token={token}'
+                )
+                modified_lines.append(modified_line)
+            else:
+                modified_lines.append(line)
+        
+        modified_m3u8 = '\n'.join(modified_lines)
+        return modified_m3u8, 200, {'Content-Type': 'application/vnd.apple.mpegurl'}
+    
+    return body, status
+
+
+@app.route("/video/proxy/segment", methods=["GET"])
+def proxy_segment():
+    """proxy لـ video segments - جلب القطعة من cloudfrount وإرجاعها للمشغل"""
+    student = get_valid_session(request)
+    if not student:
+        return ("Unauthorized", 401)
+
+    segment_name = request.args.get("name")
+    video_id = request.args.get("videoId")
+    quality = request.args.get("quality", "1080")
+    token = request.args.get("token")
+    
+    if not segment_name or not video_id or not token:
+        return ("Missing parameters", 400)
+
+    # بناء الرابط الأصلي من cloudfrount
+    segment_url = f"https://cloud3.cloudfrount.shop/c486a506f1d8/videos/{video_id}/{quality}/{segment_name}"
+    
+    try:
+        # جلب الـ segment من cloudfrount
+        response = requests.get(segment_url, timeout=30, stream=True)
+        
+        if response.status_code != 200:
+            return ("Segment not found", 404)
+        
+        # إرجاع الـ segment للمشغل بنفس الـ headers
+        return response.content, 200, {
+            'Content-Type': response.headers.get('Content-Type', 'application/octet-stream'),
+            'Content-Length': response.headers.get('Content-Length', ''),
+            'Cache-Control': 'public, max-age=3600',
+            'Access-Control-Allow-Origin': '*'
+        }
+    except requests.exceptions.Timeout:
+        return ("Request timeout", 504)
+    except Exception as e:
+        return (f"Error: {str(e)}", 502)
+
+
+@app.route("/video/proxy/key", methods=["GET"])
+def proxy_key():
+    """proxy لـ encryption key - جلب المفتاح من Stream Weave"""
+    student = get_valid_session(request)
+    if not student:
+        return ("Unauthorized", 401)
+
+    video_id = request.args.get("videoId")
+    token = request.args.get("token")
+    
+    if not video_id or not token:
+        return ("Missing parameters", 400)
+
+    # جلب المفتاح من Stream Weave
+    try:
+        response = requests.get(
+            f"https://api.stream-weave.com/api/v1/videos/{video_id}/key",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15
+        )
+        
+        if response.status_code != 200:
+            return ("Key not found", 404)
+        
+        # إرجاع المفتاح مع الـ headers الصحيحة
+        return response.content, 200, {
+            'Content-Type': 'application/octet-stream',
+            'Cache-Control': 'public, max-age=86400',
+            'Access-Control-Allow-Origin': '*'
+        }
+    except requests.exceptions.Timeout:
+        return ("Request timeout", 504)
+    except Exception as e:
+        return (f"Error: {str(e)}", 502)
+
+
 @app.route("/video/stream-weave/heartbeat", methods=["POST"])
 def video_heartbeat():
     """بيحافظ على الـ session اللي مع stream-weave"""
