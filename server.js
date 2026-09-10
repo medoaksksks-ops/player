@@ -1,6 +1,6 @@
 /**
  * fb-scraper — server.js
- * VERSION: 1.0.0
+ * VERSION: 1.0.1
  *
  * سيرفر شخصي بيستخدم كوكيز حسابك عشان يجيب بوستات/ريلز عامة ويعرضها كـ JSON.
  * ده للاستخدام الشخصي بس، حساب واحد، ومحتاج ضبط مستمر لأن فيسبوك بيغيّر الـ HTML/JSON بتاعه.
@@ -19,15 +19,20 @@ const PORT = process.env.PORT || 3000;
 const FB_COOKIE = process.env.FB_COOKIE || '';
 
 const MOBILE_UA =
-  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36';
 
 function client() {
   return axios.create({
     headers: {
       'User-Agent': MOBILE_UA,
       Cookie: FB_COOKIE,
-      'Accept-Language': 'ar-EG,ar;q=0.9,en-US;q=0.8,en;q=0.7',
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'sec-ch-ua': '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"',
+      'sec-ch-ua-mobile': '?1',
+      'sec-ch-ua-platform': '"Android"',
+      'Upgrade-Insecure-Requests': '1',
     },
     timeout: 20000,
     validateStatus: () => true, // نتعامل مع أي status code يدوي
@@ -146,7 +151,7 @@ app.get('/api/raw', async (req, res) => {
 app.use(express.static('public'));
 
 app.listen(PORT, () => {
-  console.log(`fb-scraper v1.0.0 running on http://localhost:${PORT}`);
+  console.log(`fb-scraper v1.0.1 running on http://localhost:${PORT}`);
   console.log(FB_COOKIE ? '✓ FB_COOKIE loaded' : '✗ WARNING: FB_COOKIE is empty — set it in .env');
 });
-          
+      
