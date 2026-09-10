@@ -1,0 +1,84 @@
+/**
+ * lib/fetcher.js
+ * VERSION: 1.0.0
+ *
+ * غلاف حول yt-dlp: بيسرد فيديوهات حساب/هاشتاج (flat, سريع)، وبيحل رابط تشغيل مباشر لفيديو واحد.
+ * محتاج yt-dlp متثبت على السيرفر ومتاح في PATH.
+ */
+
+const { execFile } = require('child_process');
+
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'yt-dlp',
+      args,
+      { maxBuffer: 1024 * 1024 * 50, timeout: 60000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return reject(new Error(stderr || err.message));
+        }
+        resolve(stdout);
+      }
+    );
+  });
+}
+
+// سرد سريع (بدون تفاصيل فيديو كاملة) لكل فيديوهات حساب أو هاشتاج
+async function listFlat(url, maxItems) {
+  const out = await runYtDlp([
+    '--flat-playlist',
+    '--playlist-end',
+    String(maxItems),
+    '-J',
+    url,
+  ]);
+  const data = JSON.parse(out);
+  const entries = data.entries || [];
+  return entries.map((e) => ({
+    id: e.id,
+    url: e.url || e.webpage_url,
+    title: e.title || '',
+  }));
+}
+
+async function listTikTokUser(username, maxItems) {
+  return listFlat(`https://www.tiktok.com/@${username}`, maxItems);
+}
+
+async function listTikTokHashtag(tag, maxItems) {
+  return listFlat(`https://www.tiktok.com/tag/${tag}`, maxItems);
+}
+
+async function listInstagramUserReels(username, maxItems) {
+  return listFlat(`https://www.instagram.com/${username}/reels/`, maxItems);
+}
+
+// تفاصيل كاملة لفيديو واحد (بيانات + روابط تشغيل)
+async function getVideoInfo(url) {
+  const out = await runYtDlp(['-J', url]);
+  const data = JSON.parse(out);
+  return {
+    id: data.id,
+    title: data.title || data.description || '',
+    author: data.uploader || data.channel || '',
+    thumbnail: data.thumbnail || null,
+    permalink: data.webpage_url || url,
+    duration: data.duration || null,
+  };
+}
+
+// رابط تشغيل مباشر (يُستخدم وقت الطلب لأنه بينتهي بعد فترة)
+async function getDirectStreamUrl(url) {
+  const out = await runYtDlp(['-g', url]);
+  // ممكن يرجع أكتر من سطر (فيديو + صوت منفصلين)، بناخد أول رابط
+  return out.trim().split('\n')[0];
+}
+
+module.exports = {
+  listTikTokUser,
+  listTikTokHashtag,
+  listInstagramUserReels,
+  getVideoInfo,
+  getDirectStreamUrl,
+};
