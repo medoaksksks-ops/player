@@ -1,15 +1,14 @@
 {
-  "name": "fb-scraper",
+  "name": "reels-site",
   "version": "1.0.0",
-  "description": "Personal-use Facebook feed/reel scraper using account cookies",
+  "description": "Personal vertical-scroll reels feed pulling from TikTok/Instagram public content via yt-dlp",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.7.7",
-    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "node-cron": "^3.0.3"
   }
 }
