@@ -1,0 +1,16 @@
+{
+  "name": "apk-cloud-runner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser-controlled Android APK runner with a Railway Node.js control server and ADB runner.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "runner": "node runner/runner.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "ws": "^8.18.3"
+  }
+}
