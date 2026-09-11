@@ -18,7 +18,6 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 app.use(express.json({ limit: "2mb" }));
-app.use(express.static(path.join(__dirname, "public")));
 
 const upload = multer({
   dest: UPLOAD_DIR,
@@ -253,9 +252,6 @@ setInterval(() => {
   }
 }, 60_000);
 
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
 
 if (process.env.RUNNER_MODE !== "1") {
   server.listen(PORT, HOST, () => {
