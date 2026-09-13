@@ -1,16 +1,16 @@
 {
-  "name": "apk-cloud-runner",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Browser-controlled Android APK runner with a Railway Node.js control server and ADB runner.",
+  "name": "naqal-backend",
+  "version": "3.0.0",
+  "description": "Fast WebRTC signaling backend for Naqal P2P file transfer",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "runner": "node runner/runner.js"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.18.0"
   },
   "dependencies": {
     "express": "^5.1.0",
-    "multer": "^2.0.2",
-    "ws": "^8.18.3"
+    "socket.io": "^4.8.1"
   }
 }
