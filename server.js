@@ -67,6 +67,45 @@ function verifyToken(token){const a=String(token||'').split('.');if(a.length!==3
 function bearer(req){const h=String(req.headers.authorization||'');return h.startsWith('Bearer ')?h.slice(7).trim():'';}
 
 // ---------------- Firebase / Firestore ----------------
+function firebaseErrorCode(err){ return String(err?.code || err?.status || err?.name || '').trim(); }
+function firebaseErrorMessage(err){ return String(err?.message || 'Unknown Firebase/Firestore error').replace(/\s+/g,' ').trim().slice(0,240); }
+function isTransientFirebaseError(err){
+  const c=firebaseErrorCode(err).toLowerCase();
+  const m=firebaseErrorMessage(err).toLowerCase();
+  return ['unavailable','deadline-exceeded','resource-exhausted','aborted','internal','unknown','network-request-failed'].includes(c) || /timeout|timed out|socket|econnreset|eai_again|temporar|unavailable|deadline/.test(m);
+}
+function firebaseHttpStatus(err,fallback=500){
+  if(err?.status && Number(err.status)>=400 && Number(err.status)<600) return Number(err.status);
+  const c=firebaseErrorCode(err).toLowerCase();
+  if(c==='permission-denied'||c==='unauthenticated') return 503;
+  if(c==='not-found') return 404;
+  if(c==='resource-exhausted') return 429;
+  if(isTransientFirebaseError(err)) return 503;
+  return fallback;
+}
+function publicFirebaseFailure(err,operation){
+  const status=firebaseHttpStatus(err);
+  const code=firebaseErrorCode(err);
+  const transient=isTransientFirebaseError(err);
+  console.error(`[FIREBASE_${operation}]`, {code,message:firebaseErrorMessage(err),status,transient});
+  if(status===404) return {status,error:'FIREBASE_NOT_FOUND',message:'Requested Firebase data was not found.'};
+  if(status===429) return {status,error:'FIREBASE_RATE_LIMITED',message:'Firebase is temporarily rate-limiting requests. Try again shortly.'};
+  if(status===503) return {status,error:'FIREBASE_UNAVAILABLE',message:'Firebase is temporarily unavailable. Please try again.'};
+  if(code.toLowerCase()==='permission-denied') return {status:503,error:'FIREBASE_PERMISSION_CONFIG',message:'Firebase permissions are not configured correctly on the server.'};
+  return {status:500,error:'FIREBASE_OPERATION_FAILED',message:'Firebase operation failed.'};
+}
+async function withFirebaseRetry(operation,fn,maxAttempts=2){
+  let last;
+  for(let attempt=1;attempt<=maxAttempts;attempt++){
+    try{return await fn();}
+    catch(err){
+      last=err;
+      if(attempt>=maxAttempts || !isTransientFirebaseError(err)) throw err;
+      await new Promise(r=>setTimeout(r,250*attempt));
+    }
+  }
+  throw last;
+}
 let db=null; let firebaseMode=null;
 function initFirebase(){
   const service=parseJsonEnv('FIREBASE_ADMIN_SERVICE_ACCOUNT_JSON');
@@ -79,9 +118,10 @@ function initFirebase(){
   }
 }
 initFirebase();
+if(!db) console.error('[FIREBASE_INIT] Firebase/Firestore is not configured or failed to initialize. Protected content routes will return a configuration error.');
 function needDb(res){if(db)return true;fail(res,503,'FIREBASE_NOT_CONFIGURED','Firestore is not configured.');return false;}
-function contentQuery(parentId){if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDocs(fs.query(fs.collection(db,'content'),fs.where('parentId','==',parentId)));}return db.collection('content').where('parentId','==',parentId).get();}
-function contentDoc(id){if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDoc(fs.doc(db,'content',id));}return db.collection('content').doc(id).get();}
+function contentQuery(parentId){return withFirebaseRetry('contentQuery',()=>{if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDocs(fs.query(fs.collection(db,'content'),fs.where('parentId','==',parentId)));}return db.collection('content').where('parentId','==',parentId).get();});}
+function contentDoc(id){return withFirebaseRetry('contentDoc',()=>{if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDoc(fs.doc(db,'content',id));}return db.collection('content').doc(id).get();});}
 function serialize(v){if(v===null||v===undefined)return v;if(v?.toDate instanceof Function)return v.toDate().toISOString();if(Array.isArray(v))return v.map(serialize);if(typeof v==='object'){const o={};for(const[k,x]of Object.entries(v))o[k]=serialize(x);return o;}return v;}
 function docToItem(doc){return{id:doc.id,data:serialize(doc.data()||{})};}
 function parseParentIds(v){const arr=Array.isArray(v)?v:[v];const out=[];for(const x of arr){if(x===undefined||x===null||x==='')continue;for(const p of String(x).split(',').map(s=>s.trim()).filter(Boolean))out.push(safeId(p,'parent_id'));}return [...new Set(out)];}
@@ -172,9 +212,9 @@ app.post('/api/auth/login',authLimiter,async(req,res)=>{
 });
 
 // ---------------- Protected Firestore content ----------------
-app.get('/api/content',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentId??req.query.parentIds);if(!ids.length)return fail(res,400,'PARENT_ID_REQUIRED','Pass parentId.');const section=req.auth.section||'all';const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem)));const items=[];const seen=new Set();for(const list of lists)for(const x of list){if(seen.has(x.id))continue;if(!contentAllowed(x.data,section))continue;seen.add(x.id);items.push(x);}items.sort((a,b)=>(Number(a.data?.order)||0)-(Number(b.data?.order)||0));res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',parentIds:ids,section,count:items.length,items});}catch(e){console.error(e);fail(res,500,'CONTENT_READ_FAILED','Unable to read content.');}});
-app.get('/api/content/doc/:id',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const id=safeId(req.params.id);const snap=await contentDoc(id);const exists=typeof snap.exists==='function'?snap.exists():Boolean(snap.exists);if(!exists)return fail(res,404,'CONTENT_NOT_FOUND','Document not found.');const item=docToItem(snap);if(!contentAllowed(item.data,req.auth.section||'all'))return fail(res,403,'CONTENT_NOT_ALLOWED','Content is not available for this student section.');res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',item});}catch(e){fail(res,500,'CONTENT_DOCUMENT_READ_FAILED','Unable to read document.');}});
-app.get('/api/content/children',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentIds??req.query.parentId);if(!ids.length)return fail(res,400,'PARENT_IDS_REQUIRED','Pass parentIds.');const section=req.auth.section||'all';const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem).then(a=>a.filter(x=>contentAllowed(x.data,section)))));const byParentId={};const items=[];ids.forEach((id,i)=>{byParentId[id]=lists[i];lists[i].forEach(x=>items.push({parentId:id,...x}));});items.sort((a,b)=>(Number(a.data?.order)||0)-(Number(b.data?.order)||0));res.json({success:true,parentIds:ids,count:items.length,byParentId,items});}catch(e){fail(res,500,'BATCH_READ_FAILED','Unable to read content.');}});
+app.get('/api/content',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentId??req.query.parentIds);if(!ids.length)return fail(res,400,'PARENT_ID_REQUIRED','Pass parentId.');const section=req.auth.section||'all';const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem)));const items=[];const seen=new Set();for(const list of lists)for(const x of list){if(seen.has(x.id))continue;if(!contentAllowed(x.data,section))continue;seen.add(x.id);items.push(x);}items.sort((a,b)=>(Number(a.data?.order)||0)-(Number(b.data?.order)||0));res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',parentIds:ids,section,count:items.length,items});}catch(e){const f=publicFirebaseFailure(e,'CONTENT_READ');return fail(res,f.status,f.error,f.message);}});
+app.get('/api/content/doc/:id',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const id=safeId(req.params.id);const snap=await contentDoc(id);const exists=typeof snap.exists==='function'?snap.exists():Boolean(snap.exists);if(!exists)return fail(res,404,'CONTENT_NOT_FOUND','Document not found.');const item=docToItem(snap);if(!contentAllowed(item.data,req.auth.section||'all'))return fail(res,403,'CONTENT_NOT_ALLOWED','Content is not available for this student section.');res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',item});}catch(e){const f=publicFirebaseFailure(e,'CONTENT_DOCUMENT_READ');return fail(res,f.status,f.error,f.message);}});
+app.get('/api/content/children',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentIds??req.query.parentId);if(!ids.length)return fail(res,400,'PARENT_IDS_REQUIRED','Pass parentIds.');const section=req.auth.section||'all';const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem).then(a=>a.filter(x=>contentAllowed(x.data,section)))));const byParentId={};const items=[];ids.forEach((id,i)=>{byParentId[id]=lists[i];lists[i].forEach(x=>items.push({parentId:id,...x}));});items.sort((a,b)=>(Number(a.data?.order)||0)-(Number(b.data?.order)||0));res.json({success:true,parentIds:ids,count:items.length,byParentId,items});}catch(e){const f=publicFirebaseFailure(e,'BATCH_READ');return fail(res,f.status,f.error,f.message);}});
 
 // ---------------- Protected video token ----------------
 // Client asks for a short-lived token for a specific Firestore video document.
@@ -192,7 +232,7 @@ app.post('/api/video/token',requireStudent,async(req,res)=>{
     const accessToken=signVideoToken(req.auth.sub,id,req.auth.section||'all');
     res.set('Cache-Control','private,no-store');
     return res.json({success:true,accessToken,expiresIn:VIDEO_TOKEN_TTL_SECONDS,contentId:id});
-  }catch(e){console.error('video token',e);return fail(res,500,'VIDEO_TOKEN_FAILED','Unable to create video token.');}
+  }catch(e){const f=publicFirebaseFailure(e,'VIDEO_TOKEN');return fail(res,f.status,f.error==='FIREBASE_NOT_FOUND'?'VIDEO_NOT_FOUND':f.message);}
 });
 
 app.get('/api/video/source/:id',async(req,res)=>{
@@ -211,7 +251,7 @@ app.get('/api/video/source/:id',async(req,res)=>{
     if(!source)return fail(res,404,'VIDEO_SOURCE_MISSING','Video source is missing in Firestore.');
     res.set('Cache-Control','private,no-store');
     return res.json({success:true,contentId:id,type:String(data.type||''),title:String(data.displayName||data.title||''),source});
-  }catch(e){console.error('video source',e);return fail(res,500,'VIDEO_SOURCE_FAILED','Unable to read video source.');}
+  }catch(e){const f=publicFirebaseFailure(e,'VIDEO_SOURCE');return fail(res,f.status,f.error,f.message);}
 });
 
 // ---------------- Admin student management ----------------
