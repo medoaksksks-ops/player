@@ -70,7 +70,7 @@ let db=null; let firebaseMode=null;
 function initFirebase(){
   const service=parseJsonEnv('FIREBASE_ADMIN_SERVICE_ACCOUNT_JSON');
   if(service?.type==='service_account' && service.private_key && service.client_email){
-    try{if(!admin.apps.length)admin.initializeApp({credential:admin.credential.cert(service)});db=admin.firestore();firebaseMode='admin';console.log('Firestore Admin connected');return;}catch(e){console.error('Firestore init failed:',e.message);}
+    try{if(!admin.apps.length)admin.initializeApp({credential:admin.credential.cert(service),databaseURL:RTDB_URL});db=admin.firestore();firebaseMode='admin';console.log('Firestore Admin + RTDB connected');return;}catch(e){console.error('Firestore init failed:',e.message);}
   }
   const web=parseJsonEnv('FIREBASE_SERVICE_ACCOUNT_JSON');
   if(web?.apiKey && web?.projectId){
@@ -88,6 +88,25 @@ function parseParentIds(v){const arr=Array.isArray(v)?v:[v];const out=[];for(con
 // ---------------- Firebase Realtime Database ----------------
 // rtdb() normally appends .json; allow a full query path safely.
 async function rtdbPath(path,options={}){
+  // Prefer Firebase Admin SDK when the server has the service account.
+  // This avoids depending on public RTDB rules for private student-account writes.
+  if(firebaseMode==='admin' && admin.apps.length){
+    const raw=String(path);
+    const [pathname,queryString='']=raw.split('?');
+    const clean=pathname.replace(/\.json$/,'').replace(/^\/+|\/+$/g,'');
+    let ref=admin.database().ref(clean.split('/').filter(Boolean).map(decodeURIComponent).join('/'));
+    const params=new URLSearchParams(queryString);
+    if(params.has('orderBy')) ref=ref.orderByChild(JSON.parse(params.get('orderBy')));
+    if(params.has('equalTo')) ref=ref.equalTo(JSON.parse(params.get('equalTo')));
+    if(params.has('limitToFirst')) ref=ref.limitToFirst(Number(params.get('limitToFirst')));
+    const method=(options.method||'GET').toUpperCase();
+    if(method==='GET'){ const snap=await ref.once('value'); return snap.val(); }
+    if(method==='POST'){ const pushed=ref.push(); await pushed.set(options.body); return {name:pushed.key}; }
+    if(method==='PATCH'){ await ref.update(options.body||{}); return null; }
+    if(method==='PUT'){ await ref.set(options.body); return null; }
+    if(method==='DELETE'){ await ref.remove(); return null; }
+    throw new Error(`RTDB_METHOD_${method}`);
+  }
   const raw=String(path);
   const [pathname,query='']=raw.split('?');
   const slash=pathname.startsWith('/')?'':'/';
@@ -97,7 +116,8 @@ async function rtdbPath(path,options={}){
   try{
     const response=await fetch(url,{method:options.method||'GET',headers:{'Content-Type':'application/json'},body:options.body===undefined?undefined:JSON.stringify(options.body),signal:controller.signal});
     const text=await response.text();let data=null;try{data=text?JSON.parse(text):null;}catch(_){data=text;}
-    if(!response.ok)throw new Error(`RTDB_${response.status}`);return data;
+    if(!response.ok){const e=new Error(`RTDB_${response.status}`);e.status=response.status;e.body=data;throw e;}
+    return data;
   }finally{clearTimeout(timer);}
 }
 async function getStudentByLookup(lookup){const path=`${encodeURIComponent(STUDENTS_PATH)}.json?orderBy=%22codeLookup%22&equalTo=${encodeURIComponent(JSON.stringify(lookup))}&limitToFirst=1`;const data=await rtdbPath(path);if(!data||typeof data!=='object')return null;const e=Object.entries(data)[0];return e?{id:e[0],data:e[1]||{}}:null;}
@@ -157,7 +177,7 @@ app.post('/api/admin/students',requireAdmin,async(req,res)=>{
     const id=created?.name;
     if(!id)throw new Error('RTDB_CREATE_FAILED');
     res.status(201).json({success:true,student:{id,name,code,durationDays,status:'active',createdAt:new Date(now).toISOString(),expiresAt:new Date(expiresAt).toISOString()}});
-  }catch(e){console.error('student create',e);fail(res,500,'STUDENT_CREATE_FAILED','Unable to create student.');}
+  }catch(e){console.error('student create',e);fail(res,500,'STUDENT_CREATE_FAILED',e?.body?.error||e?.message||'Unable to create student.',{upstreamStatus:e?.status||null});}
 });
 app.patch('/api/admin/students/:id',requireAdmin,async(req,res)=>{try{const id=safeId(req.params.id);const current=await getStudent(id);if(!current)return fail(res,404,'STUDENT_NOT_FOUND','Student not found.');const patch={};if(req.body?.name!==undefined){const name=String(req.body.name).trim();if(!name||name.length>120)return fail(res,400,'INVALID_NAME','Invalid name.');patch.name=name;}if(req.body?.status!==undefined){const status=String(req.body.status);if(!['active','disabled'].includes(status))return fail(res,400,'INVALID_STATUS','Status must be active or disabled.');patch.status=status;}if(req.body?.durationDays!==undefined){const days=Number(req.body.durationDays);if(!Number.isInteger(days)||days<1||days>3650)return fail(res,400,'INVALID_DURATION','Invalid duration.');patch.durationDays=days;patch.expiresAt=Date.now()+days*86400000;}if(!Object.keys(patch).length)return fail(res,400,'NOTHING_TO_UPDATE','No valid fields supplied.');patch.updatedAt=Date.now();await rtdbPath(`${encodeURIComponent(STUDENTS_PATH)}/${encodeURIComponent(id)}.json`,{method:'PATCH',body:patch});res.json({success:true,id,updated:true});}catch(e){console.error(e);fail(res,500,'STUDENT_UPDATE_FAILED','Unable to update student.');}});
 
