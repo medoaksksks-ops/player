@@ -17,57 +17,101 @@ const admin = require('firebase-admin');
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// ---------- Firebase Admin ----------
+// ---------- Firebase ----------
+// TEST MODE: this server can use the SAME Firebase Web Config that exists
+// inside the Durosak Plus HTML file. Put that config JSON in
+// FIREBASE_SERVICE_ACCOUNT_JSON on Railway (the variable name is kept for
+// compatibility with the first version of this server).
+//
+// It also still supports a real Firebase Admin Service Account JSON.
+
+const firebaseApp = require('firebase/app');
+const firebaseFirestore = require('firebase/firestore');
+
+let db = null;
+let firebaseMode = null;
+
 function initFirestore() {
-  if (admin.apps.length) return admin.firestore();
+  if (db) return db;
 
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    let raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-
-    // Supports either a normal JSON string or base64-encoded JSON.
-    try {
-      const serviceAccount = JSON.parse(raw);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-      return admin.firestore();
-    } catch (_) {
-      try {
-        const decoded = Buffer.from(raw, 'base64').toString('utf8');
-        const serviceAccount = JSON.parse(decoded);
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount),
-        });
-        return admin.firestore();
-      } catch (error) {
-        console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', error.message);
-      }
-    }
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) {
+    console.warn('Firebase config is not configured.');
+    console.warn('Set FIREBASE_SERVICE_ACCOUNT_JSON to the Firebase Web Config JSON.');
+    return null;
   }
 
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_FILE) {
+  let config;
+  try {
+    config = JSON.parse(raw);
+  } catch (_) {
     try {
-      const file = path.resolve(process.env.FIREBASE_SERVICE_ACCOUNT_FILE);
-      const serviceAccount = require(file);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-      return admin.firestore();
+      config = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
     } catch (error) {
-      console.error('Cannot load FIREBASE_SERVICE_ACCOUNT_FILE:', error.message);
+      console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', error.message);
+      return null;
     }
   }
 
-  console.warn('Firebase credentials are not configured.');
-  console.warn('Set FIREBASE_SERVICE_ACCOUNT_JSON on Railway.');
+  // The user can paste the exact Web Config from the HTML file.
+  if (config && config.apiKey && config.projectId) {
+    try {
+      const app = firebaseApp.initializeApp(config);
+      db = firebaseFirestore.getFirestore(app);
+      firebaseMode = 'web-config';
+      console.log(`Firebase connected using Web Config: ${config.projectId}`);
+      return db;
+    } catch (error) {
+      console.error('Firebase Web Config initialization failed:', error.message);
+      return null;
+    }
+  }
+
+  // A real Admin Service Account is also accepted for later production use.
+  if (config && config.type === 'service_account' && config.private_key && config.client_email) {
+    try {
+      const admin = require('firebase-admin');
+      admin.initializeApp({ credential: admin.credential.cert(config) });
+      db = admin.firestore();
+      firebaseMode = 'admin-service-account';
+      console.log(`Firebase Admin connected: ${config.project_id || 'project'}`);
+      return db;
+    } catch (error) {
+      console.error('Firebase Admin initialization failed:', error.message);
+      return null;
+    }
+  }
+
+  console.error('FIREBASE_SERVICE_ACCOUNT_JSON must contain either the Firebase Web Config or a Service Account JSON.');
   return null;
 }
 
-const db = initFirestore();
+initFirestore();
+
+// Small compatibility wrapper so the rest of this API keeps the same
+// Firestore-style calls used by the previous server implementation.
+function contentQuery(parentId) {
+  if (firebaseMode === 'web-config') {
+    const ref = firebaseFirestore.collection(db, 'content');
+    return firebaseFirestore.getDocs(
+      firebaseFirestore.query(ref, firebaseFirestore.where('parentId', '==', parentId))
+    );
+  }
+
+  return db.collection('content').where('parentId', '==', parentId).get();
+}
+
+function contentDoc(id) {
+  if (firebaseMode === 'web-config') {
+    return firebaseFirestore.getDoc(firebaseFirestore.doc(db, 'content', id));
+  }
+
+  return db.collection('content').doc(id).get();
+}
 
 // ---------- Middleware ----------
 app.disable('x-powered-by');
-app.use(cors()); // OPEN TEST MODE
+app.use(cors({ origin: true, methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] })); // OPEN TEST MODE
 app.use(express.json({ limit: '1mb' }));
 
 // ---------- Helpers ----------
@@ -125,15 +169,15 @@ function parseParentIds(value) {
 function serialize(value) {
   if (value === null || value === undefined) return value;
 
-  if (value instanceof admin.firestore.Timestamp) {
+  if (value && typeof value.toDate === 'function' && value.constructor && value.constructor.name === 'Timestamp') {
     return value.toDate().toISOString();
   }
 
-  if (value instanceof admin.firestore.GeoPoint) {
+  if (value && typeof value.latitude === 'number' && typeof value.longitude === 'number' && value.constructor && value.constructor.name === 'GeoPoint') {
     return { latitude: value.latitude, longitude: value.longitude };
   }
 
-  if (value instanceof admin.firestore.DocumentReference) {
+  if (value && typeof value.path === 'string' && value.constructor && value.constructor.name === 'DocumentReference') {
     return { path: value.path };
   }
 
@@ -158,10 +202,7 @@ function docToItem(doc) {
 }
 
 async function readDirectContent(parentId) {
-  const snap = await db
-    .collection('content')
-    .where('parentId', '==', parentId)
-    .get();
+  const snap = await contentQuery(parentId);
 
   return snap.docs.map(docToItem);
 }
@@ -302,9 +343,10 @@ app.get('/api/content/doc/:id', async (req, res) => {
 
   try {
     const id = safeId(req.params.id);
-    const snap = await db.collection('content').doc(id).get();
+    const snap = await contentDoc(id);
 
-    if (!snap.exists) {
+    const exists = typeof snap.exists === 'function' ? snap.exists() : Boolean(snap.exists);
+    if (!exists) {
       return fail(res, 404, 'CONTENT_NOT_FOUND', 'Document not found.');
     }
 
@@ -476,6 +518,37 @@ app.get('/api/lectures/:lectureId/content', async (req, res) => {
   }
 });
 
+// ---------- Complete tree read ----------
+// Reads every descendant under a parent, preserving every Firestore field.
+// GET /api/content/tree?parentId=ROOT_ID&maxDepth=20
+app.get('/api/content/tree', async (req, res) => {
+  if (!needDb(res)) return;
+  try {
+    const rootId = safeId(req.query.parentId || 'root', 'parent_id');
+    const maxDepth = Math.min(Math.max(Number(req.query.maxDepth) || 20, 1), 50);
+    const visited = new Set();
+    const nodes = [];
+
+    async function walk(parentId, depth) {
+      if (depth > maxDepth || visited.has(parentId)) return;
+      visited.add(parentId);
+      const children = await readDirectContent(parentId);
+      for (const item of children) {
+        const node = { parentId, depth, ...item };
+        nodes.push(node);
+        await walk(item.id, depth + 1);
+      }
+    }
+
+    await walk(rootId, 0);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ success: true, source: 'firestore', rootParentId: rootId, maxDepth, count: nodes.length, items: nodes });
+  } catch (error) {
+    console.error('GET /api/content/tree failed:', error);
+    return fail(res, 500, 'FIRESTORE_TREE_READ_FAILED', error.message);
+  }
+});
+
 // ---------- 404 ----------
 app.use((req, res) => {
   return fail(res, 404, 'ROUTE_NOT_FOUND', 'Endpoint not found.');
@@ -485,6 +558,16 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   if (res.headersSent) return next(err);
+  return fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Unexpected server error.');
+});
+
+app.use((req, res) => {
+  return fail(res, 404, 'NOT_FOUND', `Route not found: ${req.method} ${req.path}`);
+});
+
+app.use((error, req, res, next) => {
+  console.error('Unhandled server error:', error);
+  if (res.headersSent) return next(error);
   return fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Unexpected server error.');
 });
 
