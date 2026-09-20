@@ -30,7 +30,14 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.use(helmet({crossOriginResourcePolicy:{policy:'cross-origin'}}));
 app.use(cors({
-  origin(origin,cb){ if(!origin || !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) return cb(null,true); return cb(new Error('CORS_ORIGIN_NOT_ALLOWED')); },
+  origin(origin,cb){
+    // Allow requests with no Origin (curl/server-to-server) and local file:// pages (Origin: null).
+    // If ALLOWED_ORIGINS contains '*', allow any origin.
+    if(!origin || origin==='null' || !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)){
+      return cb(null,true);
+    }
+    return cb(new Error('CORS_ORIGIN_NOT_ALLOWED'));
+  },
   credentials:true,
   methods:['GET','POST','PATCH','DELETE','OPTIONS'],
   allowedHeaders:['Content-Type','Authorization','X-Device-Id','Range']
