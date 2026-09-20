@@ -1,578 +1,155 @@
-// Durosak Plus API Server - Firestore bridge (OPEN TEST MODE)
-// Browser -> Node.js -> Firestore
-//
-// This server mirrors the Firestore reads currently used by Durosak Plus:
-// 1) content where parentId == X
-// 2) batch reads for multiple parentIds
-// 3) direct document reads
-// 4) lecture video-count lookup including "videos" child sections
-//
-// TEST MODE: routes are intentionally open. Secure them before production.
+// Durosak Plus API V3
+// Firestore = educational content
+// Firebase Realtime Database = student accounts
+// All private API routes require a short-lived Bearer token.
+// Admin credentials are NEVER hard-coded; configure them in Railway variables.
 
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const admin = require('firebase-admin');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const JWT_SECRET = process.env.API_JWT_SECRET || '';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const RTDB_URL = String(process.env.FIREBASE_RTDB_URL || 'https://english-73376-default-rtdb.firebaseio.com').replace(/\/$/, '');
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean);
+const ACCESS_TTL_SECONDS = Math.min(Math.max(Number(process.env.ACCESS_TTL_SECONDS) || 3600, 300), 86400);
 
-// ---------- Firebase ----------
-// TEST MODE: this server can use the SAME Firebase Web Config that exists
-// inside the Durosak Plus HTML file. Put that config JSON in
-// FIREBASE_SERVICE_ACCOUNT_JSON on Railway (the variable name is kept for
-// compatibility with the first version of this server).
-//
-// It also still supports a real Firebase Admin Service Account JSON.
-
-const firebaseApp = require('firebase/app');
-const firebaseFirestore = require('firebase/firestore');
-
-let db = null;
-let firebaseMode = null;
-
-function initFirestore() {
-  if (db) return db;
-
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) {
-    console.warn('Firebase config is not configured.');
-    console.warn('Set FIREBASE_SERVICE_ACCOUNT_JSON to the Firebase Web Config JSON.');
-    return null;
-  }
-
-  let config;
-  try {
-    config = JSON.parse(raw);
-  } catch (_) {
-    try {
-      config = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
-    } catch (error) {
-      console.error('Invalid FIREBASE_SERVICE_ACCOUNT_JSON:', error.message);
-      return null;
-    }
-  }
-
-  // The user can paste the exact Web Config from the HTML file.
-  if (config && config.apiKey && config.projectId) {
-    try {
-      const app = firebaseApp.initializeApp(config);
-      db = firebaseFirestore.getFirestore(app);
-      firebaseMode = 'web-config';
-      console.log(`Firebase connected using Web Config: ${config.projectId}`);
-      return db;
-    } catch (error) {
-      console.error('Firebase Web Config initialization failed:', error.message);
-      return null;
-    }
-  }
-
-  // A real Admin Service Account is also accepted for later production use.
-  if (config && config.type === 'service_account' && config.private_key && config.client_email) {
-    try {
-      const admin = require('firebase-admin');
-      admin.initializeApp({ credential: admin.credential.cert(config) });
-      db = admin.firestore();
-      firebaseMode = 'admin-service-account';
-      console.log(`Firebase Admin connected: ${config.project_id || 'project'}`);
-      return db;
-    } catch (error) {
-      console.error('Firebase Admin initialization failed:', error.message);
-      return null;
-    }
-  }
-
-  console.error('FIREBASE_SERVICE_ACCOUNT_JSON must contain either the Firebase Web Config or a Service Account JSON.');
-  return null;
-}
-
-initFirestore();
-
-// Small compatibility wrapper so the rest of this API keeps the same
-// Firestore-style calls used by the previous server implementation.
-function contentQuery(parentId) {
-  if (firebaseMode === 'web-config') {
-    const ref = firebaseFirestore.collection(db, 'content');
-    return firebaseFirestore.getDocs(
-      firebaseFirestore.query(ref, firebaseFirestore.where('parentId', '==', parentId))
-    );
-  }
-
-  return db.collection('content').where('parentId', '==', parentId).get();
-}
-
-function contentDoc(id) {
-  if (firebaseMode === 'web-config') {
-    return firebaseFirestore.getDoc(firebaseFirestore.doc(db, 'content', id));
-  }
-
-  return db.collection('content').doc(id).get();
-}
-
-// ---------- Middleware ----------
 app.disable('x-powered-by');
-app.use(cors({ origin: true, methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] })); // OPEN TEST MODE
-app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS_ORIGIN_NOT_ALLOWED'));
+  },
+  methods: ['GET','POST','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.use(express.json({ limit: '256kb' }));
 
-// ---------- Helpers ----------
-function fail(res, status, code, message, extra = {}) {
-  return res.status(status).json({
-    success: false,
-    error: code,
-    message,
-    ...extra,
-  });
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 180,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { success:false, error:'RATE_LIMITED', message:'Too many requests.' }
+});
+const authLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 15,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { success:false, error:'AUTH_RATE_LIMITED', message:'Too many authentication attempts.' }
+});
+app.use(generalLimiter);
+
+function fail(res, status, error, message, extra = {}) { return res.status(status).json({ success:false, error, message, ...extra }); }
+function safeEqual(a,b) { const x=Buffer.from(String(a)); const y=Buffer.from(String(b)); return x.length===y.length && crypto.timingSafeEqual(x,y); }
+function randomId(bytes=16) { return crypto.randomBytes(bytes).toString('hex'); }
+function sixDigitCode(v) { return /^\d{6}$/.test(String(v || '')); }
+function safeId(v,label='id') { const x=String(v ?? '').trim(); if(!x || x.length>200 || /[\u0000-\u001F]/.test(x)) throw new Error(`INVALID_${label.toUpperCase()}`); return x; }
+function parseJsonEnv(name) { const raw=process.env[name]; if(!raw) return null; try{return JSON.parse(raw);}catch(_){try{return JSON.parse(Buffer.from(raw,'base64').toString('utf8'));}catch(__){return null;}} }
+function hashSecret(value,salt=crypto.randomBytes(16).toString('hex')) { return new Promise((resolve,reject)=>crypto.scrypt(String(value),salt,64,{N:16384,r:8,p:1},(e,d)=>e?reject(e):resolve(`${salt}:${d.toString('hex')}`))); }
+function verifySecret(value,stored) { return new Promise((resolve,reject)=>{const [salt,expected]=String(stored||'').split(':'); if(!salt||!expected)return resolve(false); crypto.scrypt(String(value),salt,64,{N:16384,r:8,p:1},(e,d)=>{if(e)return reject(e);resolve(safeEqual(d.toString('hex'),expected));});}); }
+function codeLookup(code) { if(!JWT_SECRET) throw new Error('API_JWT_SECRET_NOT_CONFIGURED'); return crypto.createHmac('sha256',JWT_SECRET).update(`student-code:${code}`).digest('hex'); }
+function b64(v){return Buffer.from(v).toString('base64url');}
+function signToken(payload){const h=b64(JSON.stringify({alg:'HS256',typ:'JWT'}));const p=b64(JSON.stringify(payload));const s=crypto.createHmac('sha256',JWT_SECRET).update(`${h}.${p}`).digest('base64url');return `${h}.${p}.${s}`;}
+function verifyToken(token){const a=String(token||'').split('.');if(a.length!==3||!JWT_SECRET)return null;const [h,p,s]=a;const expected=crypto.createHmac('sha256',JWT_SECRET).update(`${h}.${p}`).digest('base64url');if(!safeEqual(s,expected))return null;try{const x=JSON.parse(Buffer.from(p,'base64url').toString());if(!x.exp||x.exp<=Math.floor(Date.now()/1000))return null;return x;}catch(_){return null;}}
+function bearer(req){const h=String(req.headers.authorization||'');return h.startsWith('Bearer ')?h.slice(7).trim():'';}
+
+// ---------------- Firebase / Firestore ----------------
+let db=null; let firebaseMode=null;
+function initFirebase(){
+  const service=parseJsonEnv('FIREBASE_ADMIN_SERVICE_ACCOUNT_JSON');
+  if(service?.type==='service_account' && service.private_key && service.client_email){
+    try{if(!admin.apps.length)admin.initializeApp({credential:admin.credential.cert(service)});db=admin.firestore();firebaseMode='admin';console.log('Firestore Admin connected');return;}catch(e){console.error('Firestore init failed:',e.message);}
+  }
+  const web=parseJsonEnv('FIREBASE_SERVICE_ACCOUNT_JSON');
+  if(web?.apiKey && web?.projectId){
+    try{const fa=require('firebase/app');const fs=require('firebase/firestore');const client=fa.initializeApp(web);db=fs.getFirestore(client);firebaseMode='web';console.log('Firestore Web Config connected');}catch(e){console.error('Firestore Web init failed:',e.message);}
+  }
 }
+initFirebase();
+function needDb(res){if(db)return true;fail(res,503,'FIREBASE_NOT_CONFIGURED','Firestore is not configured.');return false;}
+function contentQuery(parentId){if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDocs(fs.query(fs.collection(db,'content'),fs.where('parentId','==',parentId)));}return db.collection('content').where('parentId','==',parentId).get();}
+function contentDoc(id){if(firebaseMode==='web'){const fs=require('firebase/firestore');return fs.getDoc(fs.doc(db,'content',id));}return db.collection('content').doc(id).get();}
+function serialize(v){if(v===null||v===undefined)return v;if(v?.toDate instanceof Function)return v.toDate().toISOString();if(Array.isArray(v))return v.map(serialize);if(typeof v==='object'){const o={};for(const[k,x]of Object.entries(v))o[k]=serialize(x);return o;}return v;}
+function docToItem(doc){return{id:doc.id,data:serialize(doc.data()||{})};}
+function parseParentIds(v){const arr=Array.isArray(v)?v:[v];const out=[];for(const x of arr){if(x===undefined||x===null||x==='')continue;for(const p of String(x).split(',').map(s=>s.trim()).filter(Boolean))out.push(safeId(p,'parent_id'));}return [...new Set(out)];}
 
-function needDb(res) {
-  if (db) return true;
-  fail(
-    res,
-    503,
-    'FIREBASE_NOT_CONFIGURED',
-    'Firebase credentials are not configured on the Node.js server.'
-  );
-  return false;
+// ---------------- Firebase Realtime Database ----------------
+async function rtdb(path='', options={}){
+  const clean=String(path).replace(/^\//,'');
+  const url=`${RTDB_URL}/${clean}.json`;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),8000);
+  try{
+    const response=await fetch(url,{method:options.method||'GET',headers:{'Content-Type':'application/json'},body:options.body===undefined?undefined:JSON.stringify(options.body),signal:controller.signal});
+    const text=await response.text();let data=null;try{data=text?JSON.parse(text):null;}catch(_){data=text;}
+    if(!response.ok)throw new Error(`RTDB_${response.status}`);
+    return data;
+  }finally{clearTimeout(timer);}
 }
-
-function safeId(value, label = 'id') {
-  const v = String(value ?? '').trim();
-  if (!v || v.length > 200 || /[\u0000-\u001F]/.test(v)) {
-    throw new Error(`INVALID_${label.toUpperCase()}`);
-  }
-  return v;
+async function findStudentByLookup(lookup){
+  const params='?orderBy='+encodeURIComponent('"codeLookup"')+'&equalTo='+encodeURIComponent(`"${lookup}"`);
+  const data=await rtdb(`students.json${params}`); // handled below because path already has query
+  if(!data||typeof data!=='object')return null;
+  const entries=Object.entries(data); return entries.length?{id:entries[0][0],data:entries[0][1]||{}}:null;
 }
-
-function parseParentIds(value) {
-  const values = Array.isArray(value) ? value : [value];
-  const ids = [];
-
-  for (const item of values) {
-    if (item === undefined || item === null || item === '') continue;
-
-    // Supports query forms such as:
-    // ?parentIds=a,b,c
-    // ?parentIds=a&parentIds=b
-    const parts = String(item)
-      .split(',')
-      .map(x => x.trim())
-      .filter(Boolean);
-
-    for (const part of parts) {
-      ids.push(safeId(part, 'parent_id'));
-    }
-  }
-
-  return [...new Set(ids)];
+// rtdb() normally appends .json; allow a full query path safely.
+const originalRtdb=rtdb;
+async function rtdbPath(path,options={}){
+  const raw=String(path); const slash=raw.startsWith('/')?'':'/'; const url=`${RTDB_URL}${slash}${raw.endsWith('.json')?'':raw}.json`;
+  const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),8000);
+  try{const response=await fetch(url,{method:options.method||'GET',headers:{'Content-Type':'application/json'},body:options.body===undefined?undefined:JSON.stringify(options.body),signal:controller.signal});const text=await response.text();let data=null;try{data=text?JSON.parse(text):null;}catch(_){data=text;}if(!response.ok)throw new Error(`RTDB_${response.status}`);return data;}finally{clearTimeout(timer);}
 }
+async function getStudentByLookup(lookup){const path=`students.json?orderBy=%22codeLookup%22&equalTo=${encodeURIComponent(JSON.stringify(lookup))}&limitToFirst=1`;const data=await rtdbPath(path);if(!data||typeof data!=='object')return null;const e=Object.entries(data)[0];return e?{id:e[0],data:e[1]||{}}:null;}
+async function getStudent(id){return await rtdbPath(`students/${encodeURIComponent(id)}.json`);}
 
-function serialize(value) {
-  if (value === null || value === undefined) return value;
+// ---------------- Authentication ----------------
+function requireStudent(req,res,next){const p=verifyToken(bearer(req));if(!p||p.role!=='student'||!p.sub)return fail(res,401,'UNAUTHORIZED','Valid student Bearer token required.');req.auth=p;next();}
+function requireAdmin(req,res,next){const p=verifyToken(bearer(req));if(!p||p.role!=='admin'||!p.sub)return fail(res,401,'ADMIN_UNAUTHORIZED','Valid admin Bearer token required.');req.auth=p;next();}
 
-  if (value && typeof value.toDate === 'function' && value.constructor && value.constructor.name === 'Timestamp') {
-    return value.toDate().toISOString();
-  }
+app.get('/',(req,res)=>res.json({success:true,name:'Durosak Plus API',security:'bearer-token-protected',firestore:firebaseMode,rtdb:true}));
+app.get('/health',(req,res)=>res.json({success:true,firestoreConfigured:Boolean(db),firestoreMode:firebaseMode,rtdbConfigured:Boolean(RTDB_URL),time:new Date().toISOString()}));
 
-  if (value && typeof value.latitude === 'number' && typeof value.longitude === 'number' && value.constructor && value.constructor.name === 'GeoPoint') {
-    return { latitude: value.latitude, longitude: value.longitude };
-  }
-
-  if (value && typeof value.path === 'string' && value.constructor && value.constructor.name === 'DocumentReference') {
-    return { path: value.path };
-  }
-
-  if (Array.isArray(value)) return value.map(serialize);
-
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = serialize(item);
-    }
-    return out;
-  }
-
-  return value;
-}
-
-function docToItem(doc) {
-  return {
-    id: doc.id,
-    data: serialize(doc.data() || {}),
-  };
-}
-
-async function readDirectContent(parentId) {
-  const snap = await contentQuery(parentId);
-
-  return snap.docs.map(docToItem);
-}
-
-// Same nested read pattern used by the current lecture page.
-async function readVideoCount(lectureId) {
-  const direct = await readDirectContent(lectureId);
-
-  let count = 0;
-  const videoSections = [];
-
-  for (const item of direct) {
-    const d = item.data || {};
-    const type = String(d.type || '').toLowerCase();
-    const name = String(d.displayName || d.title || '').trim().toLowerCase();
-
-    if (type === 'video' || type === 'youtube') count++;
-
-    if (
-      type === 'section' &&
-      (name.includes('فيديو') ||
-        name.includes('فديو') ||
-        name.includes('video'))
-    ) {
-      videoSections.push(item.id);
-    }
-  }
-
-  if (videoSections.length) {
-    const children = await Promise.all(
-      videoSections.map(sectionId => readDirectContent(sectionId))
-    );
-
-    const unique = new Set();
-    for (const list of children) {
-      for (const item of list) {
-        const d = item.data || {};
-        const type = String(d.type || '').toLowerCase();
-        if (
-          (type === 'video' || type === 'youtube') &&
-          !unique.has(item.id)
-        ) {
-          unique.add(item.id);
-          count++;
-        }
-      }
-    }
-  }
-
-  return {
-    lectureId,
-    count,
-    directItems: direct,
-    videoSectionIds: videoSections,
-  };
-}
-
-// ---------- Basic routes ----------
-app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    name: 'Durosak Plus API',
-    mode: 'open-development',
-    firebaseConfigured: Boolean(db),
-    firestoreCollection: 'content',
-    message: 'Node.js is running between the website and Firestore.',
-  });
+// ---------------- Admin login ----------------
+app.post('/api/admin/login',authLimiter,async(req,res)=>{
+  if(!JWT_SECRET||!ADMIN_USERNAME||!ADMIN_PASSWORD)return fail(res,503,'ADMIN_AUTH_NOT_CONFIGURED','Admin authentication is not configured.');
+  const username=String(req.body?.username||'');const password=String(req.body?.password||'');
+  if(!safeEqual(username,ADMIN_USERNAME)||!safeEqual(password,ADMIN_PASSWORD))return fail(res,401,'INVALID_ADMIN_CREDENTIALS','Invalid admin credentials.');
+  const now=Math.floor(Date.now()/1000);const token=signToken({sub:'admin',role:'admin',iat:now,exp:now+ACCESS_TTL_SECONDS,jti:randomId(12)});
+  res.json({success:true,accessToken:token,expiresIn:ACCESS_TTL_SECONDS,admin:{username:ADMIN_USERNAME}});
 });
 
-app.get('/health', (req, res) => {
-  res.json({
-    success: true,
-    firebaseConfigured: Boolean(db),
-    time: new Date().toISOString(),
-  });
+// ---------------- Student login ----------------
+app.post('/api/auth/login',authLimiter,async(req,res)=>{
+  try{if(!JWT_SECRET)return fail(res,503,'AUTH_NOT_CONFIGURED','API_JWT_SECRET is not configured.');const code=String(req.body?.code||'').trim();if(!sixDigitCode(code))return fail(res,400,'INVALID_CODE','Student code must contain exactly 6 digits.');const lookup=codeLookup(code);const found=await getStudentByLookup(lookup);if(!found)return fail(res,401,'INVALID_CREDENTIALS','Invalid or expired code.');const d=found.data;const expires=Number(d.expiresAt||0);const valid=d.status!=='disabled'&&d.status!=='deleted'&&expires>Date.now()&&await verifySecret(code,d.codeHash);if(!valid)return fail(res,401,'INVALID_CREDENTIALS','Invalid or expired code.');const now=Math.floor(Date.now()/1000);const token=signToken({sub:found.id,role:'student',iat:now,exp:now+ACCESS_TTL_SECONDS,jti:randomId(12)});await rtdbPath(`students/${encodeURIComponent(found.id)}.json`,{method:'PATCH',body:{lastLoginAt:Date.now()}});return res.json({success:true,accessToken:token,expiresIn:ACCESS_TTL_SECONDS,student:{id:found.id,name:d.name||'',status:d.status||'active',expiresAt:new Date(expires).toISOString()}});}catch(e){console.error('student login',e);return fail(res,500,'LOGIN_FAILED','Login failed.');}
 });
 
-// ---------- EXACT Firestore-style content read ----------
-// Current website equivalent:
-// db.collection("content").where("parentId","==",parentId).get()
-//
-// Example:
-// GET /api/content?parentId=root
-// GET /api/content?parentId=LECTURE_ID
-app.get('/api/content', async (req, res) => {
-  if (!needDb(res)) return;
+// ---------------- Protected Firestore content ----------------
+app.get('/api/content',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentId??req.query.parentIds);if(!ids.length)return fail(res,400,'PARENT_ID_REQUIRED','Pass parentId.');const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem)));const items=[];const seen=new Set();for(const list of lists)for(const x of list)if(!seen.has(x.id)){seen.add(x.id);items.push(x);}res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',parentIds:ids,count:items.length,items});}catch(e){console.error(e);fail(res,500,'CONTENT_READ_FAILED','Unable to read content.');}});
+app.get('/api/content/doc/:id',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const id=safeId(req.params.id);const snap=await contentDoc(id);const exists=typeof snap.exists==='function'?snap.exists():Boolean(snap.exists);if(!exists)return fail(res,404,'CONTENT_NOT_FOUND','Document not found.');res.set('Cache-Control','private,no-store');res.json({success:true,source:'firestore',collection:'content',item:docToItem(snap)});}catch(e){fail(res,500,'CONTENT_DOCUMENT_READ_FAILED','Unable to read document.');}});
+app.get('/api/content/children',requireStudent,async(req,res)=>{if(!needDb(res))return;try{const ids=parseParentIds(req.query.parentIds??req.query.parentId);if(!ids.length)return fail(res,400,'PARENT_IDS_REQUIRED','Pass parentIds.');const lists=await Promise.all(ids.map(async id=>(await contentQuery(id)).docs.map(docToItem)));const byParentId={};const items=[];ids.forEach((id,i)=>{byParentId[id]=lists[i];lists[i].forEach(x=>items.push({parentId:id,...x}));});res.json({success:true,parentIds:ids,count:items.length,byParentId,items});}catch(e){fail(res,500,'BATCH_READ_FAILED','Unable to read content.');}});
 
-  try {
-    const parentIds = parseParentIds(
-      req.query.parentId ?? req.query.parentIds
-    );
+// ---------------- Admin student management ----------------
+app.get('/api/admin/students',requireAdmin,async(req,res)=>{try{const data=await rtdbPath('students.json');const students=Object.entries(data||{}).map(([id,d])=>({id,name:d?.name||'',status:d?.status||'active',durationDays:d?.durationDays||null,createdAt:d?.createdAt||null,expiresAt:d?.expiresAt||null,lastLoginAt:d?.lastLoginAt||null}));students.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));res.json({success:true,count:students.length,students:students.slice(0,1000)});}catch(e){console.error(e);fail(res,500,'STUDENTS_READ_FAILED','Unable to list students.');}});
 
-    if (!parentIds.length) {
-      return fail(
-        res,
-        400,
-        'PARENT_ID_REQUIRED',
-        'Pass ?parentId=... (or ?parentIds=a,b).'
-      );
-    }
+app.post('/api/admin/students',requireAdmin,async(req,res)=>{try{const name=String(req.body?.name||'').trim();const code=String(req.body?.code||'').trim();const durationDays=Number(req.body?.durationDays);if(!name||name.length>120)return fail(res,400,'INVALID_NAME','Invalid name.');if(!sixDigitCode(code))return fail(res,400,'INVALID_CODE','Code must contain exactly 6 digits.');if(!Number.isInteger(durationDays)||durationDays<1||durationDays>3650)return fail(res,400,'INVALID_DURATION','durationDays must be 1..3650.');const lookup=codeLookup(code);const existing=await getStudentByLookup(lookup);if(existing&&existing.data?.status!=='deleted')return fail(res,409,'CODE_ALREADY_EXISTS','That code is already in use.');const codeHash=await hashSecret(code);const now=Date.now();const expiresAt=now+durationDays*86400000;const body={name,codeHash,codeLookup:lookup,status:'active',durationDays,createdAt:now,expiresAt,lastLoginAt:null};const created=await rtdbPath('students.json',{method:'POST',body});const id=created?.name;if(!id)throw new Error('RTDB_CREATE_FAILED');res.status(201).json({success:true,student:{id,name,code,durationDays,status:'active',createdAt:new Date(now).toISOString(),expiresAt:new Date(expiresAt).toISOString()}});}catch(e){console.error(e);fail(res,500,'STUDENT_CREATE_FAILED','Unable to create student.');}});
 
-    const lists = await Promise.all(parentIds.map(readDirectContent));
-    const seen = new Set();
-    const items = [];
+app.patch('/api/admin/students/:id',requireAdmin,async(req,res)=>{try{const id=safeId(req.params.id);const current=await getStudent(id);if(!current)return fail(res,404,'STUDENT_NOT_FOUND','Student not found.');const patch={};if(req.body?.name!==undefined){const name=String(req.body.name).trim();if(!name||name.length>120)return fail(res,400,'INVALID_NAME','Invalid name.');patch.name=name;}if(req.body?.status!==undefined){const status=String(req.body.status);if(!['active','disabled'].includes(status))return fail(res,400,'INVALID_STATUS','Status must be active or disabled.');patch.status=status;}if(req.body?.durationDays!==undefined){const days=Number(req.body.durationDays);if(!Number.isInteger(days)||days<1||days>3650)return fail(res,400,'INVALID_DURATION','Invalid duration.');patch.durationDays=days;patch.expiresAt=Date.now()+days*86400000;}if(!Object.keys(patch).length)return fail(res,400,'NOTHING_TO_UPDATE','No valid fields supplied.');patch.updatedAt=Date.now();await rtdbPath(`students/${encodeURIComponent(id)}.json`,{method:'PATCH',body:patch});res.json({success:true,id,updated:true});}catch(e){console.error(e);fail(res,500,'STUDENT_UPDATE_FAILED','Unable to update student.');}});
 
-    for (const list of lists) {
-      for (const item of list) {
-        if (seen.has(item.id)) continue;
-        seen.add(item.id);
-        items.push(item);
-      }
-    }
+app.delete('/api/admin/students/:id',requireAdmin,async(req,res)=>{try{const id=safeId(req.params.id);const current=await getStudent(id);if(!current)return fail(res,404,'STUDENT_NOT_FOUND','Student not found.');await rtdbPath(`students/${encodeURIComponent(id)}.json`,{method:'PATCH',body:{status:'deleted',deletedAt:Date.now(),updatedAt:Date.now()}});res.json({success:true,id,deleted:true});}catch(e){fail(res,500,'STUDENT_DELETE_FAILED','Unable to delete student.');}});
 
-    res.set('Cache-Control', 'no-store');
-    return res.json({
-      success: true,
-      source: 'firestore',
-      collection: 'content',
-      parentIds,
-      count: items.length,
-      items,
-    });
-  } catch (error) {
-    console.error('GET /api/content failed:', error);
-    return fail(
-      res,
-      500,
-      'FIRESTORE_CONTENT_READ_FAILED',
-      error.message
-    );
-  }
-});
+app.use((req,res)=>fail(res,404,'NOT_FOUND','Endpoint not found.'));
+app.use((err,req,res,next)=>{console.error(err);if(err?.message==='CORS_ORIGIN_NOT_ALLOWED')return fail(res,403,'CORS_BLOCKED','Origin is not allowed.');return fail(res,500,'INTERNAL_ERROR','Internal server error.');});
 
-// ---------- Direct document read ----------
-// GET /api/content/doc/:id
-app.get('/api/content/doc/:id', async (req, res) => {
-  if (!needDb(res)) return;
-
-  try {
-    const id = safeId(req.params.id);
-    const snap = await contentDoc(id);
-
-    const exists = typeof snap.exists === 'function' ? snap.exists() : Boolean(snap.exists);
-    if (!exists) {
-      return fail(res, 404, 'CONTENT_NOT_FOUND', 'Document not found.');
-    }
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({
-      success: true,
-      source: 'firestore',
-      collection: 'content',
-      item: docToItem(snap),
-    });
-  } catch (error) {
-    const status = error.message.startsWith('INVALID_') ? 400 : 500;
-    return fail(res, status, 'CONTENT_DOCUMENT_READ_FAILED', error.message);
-  }
-});
-
-// ---------- Batch children endpoint ----------
-// Useful when the frontend has multiple bucket/parent IDs and wants one HTTP request.
-// GET /api/content/children?parentIds=A,B,C
-app.get('/api/content/children', async (req, res) => {
-  if (!needDb(res)) return;
-
-  try {
-    const parentIds = parseParentIds(req.query.parentIds ?? req.query.parentId);
-
-    if (!parentIds.length) {
-      return fail(
-        res,
-        400,
-        'PARENT_IDS_REQUIRED',
-        'Pass ?parentIds=A,B,C.'
-      );
-    }
-
-    const lists = await Promise.all(parentIds.map(readDirectContent));
-    const byParentId = {};
-    const items = [];
-    const seen = new Set();
-
-    for (let i = 0; i < parentIds.length; i++) {
-      byParentId[parentIds[i]] = lists[i];
-      for (const item of lists[i]) {
-        const key = `${parentIds[i]}:${item.id}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        items.push({ parentId: parentIds[i], ...item });
-      }
-    }
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({
-      success: true,
-      source: 'firestore',
-      collection: 'content',
-      parentIds,
-      count: items.length,
-      byParentId,
-      items,
-    });
-  } catch (error) {
-    console.error('GET /api/content/children failed:', error);
-    return fail(
-      res,
-      500,
-      'FIRESTORE_BATCH_READ_FAILED',
-      error.message
-    );
-  }
-});
-
-// ---------- Lecture video count ----------
-// Mirrors the current site's extra Firestore calls for lecture cards.
-// GET /api/lectures/:lectureId/video-count
-app.get('/api/lectures/:lectureId/video-count', async (req, res) => {
-  if (!needDb(res)) return;
-
-  try {
-    const lectureId = safeId(req.params.lectureId, 'lecture_id');
-    const result = await readVideoCount(lectureId);
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({
-      success: true,
-      source: 'firestore',
-      ...result,
-    });
-  } catch (error) {
-    console.error('GET /api/lectures/:lectureId/video-count failed:', error);
-    return fail(
-      res,
-      500,
-      'LECTURE_VIDEO_COUNT_FAILED',
-      error.message
-    );
-  }
-});
-
-// ---------- Optional lecture flattened read ----------
-// Mirrors the lecture-page behavior where "فيديوهات المحاضرة" / "ملفات المحاضرة"
-// sections are not shown as cards; their children are merged into the lecture list.
-// GET /api/lectures/:lectureId/content
-app.get('/api/lectures/:lectureId/content', async (req, res) => {
-  if (!needDb(res)) return;
-
-  try {
-    const lectureId = safeId(req.params.lectureId, 'lecture_id');
-    const direct = await readDirectContent(lectureId);
-
-    const bucketSections = direct.filter(item => {
-      const d = item.data || {};
-      const type = String(d.type || '').toLowerCase();
-      const name = String(d.displayName || d.title || '')
-        .trim()
-        .toLowerCase();
-
-      return (
-        type === 'section' &&
-        (name.includes('فيديو') ||
-          name.includes('فديو') ||
-          name.includes('ملف') ||
-          name.includes('ملفات') ||
-          name.includes('video') ||
-          name.includes('file'))
-      );
-    });
-
-    const bucketIds = bucketSections.map(x => x.id);
-    const base = direct.filter(x => !bucketIds.includes(x.id));
-
-    let merged = [...base];
-
-    if (bucketIds.length) {
-      const children = await Promise.all(bucketIds.map(readDirectContent));
-      const seen = new Set();
-
-      for (const list of children) {
-        for (const item of list) {
-          if (seen.has(item.id)) continue;
-          seen.add(item.id);
-          merged.push(item);
-        }
-      }
-    }
-
-    // Current frontend sorts using numeric order after fetching.
-    merged.sort((a, b) => {
-      const ao = Number(a.data?.order) || 0;
-      const bo = Number(b.data?.order) || 0;
-      return ao - bo;
-    });
-
-    res.set('Cache-Control', 'no-store');
-    return res.json({
-      success: true,
-      source: 'firestore',
-      lectureId,
-      count: merged.length,
-      bucketSectionIds: bucketIds,
-      items: merged,
-    });
-  } catch (error) {
-    console.error('GET /api/lectures/:lectureId/content failed:', error);
-    return fail(
-      res,
-      500,
-      'LECTURE_CONTENT_READ_FAILED',
-      error.message
-    );
-  }
-});
-
-// ---------- Complete tree read ----------
-// Reads every descendant under a parent, preserving every Firestore field.
-// GET /api/content/tree?parentId=ROOT_ID&maxDepth=20
-app.get('/api/content/tree', async (req, res) => {
-  if (!needDb(res)) return;
-  try {
-    const rootId = safeId(req.query.parentId || 'root', 'parent_id');
-    const maxDepth = Math.min(Math.max(Number(req.query.maxDepth) || 20, 1), 50);
-    const visited = new Set();
-    const nodes = [];
-
-    async function walk(parentId, depth) {
-      if (depth > maxDepth || visited.has(parentId)) return;
-      visited.add(parentId);
-      const children = await readDirectContent(parentId);
-      for (const item of children) {
-        const node = { parentId, depth, ...item };
-        nodes.push(node);
-        await walk(item.id, depth + 1);
-      }
-    }
-
-    await walk(rootId, 0);
-    res.set('Cache-Control', 'no-store');
-    return res.json({ success: true, source: 'firestore', rootParentId: rootId, maxDepth, count: nodes.length, items: nodes });
-  } catch (error) {
-    console.error('GET /api/content/tree failed:', error);
-    return fail(res, 500, 'FIRESTORE_TREE_READ_FAILED', error.message);
-  }
-});
-
-// ---------- 404 ----------
-app.use((req, res) => {
-  return fail(res, 404, 'ROUTE_NOT_FOUND', 'Endpoint not found.');
-});
-
-// ---------- Error handler ----------
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  if (res.headersSent) return next(err);
-  return fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Unexpected server error.');
-});
-
-app.use((req, res) => {
-  return fail(res, 404, 'NOT_FOUND', `Route not found: ${req.method} ${req.path}`);
-});
-
-app.use((error, req, res, next) => {
-  console.error('Unhandled server error:', error);
-  if (res.headersSent) return next(error);
-  return fail(res, 500, 'INTERNAL_SERVER_ERROR', 'Unexpected server error.');
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Durosak Plus API listening on ${PORT}`);
-  console.log(`🔥 Firestore configured: ${Boolean(db)}`);
-  console.log('⚠️ OPEN TEST MODE — do not use this configuration for production.');
-});
+if(!JWT_SECRET)console.warn('WARNING: API_JWT_SECRET missing.');
+if(!ADMIN_USERNAME||!ADMIN_PASSWORD)console.warn('WARNING: ADMIN_USERNAME/ADMIN_PASSWORD missing.');
+app.listen(PORT,()=>console.log(`Durosak Plus API listening on ${PORT}`));
