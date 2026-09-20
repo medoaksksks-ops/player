@@ -31,9 +31,9 @@ app.set('trust proxy', 1);
 app.use(helmet({crossOriginResourcePolicy:{policy:'cross-origin'}}));
 app.use(cors({
   origin(origin,cb){
-    // Allow requests with no Origin (curl/server-to-server) and local file:// pages (Origin: null).
-    // If ALLOWED_ORIGINS contains '*', allow any origin.
-    if(!origin || origin==='null' || !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)){
+    // Allow requests with no Origin (same-origin/server tools) and file:// pages (Origin: null).
+    // ALLOWED_ORIGINS=* means allow every origin.
+    if(!origin || origin === 'null' || !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
       return cb(null,true);
     }
     return cb(new Error('CORS_ORIGIN_NOT_ALLOWED'));
@@ -130,7 +130,7 @@ app.post('/verify-pin',authLimiter,async(req,res)=>{
     return res.json({success:true,sessionToken:token,accessToken:token,expiresIn:ACCESS_TTL_SECONDS,studentId:found.id,studentName:d.name||'',student:{id:found.id,name:d.name||'',status:d.status||'active',expiresAt:new Date(expires).toISOString(),deviceLimit,deviceId}});
   }catch(e){console.error('verify-pin',e);return fail(res,500,'LOGIN_FAILED','Login failed.');}
 });
-app.post('/api/auth/login',authLimiter,async(req,res)=>{req.body={...(req.body||{}),pin:req.body?.code||req.body?.pin,deviceId:req.body?.deviceId||`dev_${randomId(12)}`};return app._router.handle(Object.assign(req,{url:'/verify-pin',originalUrl:'/verify-pin'}),res,()=>{});});
+app.post('/api/auth/login',authLimiter,async(req,res)=>{req.body={...(req.body||{}),pin:req.body?.code||req.body?.pin,deviceId:req.body?.deviceId||`dev_${randomId(12)}`};return app.router.handle(Object.assign(req,{url:'/verify-pin',originalUrl:'/verify-pin'}),res,()=>{});});
 
 // ---------------- Session config ----------------
 app.get('/get-config',requireStudent,async(req,res)=>res.json({success:true,config:{studentId:req.student.id,name:req.student.data.name||'',section:req.student.data.section||'all',status:req.student.data.status||'active',expiresAt:req.student.data.expiresAt||null,deviceLimit:Number(req.student.data.deviceLimit||1),deviceId:req.student.deviceId}}));
