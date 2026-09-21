@@ -1,16 +1,16 @@
 {
-  "name": "durosak-plus-api",
-  "version": "3.0.0",
-  "private": true,
+  "name": "durosak-notification-watcher",
+  "version": "1.0.0",
+  "description": "24/7 Firestore notification watcher for Railway",
   "main": "server.js",
-  "scripts": {"start":"node server.js","dev":"node server.js"},
-  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^5.1.0",
-    "firebase-admin": "^13.5.0",
-    "firebase": "^12.2.1",
-    "helmet": "^8.1.0",
-    "express-rate-limit": "^7.5.1"
+    "firebase-admin": "^13.6.0"
   }
 }
