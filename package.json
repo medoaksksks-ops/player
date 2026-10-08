@@ -3,7 +3,7 @@
   "version": "2.0.0",
   "private": true,
   "description": "Coursatk license/code management server with admin dashboard",
-  "main": "serve.r.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
