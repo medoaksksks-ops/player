@@ -82,13 +82,39 @@ function makeLicenseId(code) {
 }
 
 /* =========================
+   Code + settings helpers
+========================= */
+
+// الكود لازم يكون 9 أرقام بالظبط
+function isValidCode(code) {
+  return /^\d{9}$/.test(code);
+}
+
+function generateCode() {
+  return String(crypto.randomInt(100000000, 1000000000));
+}
+
+// التوكن العام: واحد لكل الحسابات
+async function getGlobalToken() {
+  const token = await firebaseRequest("settings/token", {
+    method: "GET"
+  });
+
+  return typeof token === "string" && token ? token : null;
+}
+
+/* =========================
    Firebase database structure
 =========================
 
+/settings
+{
+  token            // التوكن العام اللي بيرجع لكل الحسابات
+}
+
 /licenseCodes/{licenseId}
 {
-  code,
-  token,
+  code,            // 9 أرقام
   maxDevices,
   active,
   createdAt,
@@ -114,7 +140,7 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     service: "Coursatk License Server",
-    version: "3.0.0",
+    version: "3.1.0",
     database: "Firebase Realtime Database"
   });
 });
@@ -148,10 +174,12 @@ app.get("/health", async (req, res) => {
 app.post("/api/auth/verify", async (req, res) => {
   try {
     const {
-      code,
+      code: rawCode,
       deviceId,
       deviceLabel
     } = req.body || {};
+
+    const code = String(rawCode || "").trim();
 
     if (!code || !deviceId) {
       return res.status(400).json({
@@ -162,12 +190,12 @@ app.post("/api/auth/verify", async (req, res) => {
 
     const licenseId = makeLicenseId(code);
 
-    const license = await firebaseRequest(
-      `licenseCodes/${licenseId}`,
-      {
+    const [license, globalToken] = await Promise.all([
+      firebaseRequest(`licenseCodes/${licenseId}`, {
         method: "GET"
-      }
-    );
+      }),
+      getGlobalToken()
+    ]);
 
     if (!license) {
       return res.status(404).json({
@@ -180,6 +208,13 @@ app.post("/api/auth/verify", async (req, res) => {
       return res.status(403).json({
         success: false,
         message: "This code is disabled"
+      });
+    }
+
+    if (!globalToken) {
+      return res.status(503).json({
+        success: false,
+        message: "Token is not configured on the server"
       });
     }
 
@@ -252,7 +287,8 @@ app.post("/api/auth/verify", async (req, res) => {
     res.json({
       success: true,
 
-      token: license.token,
+      // التوكن العام من الإعدادات
+      token: globalToken,
 
       sessionToken,
 
@@ -417,6 +453,65 @@ function adminAuth(req, res, next) {
 
 
 /* =========================
+   ADMIN SETTINGS (التوكن العام)
+========================= */
+
+app.get("/api/admin/settings", adminAuth, async (req, res) => {
+  try {
+    const token = await getGlobalToken();
+
+    res.json({
+      success: true,
+      settings: {
+        token: token || ""
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+app.put("/api/admin/settings", adminAuth, async (req, res) => {
+  try {
+    const token = String((req.body || {}).token || "").trim();
+
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: "token is required"
+      });
+    }
+
+    if (token.length > 4096) {
+      return res.status(400).json({
+        success: false,
+        message: "token is too long"
+      });
+    }
+
+    await firebaseRequest("settings/token", {
+      method: "PUT",
+      body: JSON.stringify(token)
+    });
+
+    res.json({
+      success: true
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+
+/* =========================
    ADMIN STATS
 ========================= */
 
@@ -476,7 +571,6 @@ app.get("/api/admin/codes", adminAuth, async (req, res) => {
           return {
             id,
             code: value.code,
-            token: value.token,
             maxDevices: value.maxDevices,
             active: value.active !== false,
             createdAt: value.createdAt,
@@ -507,18 +601,9 @@ app.get("/api/admin/codes", adminAuth, async (req, res) => {
 
 app.post("/api/admin/codes", adminAuth, async (req, res) => {
   try {
-    const {
-      code,
-      token,
-      maxDevices
-    } = req.body || {};
+    const { maxDevices } = req.body || {};
 
-    if (!code || !token) {
-      return res.status(400).json({
-        success: false,
-        message: "code and token are required"
-      });
-    }
+    let code = String((req.body || {}).code || "").trim();
 
     const max = Number(maxDevices || 1);
 
@@ -526,6 +611,39 @@ app.post("/api/admin/codes", adminAuth, async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "maxDevices must be a positive integer"
+      });
+    }
+
+    // لو الكود مش مبعوت، السيرفر يولّد كود 9 أرقام
+    if (!code) {
+      for (let i = 0; i < 10; i++) {
+        const candidate = generateCode();
+
+        const taken = await firebaseRequest(
+          `licenseCodes/${makeLicenseId(candidate)}`,
+          {
+            method: "GET"
+          }
+        );
+
+        if (!taken) {
+          code = candidate;
+          break;
+        }
+      }
+
+      if (!code) {
+        return res.status(500).json({
+          success: false,
+          message: "Could not generate a unique code"
+        });
+      }
+    }
+
+    if (!isValidCode(code)) {
+      return res.status(400).json({
+        success: false,
+        message: "code must be exactly 9 digits"
       });
     }
 
@@ -547,7 +665,6 @@ app.post("/api/admin/codes", adminAuth, async (req, res) => {
 
     const license = {
       code,
-      token,
       maxDevices: max,
       active: true,
       createdAt: new Date().toISOString(),
