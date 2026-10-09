@@ -111,8 +111,8 @@ const CONFIG = {
   STREAM_UA:
     "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
-  // Firebase RTDB — set via admin panel / env FIREBASE_URL (not hardcoded secret path only)
-  FIREBASE: "", // runtime
+  // Firebase Realtime Database (NOT Firestore)
+  FIREBASE: "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
     username: "Hema",
@@ -151,7 +151,7 @@ const CONFIG = {
 const RUNTIME_PATH = path.join(__dirname, "data", "runtime.json");
 
 const runtime = {
-  firebaseUrl: (process.env.FIREBASE_URL || "").replace(/\/$/, ""),
+  firebaseUrl: (process.env.FIREBASE_URL || "https://dr-gamal-357a2-default-rtdb.firebaseio.com").replace(/\/$/, ""),
   coursatkToken: process.env.COURSATK_TOKEN || "",
   siteName: "كورساتك",
   packages: [
@@ -196,7 +196,12 @@ function saveRuntimeFile() {
 }
 
 function getFirebaseUrl() {
-  return (runtime.firebaseUrl || process.env.FIREBASE_URL || "").replace(/\/$/, "");
+  return (
+    runtime.firebaseUrl ||
+    process.env.FIREBASE_URL ||
+    CONFIG.FIREBASE ||
+    "https://dr-gamal-357a2-default-rtdb.firebaseio.com"
+  ).replace(/\/$/, "");
 }
 
 function getCoursatkTokenSync() {
@@ -329,9 +334,27 @@ async function fbGetCached(p, ttlMs = 20_000) {
 async function fbGet(p) {
   const base = getFirebaseUrl();
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
-  const r = await fetch(`${base}/${p}.json`);
-  if (!r.ok) throw new Error(`Firebase GET ${p} → ${r.status}`);
-  return r.json();
+  const r = await fetch(`${base}/${p}.json`, {
+    headers: { Accept: "application/json" },
+    cache: "no-store"
+  });
+  const text = await r.text();
+  if (text.trim().startsWith("<")) {
+    throw new Error(
+      "رابط Firebase غلط أو قاعدة Realtime Database مش متإنشاءة. من Console → Build → Realtime Database → Create (مش Firestore)"
+    );
+  }
+  if (!r.ok) {
+    let msg = text.slice(0, 200);
+    try { msg = JSON.parse(text).error || msg; } catch {}
+    throw new Error("Firebase GET فشل: " + msg);
+  }
+  if (!text || text === "null") return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("Firebase رجّع رد مش JSON");
+  }
 }
 
 async function fbSet(p, data) {
@@ -339,11 +362,21 @@ async function fbSet(p, data) {
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
   const r = await fetch(`${base}/${p}.json`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(data)
   });
-  if (!r.ok) throw new Error(`Firebase PUT ${p} → ${r.status}`);
-  return r.json();
+  const text = await r.text();
+  if (text.trim().startsWith("<")) {
+    throw new Error(
+      "قاعدة Realtime Database مش متإنشاءة أو الرابط غلط (المشروع الحالي فيه Firestore فقط — أنشئ Realtime Database)"
+    );
+  }
+  if (!r.ok) {
+    let msg = text.slice(0, 200);
+    try { msg = JSON.parse(text).error || msg; } catch {}
+    throw new Error("Firebase SET فشل: " + msg);
+  }
+  try { return text ? JSON.parse(text) : null; } catch { return null; }
 }
 
 async function fbPatch(p, data) {
@@ -351,11 +384,19 @@ async function fbPatch(p, data) {
   if (!base) throw new Error("Firebase غير مضبوط — أدخله من لوحة التحكم");
   const r = await fetch(`${base}/${p}.json`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(data)
   });
-  if (!r.ok) throw new Error(`Firebase PATCH ${p} → ${r.status}`);
-  return r.json();
+  const text = await r.text();
+  if (text.trim().startsWith("<")) {
+    throw new Error("Realtime Database مش جاهزة — أنشئها من Firebase Console");
+  }
+  if (!r.ok) {
+    let msg = text.slice(0, 200);
+    try { msg = JSON.parse(text).error || msg; } catch {}
+    throw new Error("Firebase PATCH فشل: " + msg);
+  }
+  try { return text ? JSON.parse(text) : null; } catch { return null; }
 }
 
 
