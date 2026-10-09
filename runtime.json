@@ -1,0 +1,48 @@
+{
+  "firebaseUrl": "https://english-73376-default-rtdb.firebaseio.com",
+  "coursatkToken": "",
+  "siteName": "كورساتك",
+  "packages": [
+    {
+      "id": "trial",
+      "name": "تجربة ساعة",
+      "price": 0,
+      "days": 0,
+      "hours": 1,
+      "active": true
+    },
+    {
+      "id": "month",
+      "name": "باقة شهر",
+      "price": 100,
+      "days": 30,
+      "hours": 0,
+      "active": true
+    },
+    {
+      "id": "term",
+      "name": "باقة ترم",
+      "price": 400,
+      "days": 180,
+      "hours": 0,
+      "active": true
+    },
+    {
+      "id": "year",
+      "name": "باقة سنة",
+      "price": 700,
+      "days": 365,
+      "hours": 0,
+      "active": true
+    }
+  ],
+  "agents": [
+    {
+      "id": "ag1",
+      "name": "الدعم",
+      "telegram": "",
+      "active": true
+    }
+  ],
+  "updatedAt": 0
+}
