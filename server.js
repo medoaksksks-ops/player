@@ -207,6 +207,8 @@ loadRuntimeFile();
 // apply token into CONFIG for existing helpers
 CONFIG.COURSATK_TOKEN = getCoursatkTokenSync();
 CONFIG.FIREBASE = getFirebaseUrl();
+console.log("[API] Firebase:", getFirebaseUrl() ? "configured" : "NOT set — bootstrap admin can still login");
+console.log("[API] Token:", getCoursatkTokenSync() ? "set" : "missing");
 
 function packageDurationMs(pkg) {
   if (!pkg) return 0;
@@ -461,10 +463,18 @@ function requireAdmin(permission) {
 
       let sess = adminSessions.get(token);
       if (!sess) {
-        const remote = await fbGet(`admin_sessions/${token}`);
-        if (!remote) return jsonError(res, 401, "جلسة أدمن غير صالحة");
-        sess = remote;
-        adminSessions.set(token, sess);
+        if (getFirebaseUrl()) {
+          try {
+            const remote = await fbGet(`admin_sessions/${token}`);
+            if (remote) {
+              sess = remote;
+              adminSessions.set(token, sess);
+            }
+          } catch (err) {
+            console.warn("[requireAdmin] fb session:", err.message);
+          }
+        }
+        if (!sess) return jsonError(res, 401, "جلسة أدمن غير صالحة");
       }
 
       if (sess.expiresAt && now() > sess.expiresAt) {
@@ -1239,10 +1249,18 @@ app.post("/api/admin/login", rateLimit({ max: 6, windowMs: 60_000, scope: "admin
       adminId,
       username,
       createdAt: now(),
-      expiresAt: now() + CONFIG.ADMIN_SESSION_MS
+      expiresAt: now() + CONFIG.ADMIN_SESSION_MS,
+      bootstrap: adminId === "bootstrap"
     };
     adminSessions.set(token, sess);
-    await fbSet(`admin_sessions/${token}`, sess);
+    // Firebase optional — bootstrap admin works even if Firebase not configured yet
+    if (getFirebaseUrl()) {
+      try {
+        await fbSet(`admin_sessions/${token}`, sess);
+      } catch (err) {
+        console.warn("[admin login] session fb skip:", err.message);
+      }
+    }
 
     res.json({
       success: true,
@@ -1250,7 +1268,8 @@ app.post("/api/admin/login", rateLimit({ max: 6, windowMs: 60_000, scope: "admin
         token,
         expiresAt: sess.expiresAt,
         username,
-        permissions: perms
+        permissions: perms,
+        needsSetup: !getFirebaseUrl()
       }
     });
   } catch (e) {
