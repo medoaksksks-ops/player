@@ -152,13 +152,27 @@ const CONFIG = {
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
-  DEFAULT_YEAR_ID: 4,
+  DEFAULT_YEAR_ID: 4, // 2027
+  YEAR_IDS: {
+    2024: 1,
+    2025: 2,
+    2026: 3,
+    2027: 4
+  },
+  // Supported years for catalog (2026 + 2027)
+  SUPPORTED_YEARS: [
+    { id: 3, name: "2026" },
+    { id: 4, name: "2027" }
+  ],
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
     "floravon.online",
-    "c-cdn.online"
+    "c-cdn.online",
+    "rtbcdn.ru",
+    "rutube.ru"
   ],
+
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
@@ -278,29 +292,48 @@ function packageDurationMs(pkg) {
 }
 
 
-// Canonical subject IDs per section (fallback if Firebase section missing)
+// Canonical subject IDs per section + year (fallback if Firebase section missing)
+// yearId 3 = 2026 | yearId 4 = 2027
 const SECTION_CATALOG = {
+  // ── 2027 (yearId 4) ──
   scientific_sciences: {
     name: "علمي علوم",
     yearId: 4,
-    subjectIds: [57, 58, 59, 60, 61]
+    subjectIds: [57, 58, 59, 60, 61], // عربي, English, فيزياء, كيمياء, أحياء
+    years: {
+      3: { yearId: 3, subjectIds: [40, 41, 42, 43, 44] }, // 2026
+      4: { yearId: 4, subjectIds: [57, 58, 59, 60, 61] }  // 2027
+    }
   },
   scientific_math: {
     name: "علمي رياضة",
     yearId: 4,
-    subjectIds: [57, 58, 59, 60, 65]
+    subjectIds: [57, 58, 59, 60, 65], // عربي, English, فيزياء, كيمياء, رياضيات
+    years: {
+      3: { yearId: 3, subjectIds: [40, 41, 42, 43, 48] }, // 2026
+      4: { yearId: 4, subjectIds: [57, 58, 59, 60, 65] }  // 2027
+    }
   },
   literary: {
     name: "أدبي",
     yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    subjectIds: [57, 58, 62, 63, 64],
+    years: {
+      3: { yearId: 3, subjectIds: [40, 41, 45, 46, 47] }, // 2026: عربي, English, تاريخ, جغرافيا, إحصاء
+      4: { yearId: 4, subjectIds: [57, 58, 62, 63, 64] }  // 2027
+    }
   },
   "بكالوريا": {
     name: "بكالوريا",
     yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    subjectIds: [57, 58, 62, 63, 64],
+    years: {
+      3: { yearId: 3, subjectIds: [40, 41, 45, 46, 47] },
+      4: { yearId: 4, subjectIds: [57, 58, 62, 63, 64] }
+    }
   }
 };
+
 
 /** Normalize section key from admin/UI variants */
 function normalizeSection(raw) {
@@ -335,18 +368,44 @@ function normalizeSection(raw) {
   return s;
 }
 
-/** Resolve section config: Firebase first, then hardcoded catalog */
-async function resolveSection(sectionRaw) {
+/** Resolve section config: Firebase first, then hardcoded catalog.
+ *  preferredYearId: 3 (2026) or 4 (2027). Falls back to section default / CONFIG.DEFAULT_YEAR_ID
+ */
+async function resolveSection(sectionRaw, preferredYearId = null) {
   const id = normalizeSection(sectionRaw);
   if (!id) return null;
+  const wantYear = preferredYearId != null ? Number(preferredYearId) : null;
+
   try {
     if (getFirebaseUrl()) {
+      // Try year-specific key first: sections/{id}/years/{yearId}
+      if (wantYear) {
+        const secYear = await fbGetCached(`sections/${id}/years/${wantYear}`, 60_000);
+        if (secYear && Array.isArray(secYear.subjectIds) && secYear.subjectIds.length) {
+          return {
+            id,
+            name: secYear.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
+            yearId: wantYear,
+            subjectIds: secYear.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
+          };
+        }
+      }
       const sec = await fbGetCached(`sections/${id}`, 60_000);
       if (sec && Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
+        const yId = wantYear || Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID;
+        // If section has years map in Firebase
+        if (sec.years && sec.years[yId] && Array.isArray(sec.years[yId].subjectIds)) {
+          return {
+            id,
+            name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
+            yearId: yId,
+            subjectIds: sec.years[yId].subjectIds.map(Number).filter((n) => !Number.isNaN(n))
+          };
+        }
         return {
           id,
           name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-          yearId: Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID,
+          yearId: yId,
           subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
         };
       }
@@ -354,12 +413,24 @@ async function resolveSection(sectionRaw) {
   } catch (e) {
     console.warn("[section]", e.message);
   }
+
   const def = SECTION_CATALOG[id];
   if (def) {
+    const yId = wantYear || def.yearId || CONFIG.DEFAULT_YEAR_ID;
+    // Prefer year-specific mapping if available
+    if (def.years && def.years[yId]) {
+      return {
+        id,
+        name: def.name,
+        yearId: def.years[yId].yearId || yId,
+        subjectIds: [...def.years[yId].subjectIds]
+      };
+    }
     return { id, name: def.name, yearId: def.yearId, subjectIds: [...def.subjectIds] };
   }
-  return { id, name: id, yearId: CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
+  return { id, name: id, yearId: wantYear || CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
 }
+
 
 
 function resolveDurationMs(body) {
@@ -1040,9 +1111,10 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
     clearLoginFail("student", ip, code);
 
     // Resolve subject IDs for section (hardcoded fallback + Firebase)
+    // Prefer student.yearId if set (3=2026, 4=2027)
     let subjectIds = [];
-    let yearId = CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(student.section);
+    let yearId = Number(student.yearId) || CONFIG.DEFAULT_YEAR_ID;
+    const secInfo = await resolveSection(student.section, yearId);
     if (secInfo) {
       subjectIds = secInfo.subjectIds || [];
       yearId = secInfo.yearId || yearId;
@@ -1062,12 +1134,14 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
           name: student.name,
           code,
           section: student.section || null,
+          yearId,
           expiresAt: student.expiresAt,
           maxDevices,
           deviceId
         },
         yearId,
-        subjectIds
+        subjectIds,
+        years: CONFIG.SUPPORTED_YEARS
       }
     });
   } catch (e) {
@@ -1090,8 +1164,15 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
   try {
     const s = req.student;
     let subjectIds = [];
-    let yearId = CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(s.section);
+    let yearId = Number(s.yearId) || CONFIG.DEFAULT_YEAR_ID;
+    const qYear = req.query.yearId || req.query.year;
+    if (qYear != null) {
+      const n = Number(qYear);
+      if (n === 2026 || n === 3) yearId = 3;
+      else if (n === 2027 || n === 4) yearId = 4;
+      else if (!Number.isNaN(n)) yearId = n;
+    }
+    const secInfo = await resolveSection(s.section, yearId);
     if (secInfo) {
       subjectIds = secInfo.subjectIds || [];
       yearId = secInfo.yearId || yearId;
@@ -1103,12 +1184,14 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
         name: s.name,
         code: req.session.code,
         section: s.section || null,
+        yearId,
         expiresAt: s.expiresAt,
         maxDevices: s.maxDevices || 1,
         devices: Object.keys(s.devices || {}).length,
         deviceId: req.session.deviceId,
         yearId,
         subjectIds,
+        years: CONFIG.SUPPORTED_YEARS,
         sessionExpiresAt: req.session.expiresAt
       }
     });
@@ -1120,10 +1203,37 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 // CATALOG (student token required) — proxies upstream, hides COURSATK token
 // ═══════════════════════════════════════════════════════════
+
+/** List supported years (2026 + 2027) */
+app.get("/api/years", requireStudent, async (_req, res) => {
+  res.json({
+    success: true,
+    data: CONFIG.SUPPORTED_YEARS.map((y) => ({
+      id: y.id,
+      name: y.name,
+      label: y.name
+    }))
+  });
+});
+
 app.get("/api/config", requireStudent, async (req, res) => {
-  let yearId = CONFIG.DEFAULT_YEAR_ID;
+  // Allow ?yearId=3 or ?year=2026 to select year
+  const qYear = req.query.yearId || req.query.year || null;
+  let preferredYear = null;
+  if (qYear != null) {
+    const n = Number(qYear);
+    if (n === 2026 || n === 3) preferredYear = 3;
+    else if (n === 2027 || n === 4) preferredYear = 4;
+    else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) preferredYear = n;
+  }
+  // Also respect student.yearId if stored
+  if (preferredYear == null && req.student.yearId) {
+    preferredYear = Number(req.student.yearId);
+  }
+
+  let yearId = preferredYear || CONFIG.DEFAULT_YEAR_ID;
   let subjectIds = [];
-  const secInfo = await resolveSection(req.student.section);
+  const secInfo = await resolveSection(req.student.section, preferredYear);
   if (secInfo) {
     yearId = secInfo.yearId || yearId;
     subjectIds = secInfo.subjectIds || [];
@@ -1132,6 +1242,7 @@ app.get("/api/config", requireStudent, async (req, res) => {
     success: true,
     yearId,
     subjectIds,
+    years: CONFIG.SUPPORTED_YEARS,
     cryptoReady: Boolean(decryptPlaybackKeyFn),
     decryptSegments: true
   });
@@ -1140,9 +1251,17 @@ app.get("/api/config", requireStudent, async (req, res) => {
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     // 1) Load section subject IDs (Firebase + hardcoded catalog)
+    // :id can be yearId (3 or 4) — also accept ?yearId= / ?year=
     let wantedIds = [];
     let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(req.student.section);
+    const qYear = req.query.yearId || req.query.year;
+    if (qYear != null) {
+      const n = Number(qYear);
+      if (n === 2026 || n === 3) yearId = 3;
+      else if (n === 2027 || n === 4) yearId = 4;
+      else if (!Number.isNaN(n)) yearId = n;
+    }
+    const secInfo = await resolveSection(req.student.section, yearId);
     if (secInfo) {
       if (Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
         wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
@@ -1152,6 +1271,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
     console.log("[subjects]", {
       student: req.student.code,
       section: req.student.section,
+      yearId,
       wantedIds
     });
 
@@ -1254,37 +1374,151 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 // STREAM (student token) — decrypted segments
+// Supports TWO upstream styles:
+//   A) stream-weave/play  → 2027 style (current)
+//   B) legacy / direct video info + HLS  → 2026 style (Mohamed Salah etc.)
+// Both still use DecryptionUtils.unwrap for the AES key when needed.
 // ═══════════════════════════════════════════════════════════
+
+/**
+ * Try multiple upstream playback strategies and return normalized:
+ * { videoId, token, streamUrl, mode }
+ */
+async function resolveUpstreamPlayback(videoId) {
+  const vid = encodeURIComponent(videoId);
+  const errors = [];
+
+  // ── Strategy A: Stream-Weave (2027 / newer) ──
+  try {
+    const data = await upstreamJson(`/video/${vid}/stream-weave/play`, {
+      method: "POST",
+      headers: { Accept: "application/json" }
+    });
+    if (data?.success && data?.data?.token && data?.data?.stream_url) {
+      return {
+        videoId: String(data.data.video_id || videoId),
+        token: data.data.token,
+        streamUrl: data.data.stream_url,
+        mode: "stream-weave"
+      };
+    }
+    errors.push("stream-weave: response ناقص");
+  } catch (e) {
+    errors.push("stream-weave: " + e.message);
+  }
+
+  // ── Strategy B: GET /video/{id} (2026 style – direct info) ──
+  try {
+    const data = await upstreamJson(`/video/${vid}`);
+    const d = data?.data || data;
+    // possible shapes seen on the platform
+    const streamUrl =
+      d?.stream_url ||
+      d?.playlist_url ||
+      d?.url ||
+      d?.hls_url ||
+      d?.manifest ||
+      d?.file ||
+      (d?.sources && (d.sources.hls || d.sources.m3u8)) ||
+      null;
+    const token = d?.token || d?.playback_token || d?.access_token || getCoursatkTokenSync();
+    if (streamUrl) {
+      return {
+        videoId: String(d?.id || d?.video_id || videoId),
+        token: token,
+        streamUrl: streamUrl,
+        mode: "direct-2026"
+      };
+    }
+    errors.push("GET /video: no stream_url in response");
+  } catch (e) {
+    errors.push("GET /video: " + e.message);
+  }
+
+  // ── Strategy C: POST /video/{id}/play ──
+  try {
+    const data = await upstreamJson(`/video/${vid}/play`, {
+      method: "POST",
+      headers: { Accept: "application/json" }
+    });
+    const d = data?.data || data;
+    const streamUrl =
+      d?.stream_url || d?.playlist_url || d?.url || d?.hls_url || d?.manifest || null;
+    const token = d?.token || d?.playback_token || getCoursatkTokenSync();
+    if (streamUrl) {
+      return {
+        videoId: String(d?.id || d?.video_id || videoId),
+        token: token,
+        streamUrl: streamUrl,
+        mode: "play-endpoint"
+      };
+    }
+    errors.push("POST /play: no stream_url");
+  } catch (e) {
+    errors.push("POST /play: " + e.message);
+  }
+
+  // ── Strategy D: POST /video/{id}/stream ──
+  try {
+    const data = await upstreamJson(`/video/${vid}/stream`, {
+      method: "POST",
+      headers: { Accept: "application/json" }
+    });
+    const d = data?.data || data;
+    const streamUrl =
+      d?.stream_url || d?.playlist_url || d?.url || d?.hls_url || null;
+    const token = d?.token || getCoursatkTokenSync();
+    if (streamUrl) {
+      return {
+        videoId: String(d?.id || d?.video_id || videoId),
+        token: token,
+        streamUrl: streamUrl,
+        mode: "stream-endpoint"
+      };
+    }
+    errors.push("POST /stream: no stream_url");
+  } catch (e) {
+    errors.push("POST /stream: " + e.message);
+  }
+
+  throw new Error(
+    "فشل كل طرق التشغيل للفيديو " + videoId + " | " + errors.join(" · ")
+  );
+}
+
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    const data = await upstreamJson(
-      `/video/${encodeURIComponent(req.params.videoId)}/stream-weave/play`,
-      { method: "POST", headers: { Accept: "application/json" } }
-    );
-    if (!data?.success || !data?.data?.token || !data?.data?.stream_url || !data?.data?.video_id) {
-      throw new Error("Playback response ناقص");
-    }
+    const playback = await resolveUpstreamPlayback(req.params.videoId);
     const id = crypto.randomUUID();
+    const hosts = new Set();
+    try { hosts.add(new URL(playback.streamUrl).hostname); } catch {}
+
     streamSessions.set(id, {
       id,
-      videoId: String(data.data.video_id),
-      token: data.data.token,
-      streamUrl: data.data.stream_url,
+      videoId: playback.videoId,
+      token: playback.token,
+      streamUrl: playback.streamUrl,
+      mode: playback.mode, // stream-weave | direct-2026 | play-endpoint | stream-endpoint
       createdAt: now(),
       plainKey: null,
       defaultIv: null,
-      allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
+      allowedHosts: hosts,
       ownerCode: req.session.code
     });
+
+    console.log(`[play] video=${playback.videoId} mode=${playback.mode} session=${id}`);
+
     res.json({
       success: true,
       data: {
         session: id,
-        video_id: data.data.video_id,
+        video_id: playback.videoId,
+        mode: playback.mode,
         manifest_url: `/api/stream/manifest/${id}`
       }
     });
   } catch (e) {
+    console.error("[play]", e.message);
     jsonError(res, 502, e.message);
   }
 });
@@ -1781,9 +2015,19 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
       }
     }
 
+    // yearId: 3 = 2026, 4 = 2027 (default 4)
+    let yearId = CONFIG.DEFAULT_YEAR_ID;
+    if (req.body?.yearId != null || req.body?.year != null) {
+      const n = Number(req.body.yearId ?? req.body.year);
+      if (n === 2026 || n === 3) yearId = 3;
+      else if (n === 2027 || n === 4) yearId = 4;
+      else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) yearId = n;
+    }
+
     const record = {
       name,
       section: section || null,
+      yearId,
       type: req.body?.days != null ? "custom" : type,
       days: req.body?.days != null ? Number(req.body.days) : null,
       durationMs: duration, // starts on first student login
@@ -1812,6 +2056,12 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
     const patch = {};
     if (req.body.name != null) patch.name = String(req.body.name).trim();
     if (req.body.section != null) patch.section = normalizeSection(req.body.section) || String(req.body.section).trim() || null;
+    if (req.body.yearId != null || req.body.year != null) {
+      const n = Number(req.body.yearId ?? req.body.year);
+      if (n === 2026 || n === 3) patch.yearId = 3;
+      else if (n === 2027 || n === 4) patch.yearId = 4;
+      else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) patch.yearId = n;
+    }
     if (req.body.maxDevices != null) {
       patch.maxDevices = Math.max(1, Math.min(10, Number(req.body.maxDevices)));
     }
@@ -2826,18 +3076,20 @@ if (!getFirebaseUrl()) {
   console.warn("[API] WARNING: Firebase URL not set — configure from admin panel (إعدادات التشغيل)");
 }
 
-// Seed default sections if missing
+// Seed default sections if missing (supports 2026 + 2027)
 try {
   if (!getFirebaseUrl()) throw new Error("no firebase");
-  // Always ensure correct subject IDs for the 3 main sections
-  // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
-  // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
-  // أدبي: 57 عربي، 58 English + 62،63،64
+  // 2026 (yearId 3) + 2027 (yearId 4) subject maps
   const sectionDefaults = {};
   for (const [id, def] of Object.entries(SECTION_CATALOG)) {
-    sectionDefaults[id] = { ...def, updatedAt: Date.now() };
+    sectionDefaults[id] = {
+      name: def.name,
+      yearId: def.yearId,
+      subjectIds: def.subjectIds,
+      years: def.years || null,
+      updatedAt: Date.now()
+    };
   }
-  // Sync sections only when missing or IDs changed (avoid write storm on every restart)
   const existing = (await fbGet("sections")) || {};
   let changed = 0;
   for (const [id, def] of Object.entries(sectionDefaults)) {
@@ -2846,18 +3098,19 @@ try {
       cur &&
       Array.isArray(cur.subjectIds) &&
       cur.subjectIds.length === def.subjectIds.length &&
-      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
+      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x) &&
+      cur.years && def.years;
     if (!same) {
       await fbSet(`sections/${id}`, { ...(cur || {}), ...def });
       changed++;
     }
   }
-  console.log("[API] sections synced, updated:", changed);
+  console.log("[API] sections synced (2026+2027), updated:", changed);
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON`);
+  console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON · years 2026+2027`);
   console.log(`[API] bootstrap admin ready (Hema)`);
 });
