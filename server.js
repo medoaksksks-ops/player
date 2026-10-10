@@ -18,7 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors({ origin: true, credentials: false }));
-app.use(express.json({ limit: "512kb" }));
+app.use(express.json({ limit: "8mb" }));
 app.use(compression());
 
 // ═══════════════════════════════════════════════════════════
@@ -88,6 +88,57 @@ setInterval(() => {
   }
 }, 30_000).unref();
 
+
+// ═══════════════════════════════════════════════════════════
+// Login fail lock — 5 wrong tries → 15 min cooldown (per IP+code/user)
+// ═══════════════════════════════════════════════════════════
+const loginFails = new Map(); // key -> { count, lockedUntil }
+
+function loginFailKey(kind, ip, id) {
+  return kind + ":" + ip + ":" + String(id || "").toLowerCase();
+}
+
+function checkLoginLock(kind, ip, id) {
+  const key = loginFailKey(kind, ip, id);
+  const row = loginFails.get(key);
+  if (!row) return null;
+  if (row.lockedUntil && Date.now() < row.lockedUntil) {
+    const sec = Math.ceil((row.lockedUntil - Date.now()) / 1000);
+    return { locked: true, sec, remaining: 0 };
+  }
+  if (row.lockedUntil && Date.now() >= row.lockedUntil) {
+    loginFails.delete(key);
+    return null;
+  }
+  return { locked: false, remaining: Math.max(0, 5 - (row.count || 0)) };
+}
+
+function recordLoginFail(kind, ip, id) {
+  const key = loginFailKey(kind, ip, id);
+  const row = loginFails.get(key) || { count: 0, lockedUntil: 0 };
+  row.count = (row.count || 0) + 1;
+  if (row.count >= 5) {
+    row.lockedUntil = Date.now() + 15 * 60_000; // 15 minutes
+    row.count = 0;
+  }
+  loginFails.set(key, row);
+  if (row.lockedUntil && Date.now() < row.lockedUntil) {
+    const sec = Math.ceil((row.lockedUntil - Date.now()) / 1000);
+    return { locked: true, sec };
+  }
+  return { locked: false, remaining: Math.max(0, 5 - row.count) };
+}
+
+function clearLoginFail(kind, ip, id) {
+  loginFails.delete(loginFailKey(kind, ip, id));
+}
+
+setInterval(() => {
+  const t = Date.now();
+  for (const [k, row] of loginFails) {
+    if (row.lockedUntil && t > row.lockedUntil + 60_000) loginFails.delete(k);
+  }
+}, 60_000).unref();
 
 
 // ═══════════════════════════════════════════════════════════
@@ -239,6 +290,11 @@ const SECTION_CATALOG = {
     name: "أدبي",
     yearId: 4,
     subjectIds: [57, 58, 62, 63, 64]
+  },
+  "بكالوريا": {
+    name: "بكالوريا",
+    yearId: 4,
+    subjectIds: [57, 58, 62, 63, 64]
   }
 };
 
@@ -257,6 +313,10 @@ function normalizeSection(raw) {
     "علمي_رياضه": "scientific_math",
     "ادبي": "literary",
     "أدبي": "literary",
+    "باكلوريا": "بكالوريا",
+    "بكالوريا": "بكالوريا",
+    bakaloria: "بكالوريا",
+    baccalaureate: "بكالوريا",
     sciences: "scientific_sciences",
     math: "scientific_math",
     science: "scientific_sciences"
@@ -786,7 +846,8 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
 // ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
-app.use(rateLimit({ max: 45, windowMs: 60_000, scope: "global", banAfter: 8, banMs: 10 * 60_000 }));
+// Global: soft only (prevents total abuse, won't block normal admin/import)
+app.use(rateLimit({ max: 300, windowMs: 60_000, scope: "global" }));
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -817,7 +878,7 @@ app.get("/api/public/code-types", (_req, res) => {
 });
 
 /** Public site info for frontend: packages + subscription agents (no secrets) */
-app.get("/api/public/site", rateLimit({ max: 30, windowMs: 60_000, scope: "public-site" }), (_req, res) => {
+app.get("/api/public/site", rateLimit({ max: 120, windowMs: 60_000, scope: "public-site" }), (_req, res) => {
   const packages = (runtime.packages || [])
     .filter((p) => p.active !== false)
     .map((p) => ({
@@ -853,11 +914,12 @@ app.get("/api/public/site", rateLimit({ max: 30, windowMs: 60_000, scope: "publi
  * POST /api/auth/login
  * body: { code: "1234567", deviceId: "uuid", deviceName?: "Chrome" }
  */
-app.post("/api/auth/login", rateLimit({ max: 8, windowMs: 60_000, scope: "student-login", banAfter: 4, banMs: 15 * 60_000 }), async (req, res) => {
+app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "student-login" }), async (req, res) => {
   try {
     const code = String(req.body?.code || "").trim();
     const deviceId = String(req.body?.deviceId || "").trim();
     const deviceName = String(req.body?.deviceName || "Unknown").slice(0, 80);
+    const ip = clientIp(req);
 
     if (!/^\d{9}$/.test(code)) {
       return jsonError(res, 400, "الكود يجب أن يكون 9 أرقام");
@@ -866,9 +928,20 @@ app.post("/api/auth/login", rateLimit({ max: 8, windowMs: 60_000, scope: "studen
       return jsonError(res, 400, "deviceId مطلوب");
     }
 
+    const lock = checkLoginLock("student", ip, code);
+    if (lock && lock.locked) {
+      res.setHeader("Retry-After", String(lock.sec));
+      return jsonError(res, 429, `محاولات خاطئة كثيرة — حاول بعد ${Math.ceil(lock.sec / 60)} دقيقة`);
+    }
+
     const student = await fbGet(`students/${code}`);
     if (!student || student.active === false) {
-      return jsonError(res, 401, "كود غير صحيح أو موقوف");
+      const fail = recordLoginFail("student", ip, code);
+      if (fail.locked) {
+        res.setHeader("Retry-After", String(fail.sec));
+        return jsonError(res, 429, `محاولات خاطئة كثيرة — حاول بعد 15 دقيقة`);
+      }
+      return jsonError(res, 401, `كود غير صحيح أو موقوف (متبقي ${fail.remaining} محاولات)`);
     }
 
     // Activate subscription on FIRST login only
@@ -945,7 +1018,8 @@ app.post("/api/auth/login", rateLimit({ max: 8, windowMs: 60_000, scope: "studen
       expiresAt: now() + sessionTtl
     };
     studentSessions.set(token, sess);
-    await fbSet(`sessions/${token}`, sess);
+    try { await fbSet(`sessions/${token}`, sess); } catch (e) { console.warn("[login] session fb:", e.message); }
+    clearLoginFail("student", ip, code);
 
     // Resolve subject IDs for section (hardcoded fallback + Firebase)
     let subjectIds = [];
@@ -1355,20 +1429,36 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
 // ═══════════════════════════════════════════════════════════
-app.post("/api/admin/login", rateLimit({ max: 6, windowMs: 60_000, scope: "admin-login", banAfter: 3, banMs: 15 * 60_000 }), async (req, res) => {
+app.post("/api/admin/login", rateLimit({ max: 20, windowMs: 60_000, scope: "admin-login" }), async (req, res) => {
   try {
     const username = String(req.body?.username || "").trim();
     const password = String(req.body?.password || "");
+    const ip = clientIp(req);
     if (!username || !password) return jsonError(res, 400, "يوزر وباسورد مطلوبين");
+
+    const lock = checkLoginLock("admin", ip, username);
+    if (lock && lock.locked) {
+      res.setHeader("Retry-After", String(lock.sec));
+      return jsonError(res, 429, `محاولات خاطئة كثيرة — حاول بعد ${Math.ceil(lock.sec / 60)} دقيقة`);
+    }
 
     let adminId = null;
     let admin = null;
     let perms = null;
 
+    function failAuth() {
+      const fail = recordLoginFail("admin", ip, username);
+      if (fail.locked) {
+        res.setHeader("Retry-After", String(fail.sec));
+        return jsonError(res, 429, "محاولات خاطئة كثيرة — حاول بعد 15 دقيقة");
+      }
+      return jsonError(res, 401, `بيانات الدخول خطأ (متبقي ${fail.remaining} محاولات)`);
+    }
+
     if (username === CONFIG.BOOTSTRAP_ADMIN.username) {
       const ok = scryptVerify(password, CONFIG.BOOTSTRAP_ADMIN.passwordHash) ||
         password === CONFIG.BOOTSTRAP_ADMIN.passwordPlain;
-      if (!ok) return jsonError(res, 401, "بيانات الدخول خطأ");
+      if (!ok) return failAuth();
       adminId = "bootstrap";
       perms = CONFIG.BOOTSTRAP_ADMIN.permissions;
       admin = { username, permissions: perms, bootstrap: true };
@@ -1378,7 +1468,7 @@ app.post("/api/admin/login", rateLimit({ max: 6, windowMs: 60_000, scope: "admin
       for (const [id, a] of Object.entries(all)) {
         if (a && a.username === username && a.active !== false) {
           if (!scryptVerify(password, a.passwordHash)) {
-            return jsonError(res, 401, "بيانات الدخول خطأ");
+            return failAuth();
           }
           adminId = id;
           admin = a;
@@ -1386,8 +1476,9 @@ app.post("/api/admin/login", rateLimit({ max: 6, windowMs: 60_000, scope: "admin
           break;
         }
       }
-      if (!adminId) return jsonError(res, 401, "بيانات الدخول خطأ");
+      if (!adminId) return failAuth();
     }
+    clearLoginFail("admin", ip, username);
 
     const token = randomToken(32);
     const sess = {
@@ -1535,6 +1626,98 @@ app.get("/api/admin/students/:code", requireAdmin("students_view"), async (req, 
  * POST /api/admin/students
  * { name, section, type: trial|month|term|year, maxDevices?: number, code?: "1234567" }
  */
+
+/** Bulk import students (from cleaned CSV/JSON) */
+app.post("/api/admin/students/import", requireAdmin("students_create"), async (req, res) => {
+  try {
+    const list = Array.isArray(req.body?.students) ? req.body.students : [];
+    if (!list.length) return jsonError(res, 400, "لا توجد بيانات للاستيراد");
+    if (list.length > 5000) return jsonError(res, 400, "الحد الأقصى 5000 كود في المرة");
+
+    let created = 0, updated = 0, failed = 0;
+    const errors = [];
+    const t = now();
+    const DAY = 24 * 3600 * 1000;
+
+    for (const row of list) {
+      try {
+        let code = String(row.code || "").replace(/\D/g, "");
+        if (code.length < 7) {
+          failed++;
+          errors.push({ code: row.code, error: "كود غير صالح" });
+          continue;
+        }
+        if (code.length < 9) code = code.padStart(9, "0");
+
+        const name = String(row.name || "بدون اسم").trim().slice(0, 120);
+        const section = normalizeSection(row.section) || String(row.section || "").trim() || null;
+        const active = row.active !== false && row.active !== 0 && row.active !== "0";
+        const pending = row.pendingActivation === true || row.pendingActivation === 1 || row.pendingActivation === "1";
+        const days = row.days != null ? Number(row.days) : null;
+        const durationMs =
+          Number(row.durationMs) > 0
+            ? Number(row.durationMs)
+            : days != null && days >= 0
+              ? Math.round(days * DAY)
+              : resolveDurationMs({ type: row.type || "year", days });
+
+        const existing = await fbGet(`students/${code}`);
+        const record = {
+          name,
+          section,
+          type: String(row.type || (pending ? "year" : "custom")),
+          days: days,
+          durationMs: durationMs || null,
+          maxDevices: Math.max(1, Math.min(10, Number(row.maxDevices || existing?.maxDevices || 1))),
+          devices: existing?.devices || {},
+          bannedDevices: existing?.bannedDevices || {},
+          active,
+          createdAt: existing?.createdAt || t,
+          createdBy: req.admin.username,
+          importedAt: t
+        };
+
+        if (pending || (!existing && (days == null || row.expiresAt == null) && !row.expired)) {
+          // timer starts on first login
+          if (pending || row.expiresAt == null) {
+            record.activatedAt = null;
+            record.expiresAt = null;
+            if (!record.durationMs) record.durationMs = 365 * DAY;
+          }
+        }
+
+        if (row.expired === true || (days != null && days <= 0 && !pending)) {
+          record.activatedAt = existing?.activatedAt || t - DAY;
+          record.expiresAt = t - 1000;
+          record.active = false;
+        } else if (!pending && days != null && days > 0) {
+          // remaining days from import moment
+          record.activatedAt = existing?.activatedAt || t;
+          record.expiresAt = t + Math.round(days * DAY);
+          record.durationMs = record.durationMs || Math.round(days * DAY);
+        } else if (!pending && Number(row.expiresAt) > 0) {
+          record.expiresAt = Number(row.expiresAt);
+          record.activatedAt = Number(row.activatedAt) || existing?.activatedAt || t;
+        }
+
+        await fbSet(`students/${code}`, { ...(existing || {}), ...record });
+        if (existing) updated++;
+        else created++;
+      } catch (e) {
+        failed++;
+        errors.push({ code: row.code, error: e.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { created, updated, failed, total: list.length, errors: errors.slice(0, 50) }
+    });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
 app.post("/api/admin/students", requireAdmin("students_create"), async (req, res) => {
   try {
     const name = String(req.body?.name || "").trim();
@@ -2086,7 +2269,7 @@ app.get("/api/messages", requireStudent, async (req, res) => {
 });
 
 /** Student: send message to admin */
-app.post("/api/messages", requireStudent, rateLimit({ max: 20, windowMs: 60_000, scope: "msg-student" }), async (req, res) => {
+app.post("/api/messages", requireStudent, rateLimit({ max: 60, windowMs: 60_000, scope: "msg-student" }), async (req, res) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     if (!text) return jsonError(res, 400, "اكتب رسالة");
@@ -2205,7 +2388,7 @@ app.get("/api/admin/messages/:code", requireAdmin("students_view"), async (req, 
 });
 
 /** Admin: reply */
-app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 40, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
+app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 120, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
   try {
     const code = String(req.params.code);
     const text = String(req.body?.text || "").trim().slice(0, 2000);
