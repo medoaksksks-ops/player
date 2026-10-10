@@ -222,6 +222,80 @@ function packageDurationMs(pkg) {
   return (days * 24 + hours) * 3600 * 1000;
 }
 
+
+// Canonical subject IDs per section (fallback if Firebase section missing)
+const SECTION_CATALOG = {
+  scientific_sciences: {
+    name: "علمي علوم",
+    yearId: 4,
+    subjectIds: [57, 58, 59, 60, 61]
+  },
+  scientific_math: {
+    name: "علمي رياضة",
+    yearId: 4,
+    subjectIds: [57, 58, 59, 60, 65]
+  },
+  literary: {
+    name: "أدبي",
+    yearId: 4,
+    subjectIds: [57, 58, 62, 63, 64]
+  }
+};
+
+/** Normalize section key from admin/UI variants */
+function normalizeSection(raw) {
+  if (raw == null || raw === "") return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase().replace(/\s+/g, "_");
+  const map = {
+    scientific_sciences: "scientific_sciences",
+    scientific_math: "scientific_math",
+    literary: "literary",
+    "علمي_علوم": "scientific_sciences",
+    "علمي_رياضة": "scientific_math",
+    "علمي_رياضه": "scientific_math",
+    "ادبي": "literary",
+    "أدبي": "literary",
+    sciences: "scientific_sciences",
+    math: "scientific_math",
+    science: "scientific_sciences"
+  };
+  if (map[s]) return map[s];
+  if (map[lower]) return map[lower];
+  if (s.includes("علوم") && !s.includes("رياض")) return "scientific_sciences";
+  if (s.includes("رياض")) return "scientific_math";
+  if (s.includes("أدب") || s.includes("ادب")) return "literary";
+  return s;
+}
+
+/** Resolve section config: Firebase first, then hardcoded catalog */
+async function resolveSection(sectionRaw) {
+  const id = normalizeSection(sectionRaw);
+  if (!id) return null;
+  try {
+    if (getFirebaseUrl()) {
+      const sec = await fbGetCached(`sections/${id}`, 60_000);
+      if (sec && Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
+        return {
+          id,
+          name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
+          yearId: Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID,
+          subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
+        };
+      }
+    }
+  } catch (e) {
+    console.warn("[section]", e.message);
+  }
+  const def = SECTION_CATALOG[id];
+  if (def) {
+    return { id, name: def.name, yearId: def.yearId, subjectIds: [...def.subjectIds] };
+  }
+  return { id, name: id, yearId: CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
+}
+
+
 function resolveDurationMs(body) {
   // custom days takes priority
   if (body?.days != null && body.days !== "") {
@@ -485,7 +559,9 @@ async function requireStudent(req, res, next) {
       return jsonError(res, 401, "تم تسجيل خروج هذا الجهاز من لوحة التحكم");
     }
 
-    req.student = student;
+    // CRITICAL: student record in Firebase is keyed by code but does not store code field
+    // Without attaching code, all students shared messages/undefined
+    req.student = { ...student, code: String(sess.code) };
     req.session = sess;
     req.sessionToken = token;
     next();
@@ -845,14 +921,17 @@ app.post("/api/auth/login", rateLimit({ max: 8, windowMs: 60_000, scope: "studen
     studentSessions.set(token, sess);
     await fbSet(`sessions/${token}`, sess);
 
-    // Resolve subject IDs for section
+    // Resolve subject IDs for section (hardcoded fallback + Firebase)
     let subjectIds = [];
     let yearId = CONFIG.DEFAULT_YEAR_ID;
-    if (student.section) {
-      const sec = await fbGet(`sections/${student.section}`);
-      if (sec) {
-        subjectIds = sec.subjectIds || [];
-        if (sec.yearId) yearId = sec.yearId;
+    const secInfo = await resolveSection(student.section);
+    if (secInfo) {
+      subjectIds = secInfo.subjectIds || [];
+      yearId = secInfo.yearId || yearId;
+      // normalize stored section key
+      if (secInfo.id && student.section !== secInfo.id) {
+        try { await fbPatch(`students/${code}`, { section: secInfo.id }); } catch {}
+        student.section = secInfo.id;
       }
     }
 
@@ -894,12 +973,11 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
     const s = req.student;
     let subjectIds = [];
     let yearId = CONFIG.DEFAULT_YEAR_ID;
-    if (s.section) {
-      const sec = await fbGet(`sections/${s.section}`);
-      if (sec) {
-        subjectIds = sec.subjectIds || [];
-        if (sec.yearId) yearId = sec.yearId;
-      }
+    const secInfo = await resolveSection(s.section);
+    if (secInfo) {
+      subjectIds = secInfo.subjectIds || [];
+      yearId = secInfo.yearId || yearId;
+      if (secInfo.id) s.section = secInfo.id;
     }
     res.json({
       success: true,
@@ -927,12 +1005,10 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
 app.get("/api/config", requireStudent, async (req, res) => {
   let yearId = CONFIG.DEFAULT_YEAR_ID;
   let subjectIds = [];
-  if (req.student.section) {
-    const sec = await fbGet(`sections/${req.student.section}`);
-    if (sec) {
-      if (sec.yearId) yearId = sec.yearId;
-      subjectIds = sec.subjectIds || [];
-    }
+  const secInfo = await resolveSection(req.student.section);
+  if (secInfo) {
+    yearId = secInfo.yearId || yearId;
+    subjectIds = secInfo.subjectIds || [];
   }
   res.json({
     success: true,
@@ -945,18 +1021,21 @@ app.get("/api/config", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
-    // 1) Load section subject IDs (fixed catalog per شعبة)
+    // 1) Load section subject IDs (Firebase + hardcoded catalog)
     let wantedIds = [];
     let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
-    if (req.student.section) {
-      const sec = await fbGetCached(`sections/${req.student.section}`, 60_000);
-      if (sec) {
-        if (Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
-          wantedIds = sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
-        }
-        if (sec.yearId) yearId = Number(sec.yearId) || yearId;
+    const secInfo = await resolveSection(req.student.section);
+    if (secInfo) {
+      if (Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
+        wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
       }
+      if (secInfo.yearId) yearId = Number(secInfo.yearId) || yearId;
     }
+    console.log("[subjects]", {
+      student: req.student.code,
+      section: req.student.section,
+      wantedIds
+    });
 
     // 2) Fetch year subjects once (upstream list)
     const yearData = await upstreamJson(`/user/subjects/${encodeURIComponent(yearId)}`);
@@ -1429,7 +1508,7 @@ app.get("/api/admin/students/:code", requireAdmin("students_view"), async (req, 
 app.post("/api/admin/students", requireAdmin("students_create"), async (req, res) => {
   try {
     const name = String(req.body?.name || "").trim();
-    const section = String(req.body?.section || "").trim();
+    const section = normalizeSection(req.body?.section) || String(req.body?.section || "").trim() || null;
     const type = String(req.body?.type || "custom");
     const maxDevices = Math.max(1, Math.min(10, Number(req.body?.maxDevices || 1)));
     let code = String(req.body?.code || "").trim();
@@ -1481,7 +1560,7 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
 
     const patch = {};
     if (req.body.name != null) patch.name = String(req.body.name).trim();
-    if (req.body.section != null) patch.section = String(req.body.section).trim() || null;
+    if (req.body.section != null) patch.section = normalizeSection(req.body.section) || String(req.body.section).trim() || null;
     if (req.body.maxDevices != null) {
       patch.maxDevices = Math.max(1, Math.min(10, Number(req.body.maxDevices)));
     }
@@ -1924,13 +2003,22 @@ function makeMsgId() {
   return "m_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
 }
 
-/** Student: list my threads (usually one thread per code) */
+function studentCode(req) {
+  const c = String(req.student?.code || req.session?.code || "").trim();
+  if (!/^\d{7,12}$/.test(c)) return null;
+  return c;
+}
+
+/** Student: list ONLY my messages */
 app.get("/api/messages", requireStudent, async (req, res) => {
   try {
-    const code = req.student.code;
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
     const thread = (await fbGet(`messages/${code}`)) || { messages: {}, updatedAt: 0 };
+    // ignore any thread that was mis-keyed
     const list = Object.entries(thread.messages || {})
       .map(([id, m]) => ({ id, ...m }))
+      .filter((m) => !m.ownerCode || m.ownerCode === code)
       .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
     res.json({
       success: true,
@@ -1951,24 +2039,27 @@ app.post("/api/messages", requireStudent, rateLimit({ max: 20, windowMs: 60_000,
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     if (!text) return jsonError(res, 400, "اكتب رسالة");
-    const code = req.student.code;
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
     const id = makeMsgId();
     const msg = {
       from: "student",
       text,
       name: req.student.name || code,
+      ownerCode: code,
       createdAt: now(),
       read: false
     };
     await fbSet(`messages/${code}/messages/${id}`, msg);
+    const cur = (await fbGet(`messages/${code}`)) || {};
     await fbPatch(`messages/${code}`, {
       updatedAt: now(),
       studentName: req.student.name || code,
       section: req.student.section || null,
-      unreadAdmin: Number(((await fbGet(`messages/${code}`)) || {}).unreadAdmin || 0) + 1,
+      ownerCode: code,
+      unreadAdmin: Number(cur.unreadAdmin || 0) + 1,
       unreadStudent: 0
     });
-    // mark student as having read their own outbound
     res.json({ success: true, data: { id, ...msg } });
   } catch (e) {
     jsonError(res, 500, e.message);
@@ -1978,9 +2069,37 @@ app.post("/api/messages", requireStudent, rateLimit({ max: 20, windowMs: 60_000,
 /** Student: mark thread as read */
 app.post("/api/messages/read", requireStudent, async (req, res) => {
   try {
-    const code = req.student.code;
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
     await fbPatch(`messages/${code}`, { unreadStudent: 0 });
     res.json({ success: true });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: delete one of my messages */
+app.delete("/api/messages/:msgId", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    const msgId = String(req.params.msgId);
+    const msg = await fbGet(`messages/${code}/messages/${msgId}`);
+    if (!msg) return jsonError(res, 404, "الرسالة غير موجودة");
+    await fbDelete(`messages/${code}/messages/${msgId}`);
+    res.json({ success: true, message: "تم حذف الرسالة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Student: clear entire my thread */
+app.delete("/api/messages", requireStudent, async (req, res) => {
+  try {
+    const code = studentCode(req);
+    if (!code) return jsonError(res, 401, "كود الجلسة غير صالح");
+    await fbDelete(`messages/${code}`);
+    res.json({ success: true, message: "تم مسح المحادثة" });
   } catch (e) {
     jsonError(res, 500, e.message);
   }
@@ -1990,7 +2109,9 @@ app.post("/api/messages/read", requireStudent, async (req, res) => {
 app.get("/api/admin/messages", requireAdmin("students_view"), async (_req, res) => {
   try {
     const all = (await fbGet("messages")) || {};
-    const threads = Object.entries(all).map(([code, t]) => {
+    const threads = Object.entries(all)
+      .filter(([code]) => code && code !== "undefined" && /^\d{7,12}$/.test(String(code)))
+      .map(([code, t]) => {
       const msgs = Object.values(t.messages || {});
       const last = msgs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))[0];
       return {
@@ -2043,6 +2164,7 @@ app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({
       from: "admin",
       text,
       name: req.admin.username || "أدمن",
+      ownerCode: code,
       createdAt: now(),
       read: false
     };
@@ -2060,6 +2182,30 @@ app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({
   }
 });
 
+
+
+/** Admin: delete one message in a thread */
+app.delete("/api/admin/messages/:code/:msgId", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const code = String(req.params.code).trim();
+    const msgId = String(req.params.msgId);
+    await fbDelete(`messages/${code}/messages/${msgId}`);
+    res.json({ success: true, message: "تم حذف الرسالة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** Admin: delete whole thread */
+app.delete("/api/admin/messages/:code", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const code = String(req.params.code).trim();
+    await fbDelete(`messages/${code}`);
+    res.json({ success: true, message: "تم حذف المحادثة" });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
 
 // ═══════════════════════════════════════════════════════════
 // Fallback
@@ -2128,26 +2274,10 @@ try {
   // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
   // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
   // أدبي: 57 عربي، 58 English + 62،63،64
-  const sectionDefaults = {
-    scientific_sciences: {
-      name: "علمي علوم",
-      yearId: 4,
-      subjectIds: [57, 58, 59, 60, 61],
-      updatedAt: Date.now()
-    },
-    scientific_math: {
-      name: "علمي رياضة",
-      yearId: 4,
-      subjectIds: [57, 58, 59, 60, 65],
-      updatedAt: Date.now()
-    },
-    literary: {
-      name: "أدبي",
-      yearId: 4,
-      subjectIds: [57, 58, 62, 63, 64],
-      updatedAt: Date.now()
-    }
-  };
+  const sectionDefaults = {};
+  for (const [id, def] of Object.entries(SECTION_CATALOG)) {
+    sectionDefaults[id] = { ...def, updatedAt: Date.now() };
+  }
   // Sync sections only when missing or IDs changed (avoid write storm on every restart)
   const existing = (await fbGet("sections")) || {};
   let changed = 0;
