@@ -15,6 +15,9 @@ import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(__dirname, "data");
+const MEDIA_DIR = path.join(DATA_DIR, "media");
+try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 const app = express();
 app.set("trust proxy", 1);
 app.use(cors({ origin: true, credentials: false }));
@@ -2430,7 +2433,7 @@ function saveMediaFile(code, msgId, media) {
   if (buf.length > MEDIA_MAX_BYTES) throw new Error("حجم الملف كبير (الحد 12 ميجا)");
 
   const mimeClean = mime.split(";")[0].trim();
-  const dir = path.join(MEDIA_DIR, String(code));
+  const dir = path.join(typeof MEDIA_DIR !== 'undefined' ? MEDIA_DIR : path.join(__dirname, 'data', 'media'), String(code));
   fs.mkdirSync(dir, { recursive: true });
   const fileName = `${msgId}.${extFromMime(mimeClean)}`;
   const full = path.join(dir, fileName);
