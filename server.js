@@ -1841,31 +1841,29 @@ async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
     throw new Error("stream-weave response ناقص");
   };
 
-  // Official 2026 path first: /video/stream/{id}/playlist.m3u8
-  // Then stream-weave (2027). Skip pure rutube-only if both fail.
-  const order = [];
-  if (hasCdn || !hasSw) order.push("cdn", "sw");
-  else if (hasSw && !hasCdn) order.push("sw", "cdn");
-  else order.push("cdn", "sw");
-
-  for (const step of order) {
-    try {
-      if (step === "sw") return await tryStreamWeave();
-      return await resolveCdnPlayback(numericId, tok, studentCode);
-    } catch (e) {
-      errors.push(step + ": " + e.message);
-      console.warn("[play]", step, "failed:", e.message);
+  // CDN-only playback: never fall back to stream-weave or external YouTube/Rutube URLs.
+  // The CDN resolver must return a valid CDN playlist/hash; if the upstream API only
+  // reports YouTube and provides no CDN data, fail clearly rather than opening YouTube.
+  try {
+    const playback = await resolveCdnPlayback(numericId, tok, studentCode);
+    if (playback?.streamUrl && /youtu\.be|youtube\.com|rutube\.ru/i.test(String(playback.streamUrl))) {
+      throw new Error("رفض رابط خارجي؛ مطلوب رابط CDN");
     }
+    return playback;
+  } catch (e) {
+    errors.push("cdn: " + e.message);
+    console.warn("[play] CDN-only failed:", e.message);
   }
 
-  if (hasRutube) {
+  if (hasRutube || platforms.some((p) => /youtube|youtu|rutube/.test(p))) {
     throw new Error(
-      "الفيديو على منصة rutube/youtube — مش مدعوم في مشغل فك التشفير | " + errors.join(" · ")
+      "تم تعطيل YouTube/Rutube. لم يُعثر على مصدر CDN صالح لهذا الفيديو " + numericId +
+      ". تأكد أن API يرجّع CDN hash أو playlist.m3u8. | " + errors.join(" · ")
     );
   }
 
   throw new Error(
-    "فشل كل طرق التشغيل للفيديو " + numericId + " | " + errors.join(" · ")
+    "فشل تشغيل CDN للفيديو " + numericId + " | " + errors.join(" · ")
   );
 }
 
