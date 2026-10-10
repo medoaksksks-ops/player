@@ -152,33 +152,13 @@ const CONFIG = {
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
-  DEFAULT_YEAR_ID: 4, // 2027
-  YEAR_IDS: {
-    2024: 1,
-    2025: 2,
-    2026: 3,
-    2027: 4
-  },
-  // Supported years for catalog (2026 + 2027)
-  SUPPORTED_YEARS: [
-    { id: 3, name: "2026" },
-    { id: 4, name: "2027" }
-  ],
+  DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
-    "api.stream-weave.com",
     "floravon.online",
-    "c-cdn.online",
-    "z1.c-cdn.online",
-    "z2.c-cdn.online",
-    "z3.c-cdn.online",
-    "cloud3.cloudfrount.shop",
-    "cloudfrount.shop",
-    "rtbcdn.ru",
-    "rutube.ru"
+    "c-cdn.online"
   ],
-
   STREAM_ORIGIN: "https://coursatk.online",
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
@@ -288,10 +268,7 @@ loadRuntimeFile();
 CONFIG.COURSATK_TOKEN = getCoursatkTokenSync();
 CONFIG.FIREBASE = getFirebaseUrl();
 console.log("[API] Firebase:", getFirebaseUrl() ? "configured" : "NOT set — bootstrap admin can still login");
-console.log("[API] Token:", getCoursatkTokenSync() ? ("set (" + getCoursatkTokenSync().slice(0, 16) + "…)") : "MISSING — set coursatkToken in admin panel or COURSATK_TOKEN env");
-if (!getCoursatkTokenSync()) {
-  console.warn("[API] ⚠ بدون توكن كورساتك فيديوهات 2026/2027 مش هتشتغل");
-}
+console.log("[API] Token:", getCoursatkTokenSync() ? "set" : "missing");
 
 function packageDurationMs(pkg) {
   if (!pkg) return 0;
@@ -301,48 +278,29 @@ function packageDurationMs(pkg) {
 }
 
 
-// Canonical subject IDs per section + year (fallback if Firebase section missing)
-// yearId 3 = 2026 | yearId 4 = 2027
+// Canonical subject IDs per section (fallback if Firebase section missing)
 const SECTION_CATALOG = {
-  // ── 2027 (yearId 4) ──
   scientific_sciences: {
     name: "علمي علوم",
     yearId: 4,
-    subjectIds: [57, 58, 59, 60, 61], // عربي, English, فيزياء, كيمياء, أحياء
-    years: {
-      3: { yearId: 3, subjectIds: [40, 41, 42, 43, 44] }, // 2026
-      4: { yearId: 4, subjectIds: [57, 58, 59, 60, 61] }  // 2027
-    }
+    subjectIds: [57, 58, 59, 60, 61]
   },
   scientific_math: {
     name: "علمي رياضة",
     yearId: 4,
-    subjectIds: [57, 58, 59, 60, 65], // عربي, English, فيزياء, كيمياء, رياضيات
-    years: {
-      3: { yearId: 3, subjectIds: [40, 41, 42, 43, 48] }, // 2026
-      4: { yearId: 4, subjectIds: [57, 58, 59, 60, 65] }  // 2027
-    }
+    subjectIds: [57, 58, 59, 60, 65]
   },
   literary: {
     name: "أدبي",
     yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64],
-    years: {
-      3: { yearId: 3, subjectIds: [40, 41, 45, 46, 47] }, // 2026: عربي, English, تاريخ, جغرافيا, إحصاء
-      4: { yearId: 4, subjectIds: [57, 58, 62, 63, 64] }  // 2027
-    }
+    subjectIds: [57, 58, 62, 63, 64]
   },
   "بكالوريا": {
     name: "بكالوريا",
     yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64],
-    years: {
-      3: { yearId: 3, subjectIds: [40, 41, 45, 46, 47] },
-      4: { yearId: 4, subjectIds: [57, 58, 62, 63, 64] }
-    }
+    subjectIds: [57, 58, 62, 63, 64]
   }
 };
-
 
 /** Normalize section key from admin/UI variants */
 function normalizeSection(raw) {
@@ -377,44 +335,18 @@ function normalizeSection(raw) {
   return s;
 }
 
-/** Resolve section config: Firebase first, then hardcoded catalog.
- *  preferredYearId: 3 (2026) or 4 (2027). Falls back to section default / CONFIG.DEFAULT_YEAR_ID
- */
-async function resolveSection(sectionRaw, preferredYearId = null) {
+/** Resolve section config: Firebase first, then hardcoded catalog */
+async function resolveSection(sectionRaw) {
   const id = normalizeSection(sectionRaw);
   if (!id) return null;
-  const wantYear = preferredYearId != null ? Number(preferredYearId) : null;
-
   try {
     if (getFirebaseUrl()) {
-      // Try year-specific key first: sections/{id}/years/{yearId}
-      if (wantYear) {
-        const secYear = await fbGetCached(`sections/${id}/years/${wantYear}`, 60_000);
-        if (secYear && Array.isArray(secYear.subjectIds) && secYear.subjectIds.length) {
-          return {
-            id,
-            name: secYear.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-            yearId: wantYear,
-            subjectIds: secYear.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
-          };
-        }
-      }
       const sec = await fbGetCached(`sections/${id}`, 60_000);
       if (sec && Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
-        const yId = wantYear || Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID;
-        // If section has years map in Firebase
-        if (sec.years && sec.years[yId] && Array.isArray(sec.years[yId].subjectIds)) {
-          return {
-            id,
-            name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-            yearId: yId,
-            subjectIds: sec.years[yId].subjectIds.map(Number).filter((n) => !Number.isNaN(n))
-          };
-        }
         return {
           id,
           name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-          yearId: yId,
+          yearId: Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID,
           subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
         };
       }
@@ -422,24 +354,12 @@ async function resolveSection(sectionRaw, preferredYearId = null) {
   } catch (e) {
     console.warn("[section]", e.message);
   }
-
   const def = SECTION_CATALOG[id];
   if (def) {
-    const yId = wantYear || def.yearId || CONFIG.DEFAULT_YEAR_ID;
-    // Prefer year-specific mapping if available
-    if (def.years && def.years[yId]) {
-      return {
-        id,
-        name: def.name,
-        yearId: def.years[yId].yearId || yId,
-        subjectIds: [...def.years[yId].subjectIds]
-      };
-    }
     return { id, name: def.name, yearId: def.yearId, subjectIds: [...def.subjectIds] };
   }
-  return { id, name: id, yearId: wantYear || CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
+  return { id, name: id, yearId: CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
 }
-
 
 
 function resolveDurationMs(body) {
@@ -849,37 +769,16 @@ async function unwrapKey(wrappedBuf, videoId) {
     ? new Uint8Array(wrappedBuf)
     : new Uint8Array(wrappedBuf);
   if (wrapped.byteLength === 16) return Buffer.from(wrapped);
-
-  // Official CDN key is often 85 bytes; stream-weave decryptPlaybackKey expects 86 or 16.
-  // Try raw, then pad with common markers 0x00..0x02 at start/end.
-  const attempts = [wrapped];
-  if (wrapped.byteLength === 85) {
-    for (const b of [0x00, 0x01, 0x02, 0x10, 0x80]) {
-      const a = new Uint8Array(86); a[0] = b; a.set(wrapped, 1); attempts.push(a);
-      const c = new Uint8Array(86); c.set(wrapped, 0); c[85] = b; attempts.push(c);
-    }
-  }
-
-  let lastErr = null;
-  for (const buf of attempts) {
-    try {
-      const result = await decryptPlaybackKeyFn(buf, String(videoId || ""));
-      const key = result?.key;
-      if (!key) continue;
-      const aes = Buffer.isBuffer(key)
-        ? key
-        : key instanceof ArrayBuffer
-          ? Buffer.from(key)
-          : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
-      if (aes.length === 16) {
-        if (result?.code) console.log("[key] studentCode from payload:", result.code);
-        return aes;
-      }
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("فشل فك المفتاح (len=" + wrapped.byteLength + ")");
+  const result = await decryptPlaybackKeyFn(wrapped, String(videoId));
+  const key = result?.key;
+  if (!key) throw new Error("empty key");
+  const aes = Buffer.isBuffer(key)
+    ? key
+    : key instanceof ArrayBuffer
+      ? Buffer.from(key)
+      : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
+  if (aes.length !== 16) throw new Error(`key len ${aes.length}`);
+  return aes;
 }
 
 function decryptSegment(encrypted, key, iv) {
@@ -932,8 +831,6 @@ function allowedStreamUrl(raw, session = null) {
     if (session?.streamUrl) {
       try { hosts.add(new URL(session.streamUrl).hostname); } catch {}
     }
-    if (u.hostname.endsWith(".cloudfrount.shop") || u.hostname === "cloudfrount.shop") return true;
-    if (u.hostname.endsWith(".c-cdn.online") || u.hostname === "c-cdn.online") return true;
     return [...hosts].some(h => u.hostname === h || u.hostname.endsWith("." + h));
   } catch {
     return false;
@@ -1143,10 +1040,9 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
     clearLoginFail("student", ip, code);
 
     // Resolve subject IDs for section (hardcoded fallback + Firebase)
-    // Prefer student.yearId if set (3=2026, 4=2027)
     let subjectIds = [];
-    let yearId = Number(student.yearId) || CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(student.section, yearId);
+    let yearId = CONFIG.DEFAULT_YEAR_ID;
+    const secInfo = await resolveSection(student.section);
     if (secInfo) {
       subjectIds = secInfo.subjectIds || [];
       yearId = secInfo.yearId || yearId;
@@ -1166,14 +1062,12 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
           name: student.name,
           code,
           section: student.section || null,
-          yearId,
           expiresAt: student.expiresAt,
           maxDevices,
           deviceId
         },
         yearId,
-        subjectIds,
-        years: CONFIG.SUPPORTED_YEARS
+        subjectIds
       }
     });
   } catch (e) {
@@ -1196,15 +1090,8 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
   try {
     const s = req.student;
     let subjectIds = [];
-    let yearId = Number(s.yearId) || CONFIG.DEFAULT_YEAR_ID;
-    const qYear = req.query.yearId || req.query.year;
-    if (qYear != null) {
-      const n = Number(qYear);
-      if (n === 2026 || n === 3) yearId = 3;
-      else if (n === 2027 || n === 4) yearId = 4;
-      else if (!Number.isNaN(n)) yearId = n;
-    }
-    const secInfo = await resolveSection(s.section, yearId);
+    let yearId = CONFIG.DEFAULT_YEAR_ID;
+    const secInfo = await resolveSection(s.section);
     if (secInfo) {
       subjectIds = secInfo.subjectIds || [];
       yearId = secInfo.yearId || yearId;
@@ -1216,14 +1103,12 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
         name: s.name,
         code: req.session.code,
         section: s.section || null,
-        yearId,
         expiresAt: s.expiresAt,
         maxDevices: s.maxDevices || 1,
         devices: Object.keys(s.devices || {}).length,
         deviceId: req.session.deviceId,
         yearId,
         subjectIds,
-        years: CONFIG.SUPPORTED_YEARS,
         sessionExpiresAt: req.session.expiresAt
       }
     });
@@ -1235,37 +1120,10 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 // CATALOG (student token required) — proxies upstream, hides COURSATK token
 // ═══════════════════════════════════════════════════════════
-
-/** List supported years (2026 + 2027) */
-app.get("/api/years", requireStudent, async (_req, res) => {
-  res.json({
-    success: true,
-    data: CONFIG.SUPPORTED_YEARS.map((y) => ({
-      id: y.id,
-      name: y.name,
-      label: y.name
-    }))
-  });
-});
-
 app.get("/api/config", requireStudent, async (req, res) => {
-  // Allow ?yearId=3 or ?year=2026 to select year
-  const qYear = req.query.yearId || req.query.year || null;
-  let preferredYear = null;
-  if (qYear != null) {
-    const n = Number(qYear);
-    if (n === 2026 || n === 3) preferredYear = 3;
-    else if (n === 2027 || n === 4) preferredYear = 4;
-    else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) preferredYear = n;
-  }
-  // Also respect student.yearId if stored
-  if (preferredYear == null && req.student.yearId) {
-    preferredYear = Number(req.student.yearId);
-  }
-
-  let yearId = preferredYear || CONFIG.DEFAULT_YEAR_ID;
+  let yearId = CONFIG.DEFAULT_YEAR_ID;
   let subjectIds = [];
-  const secInfo = await resolveSection(req.student.section, preferredYear);
+  const secInfo = await resolveSection(req.student.section);
   if (secInfo) {
     yearId = secInfo.yearId || yearId;
     subjectIds = secInfo.subjectIds || [];
@@ -1274,7 +1132,6 @@ app.get("/api/config", requireStudent, async (req, res) => {
     success: true,
     yearId,
     subjectIds,
-    years: CONFIG.SUPPORTED_YEARS,
     cryptoReady: Boolean(decryptPlaybackKeyFn),
     decryptSegments: true
   });
@@ -1283,17 +1140,9 @@ app.get("/api/config", requireStudent, async (req, res) => {
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     // 1) Load section subject IDs (Firebase + hardcoded catalog)
-    // :id can be yearId (3 or 4) — also accept ?yearId= / ?year=
     let wantedIds = [];
     let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
-    const qYear = req.query.yearId || req.query.year;
-    if (qYear != null) {
-      const n = Number(qYear);
-      if (n === 2026 || n === 3) yearId = 3;
-      else if (n === 2027 || n === 4) yearId = 4;
-      else if (!Number.isNaN(n)) yearId = n;
-    }
-    const secInfo = await resolveSection(req.student.section, yearId);
+    const secInfo = await resolveSection(req.student.section);
     if (secInfo) {
       if (Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
         wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
@@ -1303,7 +1152,6 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
     console.log("[subjects]", {
       student: req.student.code,
       section: req.student.section,
-      yearId,
       wantedIds
     });
 
@@ -1396,42 +1244,9 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
-    const data = await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`);
-    // Cache any CDN hashes found on video objects (2026)
-    try {
-      const videos = data?.data?.videos || data?.videos || [];
-      let saved = 0;
-      for (const v of videos) {
-        if (!v || v.id == null) continue;
-        const vid = String(v.id);
-        const hash =
-          v.content_hash || v.contentHash || v.hash || v.video_hash ||
-          v.file_hash || v.cdn_hash || v.media_hash || v.uuid ||
-          (typeof v.platform_id === "string" && /^[a-f0-9]{32}$/i.test(v.platform_id) ? v.platform_id : null) ||
-          (typeof v.external_id === "string" && /^[a-f0-9]{32}$/i.test(v.external_id) ? v.external_id : null);
-        if (hash && /^[a-f0-9]{32}$/i.test(String(hash))) {
-          CDN_HASH_BY_VIDEO[vid] = String(hash).toLowerCase();
-          saved++;
-        }
-        // also scan nested platform objects
-        for (const p of (v.platforms || v.platform || [])) {
-          const obj = typeof p === "object" ? p : null;
-          if (!obj) continue;
-          const h = obj.content_hash || obj.hash || obj.id || obj.video_id;
-          if (h && /^[a-f0-9]{32}$/i.test(String(h))) {
-            CDN_HASH_BY_VIDEO[vid] = String(h).toLowerCase();
-            saved++;
-          }
-        }
-      }
-      if (saved) {
-        try { saveCdnHashes(); } catch {}
-        console.log("[content] cached", saved, "cdn hashes from lecture", req.params.id);
-      }
-    } catch (e) {
-      console.warn("[content] hash scan:", e.message);
-    }
-    res.json(data);
+    res.json(
+      await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
+    );
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -1439,513 +1254,37 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 // STREAM (student token) — decrypted segments
-// Two platforms:
-//   A) stream-weave → 2027 (POST /video/{id}/stream-weave/play)
-//   B) cdn          → 2026 (z1.c-cdn.online + /user/auth/{hash} key)
-//      Proven from captured playlist:
-//      KEY:  GET /api/v1/user/auth/{hash}  (85-byte wrapped)
-//      SEGS: https://z1.c-cdn.online/2026/videos/{hash}/480/seg-*.woff2?code&expires&token
 // ═══════════════════════════════════════════════════════════
-
-async function upstreamJsonWithToken(apiPath, studentBearer, options = {}) {
-  const headers = {
-    Authorization: `Bearer ${studentBearer || (await getCoursatkToken())}`,
-    Accept: "application/json",
-    ...(options.headers || {})
-  };
-  const r = await fetch(`${CONFIG.COURSATK_API}${apiPath}`, {
-    ...options,
-    headers
-  });
-  const text = await r.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Upstream non-JSON (${r.status}) ${text.slice(0, 120)}`);
-  }
-  if (!r.ok) throw new Error(data?.message || data?.error || `Upstream HTTP ${r.status}`);
-  return data;
-}
-
-async function detectPlatforms(videoId, studentBearer) {
-  try {
-    const data = await upstreamJsonWithToken(
-      `/video/${encodeURIComponent(videoId)}/platforms`,
-      studentBearer
-    );
-    const list = data?.data?.platforms || data?.platforms || [];
-    // cache hash if present on platform entries
-    for (const p of list) {
-      if (!p || typeof p !== "object") continue;
-      const h = p.content_hash || p.hash || p.video_hash || p.file_hash ||
-        p.cdn_hash || p.uuid || p.platform_video_id || p.external_id ||
-        (typeof p.id === "string" && /^[a-f0-9]{32}$/i.test(p.id) ? p.id : null);
-      if (h && /^[a-f0-9]{32}$/i.test(String(h))) {
-        CDN_HASH_BY_VIDEO[String(videoId)] = String(h).toLowerCase();
-        try { saveCdnHashes(); } catch {}
-        console.log("[platforms] hash for", videoId, "=", h);
-      }
-    }
-    // also top-level
-    const top = data?.data || data || {};
-    for (const k of ["content_hash", "hash", "video_hash", "cdn_hash"]) {
-      if (top[k] && /^[a-f0-9]{32}$/i.test(String(top[k]))) {
-        CDN_HASH_BY_VIDEO[String(videoId)] = String(top[k]).toLowerCase();
-        try { saveCdnHashes(); } catch {}
-      }
-    }
-    return list.map((p) => String(p.name || p.type || p).toLowerCase());
-  } catch {
-    return [];
-  }
-}
-
-/**
- * CDN content hashes (video_id → hash). Loaded from data/cdn_hashes.json + defaults.
- * Each video still gets its own stream session via POST /api/play/:videoId — same as 2027.
- */
-const CDN_HASH_FILE = path.join(DATA_DIR, "cdn_hashes.json");
-const CDN_HASH_BY_VIDEO = {
-  "12141": "eb543cf78f92ae5b059d72035722464c"
-};
-try {
-  if (fs.existsSync(CDN_HASH_FILE)) {
-    const extra = JSON.parse(fs.readFileSync(CDN_HASH_FILE, "utf8"));
-    if (extra && typeof extra === "object") Object.assign(CDN_HASH_BY_VIDEO, extra);
-  }
-} catch {}
-
-function saveCdnHashes() {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(CDN_HASH_FILE, JSON.stringify(CDN_HASH_BY_VIDEO, null, 2));
-  } catch (e) {
-    console.warn("[cdn] save hashes:", e.message);
-  }
-}
-
-/** Optional: captured quality playlist path per video_id (bootstrap while CDN signatures valid) */
-const CDN_PLAYLIST_BOOTSTRAP = {
-  "12141": path.join(__dirname, "video_sample", "playlist.m3u8")
-};
-
-/**
- * CDN (2026) playback resolver
- * Flow proven from captured playlist:
- *   KEY:  GET /api/v1/user/auth/{hash}  → 85-byte wrapped AES key
- *   SEGS: https://z1.c-cdn.online/2026/videos/{hash}/480/seg-*.woff2?code&expires&token
- *   Unwrap videoId for DecryptionUtils = content hash (not numeric id)
- */
-async function resolveCdnPlayback(videoId, studentBearer, studentCode) {
-  const vid = String(videoId);
-  const enc = encodeURIComponent(vid);
-  const errors = [];
-  const tok = studentBearer || getCoursatkTokenSync() || (await getCoursatkToken());
-
-  // ── Primary path (proven from official app Network):
-  // GET /api/v1/video/stream/{id}/playlist.m3u8  (Bearer token)
-  // variant: /video/stream/{id}/224.m3u8 | 360 | 540
-  // KEY: /user/auth/{contentHash}  (85-byte wrapped)
-  // SEGS: https://cloud3.cloudfrount.shop/2026/videos/{hash}/{quality}/seg-*.woff2?...
-  const streamPlaylist = `${CONFIG.COURSATK_API}/video/stream/${vid}/playlist.m3u8`;
-  try {
-    const probe = await fetch(streamPlaylist, {
-      headers: {
-        Authorization: `Bearer ${tok}`,
-        Accept: "*/*",
-        Origin: CONFIG.STREAM_ORIGIN,
-        Referer: CONFIG.STREAM_REFERER,
-        "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
-        "User-Agent": CONFIG.STREAM_UA
-      },
-      cache: "no-store"
-    });
-    if (probe.ok) {
-      const body = await probe.text();
-      if (body.includes("#EXTM3U")) {
-        console.log("[cdn] stream playlist OK for", vid);
-        return {
-          videoId: vid, // may be updated later from KEY hash
-          numericId: vid,
-          token: tok,
-          streamUrl: streamPlaylist,
-          mode: "cdn",
-          contentHash: CDN_HASH_BY_VIDEO[vid] || null,
-          keyUrl: null, // resolved from playlist KEY URI
-          playlistCandidates: [streamPlaylist]
-        };
-      }
-      // sometimes JSON error
-      errors.push("stream/playlist: not m3u8 " + body.slice(0, 80));
-    } else {
-      const t = await probe.text();
-      errors.push(`stream/playlist HTTP ${probe.status}: ` + t.slice(0, 100));
-    }
-  } catch (e) {
-    errors.push("stream/playlist: " + e.message);
-  }
-
-
-
-  function deepFindHash(obj, depth = 0) {
-    if (!obj || depth > 6) return null;
-    if (typeof obj === "string") {
-      const s = obj.trim();
-      // 32 hex content hash
-      if (/^[a-f0-9]{32}$/i.test(s)) return s.toLowerCase();
-      // embedded in URL
-      const m = s.match(/\/(?:videos|video|cdn)\/([a-f0-9]{32})\b/i);
-      if (m) return m[1].toLowerCase();
-      return null;
-    }
-    if (Array.isArray(obj)) {
-      for (const x of obj) {
-        const h = deepFindHash(x, depth + 1);
-        if (h) return h;
-      }
-      return null;
-    }
-    if (typeof obj === "object") {
-      const preferKeys = [
-        "content_hash", "contentHash", "hash", "video_hash", "file_hash",
-        "cdn_hash", "uuid", "cdn_id", "media_hash", "fileHash"
-      ];
-      for (const k of preferKeys) {
-        if (obj[k] != null) {
-          const h = deepFindHash(obj[k], depth + 1);
-          if (h) return h;
-        }
-      }
-      for (const v of Object.values(obj)) {
-        const h = deepFindHash(v, depth + 1);
-        if (h) return h;
-      }
-    }
-    return null;
-  }
-
-  function deepFindUrl(obj, depth = 0) {
-    if (!obj || depth > 6) return null;
-    if (typeof obj === "string") {
-      const s = obj.trim();
-      if (/^https?:\/\/.+\.m3u8(\?|$)/i.test(s)) return s;
-      if (/^https?:\/\/.*(c-cdn|stream-weave|rtbcdn)/i.test(s) && /\.m3u8/i.test(s)) return s;
-      return null;
-    }
-    if (Array.isArray(obj)) {
-      for (const x of obj) {
-        const u = deepFindUrl(x, depth + 1);
-        if (u) return u;
-      }
-      return null;
-    }
-    if (typeof obj === "object") {
-      const keys = [
-        "stream_url", "playlist_url", "playlist", "hls_url", "manifest_url",
-        "manifest", "url", "master_url", "src", "source"
-      ];
-      for (const k of keys) {
-        if (obj[k]) {
-          const u = deepFindUrl(obj[k], depth + 1);
-          if (u) return u;
-        }
-      }
-      if (obj.qualities && typeof obj.qualities === "object") {
-        for (const q of ["480", "720", "360", "1080", "auto"]) {
-          if (obj.qualities[q]) {
-            const u = deepFindUrl(obj.qualities[q], depth + 1);
-            if (u) return u;
-          }
-        }
-      }
-      for (const v of Object.values(obj)) {
-        const u = deepFindUrl(v, depth + 1);
-        if (u) return u;
-      }
-    }
-    return null;
-  }
-
-  function pack(hash, streamUrl, extra = {}) {
-    const h = hash ? String(hash).toLowerCase() : null;
-    const candidates = h
-      ? [
-          streamUrl,
-          `https://z1.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
-          `https://z2.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
-          `https://z3.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
-          `https://z1.c-cdn.online/2026/videos/${h}/playlist.m3u8`,
-          `https://z1.c-cdn.online/2026/videos/${h}/master.m3u8`,
-          `https://c-cdn.online/2026/videos/${h}/480/playlist.m3u8`
-        ].filter(Boolean)
-      : [streamUrl].filter(Boolean);
-    return {
-      videoId: String(h || vid),
-      numericId: vid,
-      token: extra.token || tok,
-      streamUrl: candidates[0],
-      mode: "cdn",
-      contentHash: h,
-      keyUrl: h ? `${CONFIG.COURSATK_API}/user/auth/${h}` : null,
-      playlistCandidates: [...new Set(candidates)]
-    };
-  }
-
-  async function tryPlaylistReachable(url) {
-    try {
-      const r = await fetch(url, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${tok}`,
-          Accept: "*/*",
-          Origin: CONFIG.STREAM_ORIGIN,
-          Referer: CONFIG.STREAM_REFERER,
-          "User-Agent": CONFIG.STREAM_UA
-        },
-        cache: "no-store"
-      });
-      if (!r.ok) return false;
-      const t = await r.text();
-      return t.includes("#EXTM3U");
-    } catch {
-      return false;
-    }
-  }
-
-  async function finalize(hit) {
-    if (!hit) return null;
-    const list = hit.playlistCandidates || [hit.streamUrl];
-    for (const u of list) {
-      if (!u) continue;
-      if (await tryPlaylistReachable(u)) {
-        hit.streamUrl = u;
-        return hit;
-      }
-    }
-    // keep first candidate even if not reachable now (signed URLs may need key path later)
-    return hit;
-  }
-
-  const apiTries = [
-    { path: `/video/${enc}/otp`, method: "GET" },
-    { path: `/video/${enc}`, method: "GET" },
-    { path: `/video/${enc}/platforms`, method: "GET" },
-    { path: `/video/${enc}/cdn/play`, method: "POST" },
-    { path: `/video/${enc}/play`, method: "POST" },
-    { path: `/user/videos/${enc}`, method: "GET" },
-    { path: `/user/videos/${enc}/play`, method: "POST" },
-    { path: `/user/video/${enc}`, method: "GET" },
-    { path: `/user/videos/${enc}/playlist`, method: "GET" },
-    { path: `/user/videos/${enc}/manifest`, method: "GET" }
-  ];
-
-  for (const t of apiTries) {
-    try {
-      const data = await upstreamJsonWithToken(t.path, tok, {
-        method: t.method,
-        headers: { Accept: "application/json" }
-      });
-      const root = data?.data || data;
-      const hash = deepFindHash(root);
-      const streamUrl = deepFindUrl(root);
-      if (streamUrl || hash) {
-        const hit = await finalize(pack(hash, streamUrl, { token: root?.token || tok }));
-        if (hit) {
-          if (hash) {
-            CDN_HASH_BY_VIDEO[vid] = hash;
-            try { saveCdnHashes(); } catch {}
-          }
-          console.log("[cdn] resolved via", t.path, "hash=", hit.contentHash, "url=", hit.streamUrl?.slice(0, 80));
-          return hit;
-        }
-      }
-      // platforms array special
-      const plats = root?.platforms || [];
-      for (const p of plats) {
-        const h = deepFindHash(p);
-        const u = deepFindUrl(p) || p.url || null;
-        if (h || u) {
-          const hit = await finalize(pack(h, u));
-          if (hit) return hit;
-        }
-      }
-      errors.push(t.path + ": no hash/url");
-    } catch (e) {
-      errors.push(t.path + ": " + e.message);
-    }
-  }
-
-  // Known hash map
-  const knownHash = CDN_HASH_BY_VIDEO[vid];
-  if (knownHash) {
-    const boot = CDN_PLAYLIST_BOOTSTRAP[vid];
-    if (boot && fs.existsSync(boot)) {
-      return {
-        videoId: knownHash,
-        numericId: vid,
-        token: tok,
-        streamUrl: `file://${boot}`,
-        mode: "cdn",
-        contentHash: knownHash,
-        keyUrl: `${CONFIG.COURSATK_API}/user/auth/${knownHash}`,
-        localPlaylist: boot
-      };
-    }
-    const hit = await finalize(pack(knownHash, null));
-    if (hit) return hit;
-  }
-
-  // Last resort: try stream-weave style id as hash if video details returned numeric only
-  throw new Error("CDN resolve failed for " + videoId + " | " + errors.slice(0, 8).join(" · "));
-}
-
-async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
-  const numericId = String(videoId);
-  const vid = encodeURIComponent(numericId);
-  const errors = [];
-  const tok = studentBearer || getCoursatkTokenSync();
-  if (!tok) {
-    throw new Error("توكن كورساتك غير مضبوط — من لوحة التحكم → إعدادات التشغيل → coursatkToken");
-  }
-
-  const platforms = await detectPlatforms(numericId, tok);
-  console.log("[play] platforms for", numericId, platforms);
-
-  const hasCdn = platforms.includes("cdn");
-  const hasSw =
-    platforms.includes("stream-weave") ||
-    platforms.includes("stream_weave") ||
-    platforms.includes("streamweave");
-  const hasRutube = platforms.some((p) => /rutube|youtube|youtu/.test(p));
-
-  const tryStreamWeave = async () => {
-    const data = await upstreamJson(`/video/${vid}/stream-weave/play`, {
-      method: "POST",
-      headers: { Accept: "application/json" }
-    });
-    if (data?.success && data?.data?.token && data?.data?.stream_url) {
-      const streamUrl = String(data.data.stream_url);
-      // refuse youtube/rutube embeds — our decrypt pipeline can't play them
-      if (/youtu\.be|youtube\.com|rutube\.ru/i.test(streamUrl)) {
-        throw new Error("رابط خارجي (youtube/rutube) غير مدعوم في المشغل");
-      }
-      return {
-        videoId: String(data.data.video_id || numericId),
-        numericId,
-        token: data.data.token,
-        streamUrl,
-        mode: "stream-weave"
-      };
-    }
-    throw new Error("stream-weave response ناقص");
-  };
-
-  // CDN-only playback: never fall back to stream-weave or external YouTube/Rutube URLs.
-  // The CDN resolver must return a valid CDN playlist/hash; if the upstream API only
-  // reports YouTube and provides no CDN data, fail clearly rather than opening YouTube.
-  try {
-    const playback = await resolveCdnPlayback(numericId, tok, studentCode);
-    if (playback?.streamUrl && /youtu\.be|youtube\.com|rutube\.ru/i.test(String(playback.streamUrl))) {
-      throw new Error("رفض رابط خارجي؛ مطلوب رابط CDN");
-    }
-    return playback;
-  } catch (e) {
-    errors.push("cdn: " + e.message);
-    console.warn("[play] CDN-only failed:", e.message);
-  }
-
-  if (hasRutube || platforms.some((p) => /youtube|youtu|rutube/.test(p))) {
-    throw new Error(
-      "تم تعطيل YouTube/Rutube. لم يُعثر على مصدر CDN صالح لهذا الفيديو " + numericId +
-      ". تأكد أن API يرجّع CDN hash أو playlist.m3u8. | " + errors.join(" · ")
-    );
-  }
-
-  throw new Error(
-    "فشل تشغيل CDN للفيديو " + numericId + " | " + errors.join(" · ")
-  );
-}
-
-/**
- * POST /api/play/:videoId
- * Same for every video (2026 CDN or 2027 stream-weave):
- *   → resolve upstream playlist
- *   → create stream session
- *   → return { session, video_id, mode, manifest_url }
- */
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    const numericId = String(req.params.videoId);
-    const studentBearer = getCoursatkTokenSync() || null;
-    const studentCode = req.session?.code || req.student?.code || "";
-    if (!studentBearer) {
-      return jsonError(res, 503, "توكن كورساتك غير مضبوط — أدخله من لوحة التحكم (إعدادات التشغيل)");
-    }
-
-    // Accept optional content hash from client (if frontend knows it)
-    const clientHash = String(req.body?.contentHash || req.body?.hash || "").trim().toLowerCase();
-    if (/^[a-f0-9]{32}$/.test(clientHash)) {
-      CDN_HASH_BY_VIDEO[numericId] = clientHash;
-      try { saveCdnHashes(); } catch {}
-    }
-
-    const playback = await resolveUpstreamPlayback(
-      numericId,
-      studentBearer,
-      studentCode
+    const data = await upstreamJson(
+      `/video/${encodeURIComponent(req.params.videoId)}/stream-weave/play`,
+      { method: "POST", headers: { Accept: "application/json" } }
     );
-
-    const id = crypto.randomUUID();
-    const hosts = new Set([
-      "z1.c-cdn.online",
-      "z2.c-cdn.online",
-      "z3.c-cdn.online",
-      "c-cdn.online",
-      "api.coursatk.online",
-      "api.stream-weave.com",
-      "stream-weave.com"
-    ]);
-    if (playback.streamUrl && !String(playback.streamUrl).startsWith("file:")) {
-      try { hosts.add(new URL(playback.streamUrl).hostname); } catch {}
+    if (!data?.success || !data?.data?.token || !data?.data?.stream_url || !data?.data?.video_id) {
+      throw new Error("Playback response ناقص");
     }
-
+    const id = crypto.randomUUID();
     streamSessions.set(id, {
       id,
-      videoId: playback.videoId, // may be content-hash for CDN key unwrap
-      numericId: playback.numericId || numericId,
-      token: playback.token,
-      streamUrl: playback.streamUrl,
-      mode: playback.mode,
-      contentHash: playback.contentHash || null,
-      keyUrl: playback.keyUrl || null,
-      localPlaylist: playback.localPlaylist || null,
-      playlistCandidates: playback.playlistCandidates || null,
+      videoId: String(data.data.video_id),
+      token: data.data.token,
+      streamUrl: data.data.stream_url,
       createdAt: now(),
       plainKey: null,
       defaultIv: null,
-      allowedHosts: hosts,
+      allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
       ownerCode: req.session.code
     });
-
-    console.log(
-      `[play] numeric=${numericId} mode=${playback.mode}` +
-        (playback.contentHash ? ` hash=${playback.contentHash}` : "") +
-        ` session=${id}`
-    );
-
-    // Same response shape for all years / platforms
     res.json({
       success: true,
       data: {
         session: id,
-        video_id: numericId,
-        mode: playback.mode,
+        video_id: data.data.video_id,
         manifest_url: `/api/stream/manifest/${id}`
       }
     });
   } catch (e) {
-    console.error("[play]", e.message);
     jsonError(res, 502, e.message);
   }
 });
@@ -1968,46 +1307,9 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
   }
 
   try {
-    let masterText;
-    let baseUrl = session.streamUrl;
-
-    // Local captured playlist (CDN bootstrap) — media URIs are absolute CDN URLs
-    if (session.localPlaylist || (session.streamUrl && session.streamUrl.startsWith("file://"))) {
-      const fp = session.localPlaylist || session.streamUrl.replace(/^file:\/\//, "");
-      masterText = fs.readFileSync(fp, "utf8");
-      // base for relative lines — segments in capture are absolute
-      baseUrl = session.contentHash
-        ? `https://z1.c-cdn.online/2026/videos/${session.contentHash}/480/playlist.m3u8`
-        : "https://z1.c-cdn.online/";
-    } else {
-      const tryUrls = [session.streamUrl, ...(session.playlistCandidates || [])].filter(Boolean);
-      const seen = new Set();
-      let lastErr = null;
-      for (const u of tryUrls) {
-        if (seen.has(u)) continue;
-        seen.add(u);
-        try {
-          const master = await streamFetch(session, u, {}, req.headers);
-          if (!master.ok) {
-            lastErr = new Error(`Stream master HTTP ${master.status} @ ${u}`);
-            continue;
-          }
-          const txt = await master.text();
-          if (!txt.includes("#EXTM3U")) {
-            lastErr = new Error("not m3u8 @ " + u);
-            continue;
-          }
-          masterText = txt;
-          baseUrl = u;
-          session.streamUrl = u;
-          break;
-        } catch (e) {
-          lastErr = e;
-        }
-      }
-      if (!masterText) throw lastErr || new Error("تعذر جلب playlist");
-    }
-
+    const master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
+    const masterText = await master.text();
     const lines = masterText.split(/\r?\n/);
 
     let variant = null;
@@ -2015,7 +1317,7 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
       if (lines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
         const next = lines[i + 1]?.trim();
         if (next && !next.startsWith("#")) {
-          variant = new URL(next, baseUrl).href;
+          variant = new URL(next, session.streamUrl).href;
           break;
         }
       }
@@ -2029,7 +1331,7 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
       );
     }
     return rewritePlaylist(
-      req.params.sessionId, session, masterText, baseUrl, res, req.headers
+      req.params.sessionId, session, masterText, session.streamUrl, res, req.headers
     );
   } catch (e) {
     console.error("[manifest]", e.message);
@@ -2058,56 +1360,15 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
       if (ivHex) currentIv = parseIvHex(ivHex);
       if (uri && !keyFetched) {
-        let keyUrl;
-        // CDN 2026: KEY often points at /api/v1/user/auth/{hash} (coursatk API)
-        if (/user\/auth\//i.test(uri) || /\/auth\/[a-f0-9]{32}/i.test(uri)) {
-          if (/^https?:\/\//i.test(uri)) keyUrl = uri;
-          else {
-            const pathPart = uri.startsWith("/") ? uri.replace(/^\/api\/v1/, "") : "/" + uri;
-            keyUrl = CONFIG.COURSATK_API.replace(/\/api\/v1$/, "") + (pathPart.startsWith("/api/") ? pathPart : `/api/v1${pathPart.startsWith("/") ? pathPart : "/" + pathPart}`);
-            // normalize: COURSATK_API already includes /api/v1
-            if (uri.includes("user/auth/")) {
-              const hash = (uri.match(/user\/auth\/([a-f0-9]{32})/i) || session.contentHash && [0, session.contentHash] || [])[1];
-              if (hash) keyUrl = `${CONFIG.COURSATK_API}/user/auth/${hash}`;
-            }
-          }
-        } else {
-          keyUrl = new URL(uri, baseUrl).href;
-        }
-        // Extract content hash from KEY URI if present
-        const hashMatch = String(uri).match(/(?:user\/auth\/|videos\/)([a-f0-9]{32})/i);
-        if (hashMatch) {
-          session.contentHash = hashMatch[1].toLowerCase();
-          session.videoId = session.contentHash; // DecryptionUtils uses content hash
-          session.keyUrl = `${CONFIG.COURSATK_API}/user/auth/${session.contentHash}`;
-          try {
-            CDN_HASH_BY_VIDEO[String(session.numericId || "")] = session.contentHash;
-            saveCdnHashes();
-          } catch {}
-        }
-        // Prefer session.keyUrl when set (CDN)
-        if (session.keyUrl && session.contentHash) {
-          keyUrl = session.keyUrl;
-        }
+        const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        // ensure api.coursatk.online allowed
-        try { session.allowedHosts.add("api.coursatk.online"); } catch {}
-
-        let keyRes = await streamFetch(session, keyUrl, {
-          Authorization: `Bearer ${session.token || getCoursatkTokenSync()}`
-        }, clientHeaders);
-        if (!keyRes.ok && session.keyUrl && keyUrl !== session.keyUrl) {
-          keyRes = await streamFetch(session, session.keyUrl, {
-            Authorization: `Bearer ${session.token || getCoursatkTokenSync()}`
-          }, clientHeaders);
-        }
-        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status} @ ${keyUrl}`);
+        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        const unwrapId = session.contentHash || session.videoId;
-        session.plainKey = await unwrapKey(wrapped, unwrapId);
+        session.plainKey = await unwrapKey(wrapped, session.videoId);
         session.defaultIv = currentIv;
         keyFetched = true;
-        console.log(`[key] unwrapped for ${unwrapId} (${wrapped.byteLength}b)`);
+        console.log(`[key] unwrapped for ${session.videoId}`);
       }
       continue; // strip KEY — segments are plain
     }
@@ -2288,20 +1549,6 @@ app.get("/api/admin/me", requireAdmin(null), (req, res) => {
   });
 });
 
-// CDN hash map — register content hashes so POST /api/play/:id creates a session for 2026 videos
-app.get("/api/admin/cdn-hashes", requireAdmin("sections_manage"), (_req, res) => {
-  res.json({ success: true, data: CDN_HASH_BY_VIDEO });
-});
-
-app.post("/api/admin/cdn-hashes", requireAdmin("sections_manage"), (req, res) => {
-  const videoId = String(req.body?.videoId || req.body?.video_id || "").trim();
-  const hash = String(req.body?.hash || req.body?.content_hash || "").trim().toLowerCase();
-  if (!/^\d+$/.test(videoId)) return jsonError(res, 400, "videoId مطلوب");
-  if (!/^[a-f0-9]{32}$/.test(hash)) return jsonError(res, 400, "hash يجب أن يكون 32 hex");
-  CDN_HASH_BY_VIDEO[videoId] = hash;
-  saveCdnHashes();
-  res.json({ success: true, data: { videoId, hash } });
-});
 
 // ═══════════════════════════════════════════════════════════
 // ADMIN — App config (Coursatk token)
@@ -2534,19 +1781,9 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
       }
     }
 
-    // yearId: 3 = 2026, 4 = 2027 (default 4)
-    let yearId = CONFIG.DEFAULT_YEAR_ID;
-    if (req.body?.yearId != null || req.body?.year != null) {
-      const n = Number(req.body.yearId ?? req.body.year);
-      if (n === 2026 || n === 3) yearId = 3;
-      else if (n === 2027 || n === 4) yearId = 4;
-      else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) yearId = n;
-    }
-
     const record = {
       name,
       section: section || null,
-      yearId,
       type: req.body?.days != null ? "custom" : type,
       days: req.body?.days != null ? Number(req.body.days) : null,
       durationMs: duration, // starts on first student login
@@ -2575,12 +1812,6 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
     const patch = {};
     if (req.body.name != null) patch.name = String(req.body.name).trim();
     if (req.body.section != null) patch.section = normalizeSection(req.body.section) || String(req.body.section).trim() || null;
-    if (req.body.yearId != null || req.body.year != null) {
-      const n = Number(req.body.yearId ?? req.body.year);
-      if (n === 2026 || n === 3) patch.yearId = 3;
-      else if (n === 2027 || n === 4) patch.yearId = 4;
-      else if (CONFIG.SUPPORTED_YEARS.some((y) => y.id === n)) patch.yearId = n;
-    }
     if (req.body.maxDevices != null) {
       patch.maxDevices = Math.max(1, Math.min(10, Number(req.body.maxDevices)));
     }
@@ -3408,12 +2639,7 @@ app.get("/api/admin/messages/:code", requireAdmin("students_view"), async (req, 
  */
 app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 120, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
   try {
-    let code = String(req.params.code || "").trim();
-    if (code.startsWith("guest_")) {
-      code = code.replace(/[^a-zA-Z0-9_\-]/g, "");
-    } else {
-      code = code.replace(/\D/g, "");
-    }
+    const code = String(req.params.code).replace(/\D/g, "");
     if (!code) return jsonError(res, 400, "كود غير صالح");
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     const id = makeMsgId();
@@ -3540,55 +2766,6 @@ app.get("/api/media/:code/:file", async (req, res) => {
   }
 });
 
-
-/** Admin debug: raw upstream play probes for a video id */
-app.get("/api/admin/play-debug/:videoId", requireAdmin("students_view"), async (req, res) => {
-  try {
-    const vid = String(req.params.videoId);
-    const tok = getCoursatkTokenSync();
-    if (!tok) return jsonError(res, 400, "توكن كورساتك غير مضبوط");
-    const paths = [
-      `/video/${vid}/platforms`,
-      `/video/${vid}`,
-      `/video/${vid}/otp`,
-      `/user/videos/${vid}`
-    ];
-    const results = {};
-    for (const p of paths) {
-      try {
-        const r = await fetch(`${CONFIG.COURSATK_API}${p}`, {
-          headers: { Authorization: `Bearer ${tok}`, Accept: "application/json" }
-        });
-        const text = await r.text();
-        let body;
-        try { body = JSON.parse(text); } catch { body = text.slice(0, 500); }
-        results[p] = { status: r.status, body };
-      } catch (e) {
-        results[p] = { error: e.message };
-      }
-    }
-    // also try stream-weave
-    try {
-      const r = await fetch(`${CONFIG.COURSATK_API}/video/${vid}/stream-weave/play`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${tok}`, Accept: "application/json" }
-      });
-      const text = await r.text();
-      let body;
-      try { body = JSON.parse(text); } catch { body = text.slice(0, 500); }
-      results["POST /video/.../stream-weave/play"] = { status: r.status, body };
-    } catch (e) {
-      results["stream-weave"] = { error: e.message };
-    }
-    results.knownHash = CDN_HASH_BY_VIDEO[vid] || null;
-    results.tokenPrefix = tok.slice(0, 12) + "…";
-    res.json({ success: true, data: results });
-  } catch (e) {
-    jsonError(res, 500, e.message);
-  }
-});
-
-
 // ═══════════════════════════════════════════════════════════
 // Fallback
 // ═══════════════════════════════════════════════════════════
@@ -3649,20 +2826,18 @@ if (!getFirebaseUrl()) {
   console.warn("[API] WARNING: Firebase URL not set — configure from admin panel (إعدادات التشغيل)");
 }
 
-// Seed default sections if missing (supports 2026 + 2027)
+// Seed default sections if missing
 try {
   if (!getFirebaseUrl()) throw new Error("no firebase");
-  // 2026 (yearId 3) + 2027 (yearId 4) subject maps
+  // Always ensure correct subject IDs for the 3 main sections
+  // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
+  // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
+  // أدبي: 57 عربي، 58 English + 62،63،64
   const sectionDefaults = {};
   for (const [id, def] of Object.entries(SECTION_CATALOG)) {
-    sectionDefaults[id] = {
-      name: def.name,
-      yearId: def.yearId,
-      subjectIds: def.subjectIds,
-      years: def.years || null,
-      updatedAt: Date.now()
-    };
+    sectionDefaults[id] = { ...def, updatedAt: Date.now() };
   }
+  // Sync sections only when missing or IDs changed (avoid write storm on every restart)
   const existing = (await fbGet("sections")) || {};
   let changed = 0;
   for (const [id, def] of Object.entries(sectionDefaults)) {
@@ -3671,19 +2846,18 @@ try {
       cur &&
       Array.isArray(cur.subjectIds) &&
       cur.subjectIds.length === def.subjectIds.length &&
-      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x) &&
-      cur.years && def.years;
+      def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
     if (!same) {
       await fbSet(`sections/${id}`, { ...(cur || {}), ...def });
       changed++;
     }
   }
-  console.log("[API] sections synced (2026+2027), updated:", changed);
+  console.log("[API] sections synced, updated:", changed);
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON · years 2026+2027`);
+  console.log(`[API] :${CONFIG.PORT} protected · segment-decrypt ON`);
   console.log(`[API] bootstrap admin ready (Hema)`);
 });
