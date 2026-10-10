@@ -173,6 +173,8 @@ const CONFIG = {
     "z1.c-cdn.online",
     "z2.c-cdn.online",
     "z3.c-cdn.online",
+    "cloud3.cloudfrount.shop",
+    "cloudfrount.shop",
     "rtbcdn.ru",
     "rutube.ru"
   ],
@@ -844,16 +846,37 @@ async function unwrapKey(wrappedBuf, videoId) {
     ? new Uint8Array(wrappedBuf)
     : new Uint8Array(wrappedBuf);
   if (wrapped.byteLength === 16) return Buffer.from(wrapped);
-  const result = await decryptPlaybackKeyFn(wrapped, String(videoId));
-  const key = result?.key;
-  if (!key) throw new Error("empty key");
-  const aes = Buffer.isBuffer(key)
-    ? key
-    : key instanceof ArrayBuffer
-      ? Buffer.from(key)
-      : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
-  if (aes.length !== 16) throw new Error(`key len ${aes.length}`);
-  return aes;
+
+  // Official CDN key is often 85 bytes; stream-weave decryptPlaybackKey expects 86 or 16.
+  // Try raw, then pad with common markers 0x00..0x02 at start/end.
+  const attempts = [wrapped];
+  if (wrapped.byteLength === 85) {
+    for (const b of [0x00, 0x01, 0x02, 0x10, 0x80]) {
+      const a = new Uint8Array(86); a[0] = b; a.set(wrapped, 1); attempts.push(a);
+      const c = new Uint8Array(86); c.set(wrapped, 0); c[85] = b; attempts.push(c);
+    }
+  }
+
+  let lastErr = null;
+  for (const buf of attempts) {
+    try {
+      const result = await decryptPlaybackKeyFn(buf, String(videoId || ""));
+      const key = result?.key;
+      if (!key) continue;
+      const aes = Buffer.isBuffer(key)
+        ? key
+        : key instanceof ArrayBuffer
+          ? Buffer.from(key)
+          : Buffer.from(key.buffer || key, key.byteOffset || 0, key.byteLength || key.length);
+      if (aes.length === 16) {
+        if (result?.code) console.log("[key] studentCode from payload:", result.code);
+        return aes;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("فشل فك المفتاح (len=" + wrapped.byteLength + ")");
 }
 
 function decryptSegment(encrypted, key, iv) {
@@ -906,6 +929,8 @@ function allowedStreamUrl(raw, session = null) {
     if (session?.streamUrl) {
       try { hosts.add(new URL(session.streamUrl).hostname); } catch {}
     }
+    if (u.hostname.endsWith(".cloudfrount.shop") || u.hostname === "cloudfrount.shop") return true;
+    if (u.hostname.endsWith(".c-cdn.online") || u.hostname === "c-cdn.online") return true;
     return [...hosts].some(h => u.hostname === h || u.hostname.endsWith("." + h));
   } catch {
     return false;
@@ -1368,9 +1393,42 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
-    res.json(
-      await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
-    );
+    const data = await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`);
+    // Cache any CDN hashes found on video objects (2026)
+    try {
+      const videos = data?.data?.videos || data?.videos || [];
+      let saved = 0;
+      for (const v of videos) {
+        if (!v || v.id == null) continue;
+        const vid = String(v.id);
+        const hash =
+          v.content_hash || v.contentHash || v.hash || v.video_hash ||
+          v.file_hash || v.cdn_hash || v.media_hash || v.uuid ||
+          (typeof v.platform_id === "string" && /^[a-f0-9]{32}$/i.test(v.platform_id) ? v.platform_id : null) ||
+          (typeof v.external_id === "string" && /^[a-f0-9]{32}$/i.test(v.external_id) ? v.external_id : null);
+        if (hash && /^[a-f0-9]{32}$/i.test(String(hash))) {
+          CDN_HASH_BY_VIDEO[vid] = String(hash).toLowerCase();
+          saved++;
+        }
+        // also scan nested platform objects
+        for (const p of (v.platforms || v.platform || [])) {
+          const obj = typeof p === "object" ? p : null;
+          if (!obj) continue;
+          const h = obj.content_hash || obj.hash || obj.id || obj.video_id;
+          if (h && /^[a-f0-9]{32}$/i.test(String(h))) {
+            CDN_HASH_BY_VIDEO[vid] = String(h).toLowerCase();
+            saved++;
+          }
+        }
+      }
+      if (saved) {
+        try { saveCdnHashes(); } catch {}
+        console.log("[content] cached", saved, "cdn hashes from lecture", req.params.id);
+      }
+    } catch (e) {
+      console.warn("[content] hash scan:", e.message);
+    }
+    res.json(data);
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -1414,7 +1472,27 @@ async function detectPlatforms(videoId, studentBearer) {
       studentBearer
     );
     const list = data?.data?.platforms || data?.platforms || [];
-    return list.map((p) => String(p.name || p).toLowerCase());
+    // cache hash if present on platform entries
+    for (const p of list) {
+      if (!p || typeof p !== "object") continue;
+      const h = p.content_hash || p.hash || p.video_hash || p.file_hash ||
+        p.cdn_hash || p.uuid || p.platform_video_id || p.external_id ||
+        (typeof p.id === "string" && /^[a-f0-9]{32}$/i.test(p.id) ? p.id : null);
+      if (h && /^[a-f0-9]{32}$/i.test(String(h))) {
+        CDN_HASH_BY_VIDEO[String(videoId)] = String(h).toLowerCase();
+        try { saveCdnHashes(); } catch {}
+        console.log("[platforms] hash for", videoId, "=", h);
+      }
+    }
+    // also top-level
+    const top = data?.data || data || {};
+    for (const k of ["content_hash", "hash", "video_hash", "cdn_hash"]) {
+      if (top[k] && /^[a-f0-9]{32}$/i.test(String(top[k]))) {
+        CDN_HASH_BY_VIDEO[String(videoId)] = String(top[k]).toLowerCase();
+        try { saveCdnHashes(); } catch {}
+      }
+    }
+    return list.map((p) => String(p.name || p.type || p).toLowerCase());
   } catch {
     return [];
   }
@@ -1461,6 +1539,51 @@ async function resolveCdnPlayback(videoId, studentBearer, studentCode) {
   const enc = encodeURIComponent(vid);
   const errors = [];
   const tok = studentBearer || getCoursatkTokenSync() || (await getCoursatkToken());
+
+  // ── Primary path (proven from official app Network):
+  // GET /api/v1/video/stream/{id}/playlist.m3u8  (Bearer token)
+  // variant: /video/stream/{id}/224.m3u8 | 360 | 540
+  // KEY: /user/auth/{contentHash}  (85-byte wrapped)
+  // SEGS: https://cloud3.cloudfrount.shop/2026/videos/{hash}/{quality}/seg-*.woff2?...
+  const streamPlaylist = `${CONFIG.COURSATK_API}/video/stream/${vid}/playlist.m3u8`;
+  try {
+    const probe = await fetch(streamPlaylist, {
+      headers: {
+        Authorization: `Bearer ${tok}`,
+        Accept: "*/*",
+        Origin: CONFIG.STREAM_ORIGIN,
+        Referer: CONFIG.STREAM_REFERER,
+        "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
+        "User-Agent": CONFIG.STREAM_UA
+      },
+      cache: "no-store"
+    });
+    if (probe.ok) {
+      const body = await probe.text();
+      if (body.includes("#EXTM3U")) {
+        console.log("[cdn] stream playlist OK for", vid);
+        return {
+          videoId: vid, // may be updated later from KEY hash
+          numericId: vid,
+          token: tok,
+          streamUrl: streamPlaylist,
+          mode: "cdn",
+          contentHash: CDN_HASH_BY_VIDEO[vid] || null,
+          keyUrl: null, // resolved from playlist KEY URI
+          playlistCandidates: [streamPlaylist]
+        };
+      }
+      // sometimes JSON error
+      errors.push("stream/playlist: not m3u8 " + body.slice(0, 80));
+    } else {
+      const t = await probe.text();
+      errors.push(`stream/playlist HTTP ${probe.status}: ` + t.slice(0, 100));
+    }
+  } catch (e) {
+    errors.push("stream/playlist: " + e.message);
+  }
+
+
 
   function deepFindHash(obj, depth = 0) {
     if (!obj || depth > 6) return null;
@@ -1735,6 +1858,16 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     const numericId = String(req.params.videoId);
     const studentBearer = getCoursatkTokenSync() || null;
     const studentCode = req.session?.code || req.student?.code || "";
+    if (!studentBearer) {
+      return jsonError(res, 503, "توكن كورساتك غير مضبوط — أدخله من لوحة التحكم (إعدادات التشغيل)");
+    }
+
+    // Accept optional content hash from client (if frontend knows it)
+    const clientHash = String(req.body?.contentHash || req.body?.hash || "").trim().toLowerCase();
+    if (/^[a-f0-9]{32}$/.test(clientHash)) {
+      CDN_HASH_BY_VIDEO[numericId] = clientHash;
+      try { saveCdnHashes(); } catch {}
+    }
 
     const playback = await resolveUpstreamPlayback(
       numericId,
@@ -1919,6 +2052,17 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
           }
         } else {
           keyUrl = new URL(uri, baseUrl).href;
+        }
+        // Extract content hash from KEY URI if present
+        const hashMatch = String(uri).match(/(?:user\/auth\/|videos\/)([a-f0-9]{32})/i);
+        if (hashMatch) {
+          session.contentHash = hashMatch[1].toLowerCase();
+          session.videoId = session.contentHash; // DecryptionUtils uses content hash
+          session.keyUrl = `${CONFIG.COURSATK_API}/user/auth/${session.contentHash}`;
+          try {
+            CDN_HASH_BY_VIDEO[String(session.numericId || "")] = session.contentHash;
+            saveCdnHashes();
+          } catch {}
         }
         // Prefer session.keyUrl when set (CDN)
         if (session.keyUrl && session.contentHash) {
@@ -3374,6 +3518,55 @@ app.get("/api/media/:code/:file", async (req, res) => {
     jsonError(res, 500, e.message);
   }
 });
+
+
+/** Admin debug: raw upstream play probes for a video id */
+app.get("/api/admin/play-debug/:videoId", requireAdmin("students_view"), async (req, res) => {
+  try {
+    const vid = String(req.params.videoId);
+    const tok = getCoursatkTokenSync();
+    if (!tok) return jsonError(res, 400, "توكن كورساتك غير مضبوط");
+    const paths = [
+      `/video/${vid}/platforms`,
+      `/video/${vid}`,
+      `/video/${vid}/otp`,
+      `/user/videos/${vid}`
+    ];
+    const results = {};
+    for (const p of paths) {
+      try {
+        const r = await fetch(`${CONFIG.COURSATK_API}${p}`, {
+          headers: { Authorization: `Bearer ${tok}`, Accept: "application/json" }
+        });
+        const text = await r.text();
+        let body;
+        try { body = JSON.parse(text); } catch { body = text.slice(0, 500); }
+        results[p] = { status: r.status, body };
+      } catch (e) {
+        results[p] = { error: e.message };
+      }
+    }
+    // also try stream-weave
+    try {
+      const r = await fetch(`${CONFIG.COURSATK_API}/video/${vid}/stream-weave/play`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${tok}`, Accept: "application/json" }
+      });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch { body = text.slice(0, 500); }
+      results["POST /video/.../stream-weave/play"] = { status: r.status, body };
+    } catch (e) {
+      results["stream-weave"] = { error: e.message };
+    }
+    results.knownHash = CDN_HASH_BY_VIDEO[vid] || null;
+    results.tokenPrefix = tok.slice(0, 12) + "…";
+    res.json({ success: true, data: results });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // Fallback
