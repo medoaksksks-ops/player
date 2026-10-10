@@ -288,7 +288,10 @@ loadRuntimeFile();
 CONFIG.COURSATK_TOKEN = getCoursatkTokenSync();
 CONFIG.FIREBASE = getFirebaseUrl();
 console.log("[API] Firebase:", getFirebaseUrl() ? "configured" : "NOT set — bootstrap admin can still login");
-console.log("[API] Token:", getCoursatkTokenSync() ? "set" : "missing");
+console.log("[API] Token:", getCoursatkTokenSync() ? ("set (" + getCoursatkTokenSync().slice(0, 16) + "…)") : "MISSING — set coursatkToken in admin panel or COURSATK_TOKEN env");
+if (!getCoursatkTokenSync()) {
+  console.warn("[API] ⚠ بدون توكن كورساتك فيديوهات 2026/2027 مش هتشتغل");
+}
 
 function packageDurationMs(pkg) {
   if (!pkg) return 0;
@@ -1801,11 +1804,20 @@ async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
   const numericId = String(videoId);
   const vid = encodeURIComponent(numericId);
   const errors = [];
-  const platforms = await detectPlatforms(numericId, studentBearer);
+  const tok = studentBearer || getCoursatkTokenSync();
+  if (!tok) {
+    throw new Error("توكن كورساتك غير مضبوط — من لوحة التحكم → إعدادات التشغيل → coursatkToken");
+  }
+
+  const platforms = await detectPlatforms(numericId, tok);
   console.log("[play] platforms for", numericId, platforms);
 
   const hasCdn = platforms.includes("cdn");
-  const hasSw = platforms.includes("stream-weave") || platforms.includes("stream_weave") || platforms.includes("streamweave");
+  const hasSw =
+    platforms.includes("stream-weave") ||
+    platforms.includes("stream_weave") ||
+    platforms.includes("streamweave");
+  const hasRutube = platforms.some((p) => /rutube|youtube|youtu/.test(p));
 
   const tryStreamWeave = async () => {
     const data = await upstreamJson(`/video/${vid}/stream-weave/play`, {
@@ -1813,32 +1825,43 @@ async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
       headers: { Accept: "application/json" }
     });
     if (data?.success && data?.data?.token && data?.data?.stream_url) {
+      const streamUrl = String(data.data.stream_url);
+      // refuse youtube/rutube embeds — our decrypt pipeline can't play them
+      if (/youtu\.be|youtube\.com|rutube\.ru/i.test(streamUrl)) {
+        throw new Error("رابط خارجي (youtube/rutube) غير مدعوم في المشغل");
+      }
       return {
         videoId: String(data.data.video_id || numericId),
         numericId,
         token: data.data.token,
-        streamUrl: data.data.stream_url,
+        streamUrl,
         mode: "stream-weave"
       };
     }
     throw new Error("stream-weave response ناقص");
   };
 
-  // Prefer platform hints but ALWAYS fall back to the other
+  // Official 2026 path first: /video/stream/{id}/playlist.m3u8
+  // Then stream-weave (2027). Skip pure rutube-only if both fail.
   const order = [];
-  if (hasSw && !hasCdn) order.push("sw", "cdn");
-  else if (hasCdn && !hasSw) order.push("cdn", "sw");
-  else if (hasCdn && hasSw) order.push("cdn", "sw"); // 2026 often cdn
-  else order.push("sw", "cdn"); // unknown → try weave first (2027), then cdn
+  if (hasCdn || !hasSw) order.push("cdn", "sw");
+  else if (hasSw && !hasCdn) order.push("sw", "cdn");
+  else order.push("cdn", "sw");
 
   for (const step of order) {
     try {
       if (step === "sw") return await tryStreamWeave();
-      return await resolveCdnPlayback(numericId, studentBearer, studentCode);
+      return await resolveCdnPlayback(numericId, tok, studentCode);
     } catch (e) {
       errors.push(step + ": " + e.message);
       console.warn("[play]", step, "failed:", e.message);
     }
+  }
+
+  if (hasRutube) {
+    throw new Error(
+      "الفيديو على منصة rutube/youtube — مش مدعوم في مشغل فك التشفير | " + errors.join(" · ")
+    );
   }
 
   throw new Error(
