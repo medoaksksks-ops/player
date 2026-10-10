@@ -870,6 +870,32 @@ app.post("/api/auth/login", rateLimit({ max: 8, windowMs: 60_000, scope: "studen
     if (!student || student.active === false) {
       return jsonError(res, 401, "كود غير صحيح أو موقوف");
     }
+
+    // Activate subscription on FIRST login only
+    if (!student.activatedAt) {
+      const duration =
+        Number(student.durationMs) > 0
+          ? Number(student.durationMs)
+          : resolveDurationMs({
+              type: student.type,
+              days: student.days
+            });
+      if (!duration || duration <= 0) {
+        return jsonError(res, 400, "مدة الاشتراك غير محددة لهذا الكود");
+      }
+      const activatedAt = now();
+      const expiresAt = activatedAt + duration;
+      await fbPatch(`students/${code}`, {
+        activatedAt,
+        expiresAt,
+        durationMs: duration
+      });
+      student.activatedAt = activatedAt;
+      student.expiresAt = expiresAt;
+      student.durationMs = duration;
+      console.log("[auth] activated code", code, "until", new Date(expiresAt).toISOString());
+    }
+
     if (student.expiresAt && now() > student.expiresAt) {
       return jsonError(res, 403, "انتهت صلاحية الاشتراك");
     }
@@ -1467,11 +1493,15 @@ app.get("/api/admin/students", requireAdmin("students_view"), async (_req, res) 
       name: s.name,
       section: s.section || null,
       type: s.type || null,
-      expiresAt: s.expiresAt,
+      days: s.days || null,
+      durationMs: s.durationMs || null,
+      activatedAt: s.activatedAt || null,
+      expiresAt: s.expiresAt || null,
       maxDevices: s.maxDevices || 1,
       devices: Object.keys(s.devices || {}).length,
       active: s.active !== false,
-      createdAt: s.createdAt || null
+      createdAt: s.createdAt || null,
+      status: !s.activatedAt ? "لم يبدأ" : (s.expiresAt && Date.now() > s.expiresAt ? "منتهي" : "نشط")
     }));
     list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     res.json({ success: true, data: list });
@@ -1537,12 +1567,14 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
       section: section || null,
       type: req.body?.days != null ? "custom" : type,
       days: req.body?.days != null ? Number(req.body.days) : null,
+      durationMs: duration, // starts on first student login
       maxDevices,
       devices: {},
       bannedDevices: {},
       active: true,
       createdAt: now(),
-      expiresAt: now() + duration,
+      activatedAt: null, // set on first login
+      expiresAt: null,   // set on first login = activatedAt + durationMs
       createdBy: req.admin.username
     };
     await fbSet(`students/${code}`, record);
@@ -1567,17 +1599,36 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
     if (req.body.active != null) patch.active = Boolean(req.body.active);
     if (req.body.type && (CONFIG.CODE_TYPES[req.body.type] || (runtime.packages || []).some((p) => p.id === req.body.type))) {
       patch.type = req.body.type;
+      const dur = resolveDurationMs({ type: req.body.type });
+      patch.durationMs = dur;
       if (req.body.renew) {
-        patch.expiresAt = now() + resolveDurationMs({ type: req.body.type });
+        // restart from now
+        patch.activatedAt = now();
+        patch.expiresAt = now() + dur;
+      } else if (req.body.resetTimer) {
+        // wait for next student login
+        patch.activatedAt = null;
+        patch.expiresAt = null;
       }
     }
-    // custom days renew
+    // custom days
     if (req.body.days != null && Number(req.body.days) > 0) {
       patch.type = "custom";
       patch.days = Number(req.body.days);
-      if (req.body.renew !== false) {
-        patch.expiresAt = now() + resolveDurationMs({ days: req.body.days });
+      const dur = resolveDurationMs({ days: req.body.days });
+      patch.durationMs = dur;
+      if (req.body.renew) {
+        patch.activatedAt = now();
+        patch.expiresAt = now() + dur;
+      } else if (req.body.resetTimer || req.body.renew === false) {
+        patch.activatedAt = null;
+        patch.expiresAt = null;
       }
+    }
+    // explicit reset: timer starts again on next login
+    if (req.body.resetTimer === true) {
+      patch.activatedAt = null;
+      patch.expiresAt = null;
     }
     if (req.body.extendMs) {
       const base = Math.max(s.expiresAt || now(), now());
