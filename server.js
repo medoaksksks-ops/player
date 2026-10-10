@@ -1421,14 +1421,30 @@ async function detectPlatforms(videoId, studentBearer) {
 }
 
 /**
- * Known CDN content hashes captured from live playlists (video_id → hash).
- * When OTP/API is unavailable this still allows playback while signed URLs are valid.
+ * CDN content hashes (video_id → hash). Loaded from data/cdn_hashes.json + defaults.
+ * Each video still gets its own stream session via POST /api/play/:videoId — same as 2027.
  */
+const CDN_HASH_FILE = path.join(DATA_DIR, "cdn_hashes.json");
 const CDN_HASH_BY_VIDEO = {
   "12141": "eb543cf78f92ae5b059d72035722464c"
 };
+try {
+  if (fs.existsSync(CDN_HASH_FILE)) {
+    const extra = JSON.parse(fs.readFileSync(CDN_HASH_FILE, "utf8"));
+    if (extra && typeof extra === "object") Object.assign(CDN_HASH_BY_VIDEO, extra);
+  }
+} catch {}
 
-/** Optional: absolute path to a captured quality playlist for offline/bootstrap */
+function saveCdnHashes() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CDN_HASH_FILE, JSON.stringify(CDN_HASH_BY_VIDEO, null, 2));
+  } catch (e) {
+    console.warn("[cdn] save hashes:", e.message);
+  }
+}
+
+/** Optional: captured quality playlist path per video_id (bootstrap while CDN signatures valid) */
 const CDN_PLAYLIST_BOOTSTRAP = {
   "12141": path.join(__dirname, "video_sample", "playlist.m3u8")
 };
@@ -1444,138 +1460,203 @@ async function resolveCdnPlayback(videoId, studentBearer, studentCode) {
   const vid = String(videoId);
   const enc = encodeURIComponent(vid);
   const errors = [];
-  const tok = studentBearer || (await getCoursatkToken());
+  const tok = studentBearer || getCoursatkTokenSync() || (await getCoursatkToken());
 
-  const tryExtract = (d) => {
-    if (!d || typeof d !== "object") return null;
-    const hash =
-      d.content_hash ||
-      d.contentHash ||
-      d.hash ||
-      d.video_hash ||
-      d.file_hash ||
-      d.cdn_hash ||
-      d.uuid ||
-      d.cdn_id ||
-      null;
-    const streamUrl =
-      d.stream_url ||
-      d.playlist_url ||
-      d.playlist ||
-      d.hls_url ||
-      d.manifest_url ||
-      d.manifest ||
-      d.url ||
-      d.master_url ||
-      (d.qualities && (d.qualities["480"] || d.qualities.auto || d.qualities["720"])) ||
-      null;
-    if (streamUrl) {
-      const h = hash || null;
-      return {
-        // DecryptionUtils expects the content id used by the player — prefer hash
-        videoId: String(h || d.id || d.video_id || vid),
-        numericId: vid,
-        token: d.token || d.playback_token || tok,
-        streamUrl: String(streamUrl),
-        mode: "cdn",
-        contentHash: h,
-        keyUrl: h ? `${CONFIG.COURSATK_API}/user/auth/${h}` : null
-      };
+  function deepFindHash(obj, depth = 0) {
+    if (!obj || depth > 6) return null;
+    if (typeof obj === "string") {
+      const s = obj.trim();
+      // 32 hex content hash
+      if (/^[a-f0-9]{32}$/i.test(s)) return s.toLowerCase();
+      // embedded in URL
+      const m = s.match(/\/(?:videos|video|cdn)\/([a-f0-9]{32})\b/i);
+      if (m) return m[1].toLowerCase();
+      return null;
     }
-    if (hash) {
-      const candidates = [
-        `https://z1.c-cdn.online/2026/videos/${hash}/480/playlist.m3u8`,
-        `https://z1.c-cdn.online/2026/videos/${hash}/playlist.m3u8`,
-        `https://z1.c-cdn.online/2026/videos/${hash}/master.m3u8`
+    if (Array.isArray(obj)) {
+      for (const x of obj) {
+        const h = deepFindHash(x, depth + 1);
+        if (h) return h;
+      }
+      return null;
+    }
+    if (typeof obj === "object") {
+      const preferKeys = [
+        "content_hash", "contentHash", "hash", "video_hash", "file_hash",
+        "cdn_hash", "uuid", "cdn_id", "media_hash", "fileHash"
       ];
-      return {
-        videoId: String(hash),
-        numericId: vid,
-        token: tok,
-        streamUrl: candidates[0],
-        mode: "cdn",
-        contentHash: hash,
-        keyUrl: `${CONFIG.COURSATK_API}/user/auth/${hash}`,
-        playlistCandidates: candidates
-      };
-    }
-    return null;
-  };
-
-  // 0) OTP (frontend defines this; backend may start serving it)
-  try {
-    const data = await upstreamJsonWithToken(`/video/${enc}/otp`, tok);
-    const hit = tryExtract(data?.data || data);
-    if (hit) return hit;
-    errors.push("otp: no extract");
-  } catch (e) {
-    errors.push("otp: " + e.message);
-  }
-
-  // 1) GET /video/{id}
-  try {
-    const data = await upstreamJsonWithToken(`/video/${enc}`, tok);
-    const hit = tryExtract(data?.data || data);
-    if (hit) return hit;
-    errors.push("GET /video: no hash/playlist");
-  } catch (e) {
-    errors.push("GET /video: " + e.message);
-  }
-
-  // 2) platforms
-  try {
-    const data = await upstreamJsonWithToken(`/video/${enc}/platforms`, tok);
-    const plats = data?.data?.platforms || [];
-    for (const p of plats) {
-      const hit = tryExtract(p);
-      if (hit) return hit;
-      if (p.url) {
-        return {
-          videoId: vid,
-          numericId: vid,
-          token: tok,
-          streamUrl: p.url,
-          mode: "cdn",
-          contentHash: null,
-          keyUrl: null
-        };
+      for (const k of preferKeys) {
+        if (obj[k] != null) {
+          const h = deepFindHash(obj[k], depth + 1);
+          if (h) return h;
+        }
+      }
+      for (const v of Object.values(obj)) {
+        const h = deepFindHash(v, depth + 1);
+        if (h) return h;
       }
     }
-    errors.push("platforms: url null");
-  } catch (e) {
-    errors.push("platforms: " + e.message);
+    return null;
   }
 
-  // 3) play variants
-  for (const pathApi of [
-    `/video/${enc}/cdn/play`,
-    `/video/${enc}/play`,
-    `/user/videos/${enc}/play`,
-    `/user/video/${enc}/play`,
-    `/user/videos/${enc}/playlist`,
-    `/user/videos/${enc}/manifest`
-  ]) {
+  function deepFindUrl(obj, depth = 0) {
+    if (!obj || depth > 6) return null;
+    if (typeof obj === "string") {
+      const s = obj.trim();
+      if (/^https?:\/\/.+\.m3u8(\?|$)/i.test(s)) return s;
+      if (/^https?:\/\/.*(c-cdn|stream-weave|rtbcdn)/i.test(s) && /\.m3u8/i.test(s)) return s;
+      return null;
+    }
+    if (Array.isArray(obj)) {
+      for (const x of obj) {
+        const u = deepFindUrl(x, depth + 1);
+        if (u) return u;
+      }
+      return null;
+    }
+    if (typeof obj === "object") {
+      const keys = [
+        "stream_url", "playlist_url", "playlist", "hls_url", "manifest_url",
+        "manifest", "url", "master_url", "src", "source"
+      ];
+      for (const k of keys) {
+        if (obj[k]) {
+          const u = deepFindUrl(obj[k], depth + 1);
+          if (u) return u;
+        }
+      }
+      if (obj.qualities && typeof obj.qualities === "object") {
+        for (const q of ["480", "720", "360", "1080", "auto"]) {
+          if (obj.qualities[q]) {
+            const u = deepFindUrl(obj.qualities[q], depth + 1);
+            if (u) return u;
+          }
+        }
+      }
+      for (const v of Object.values(obj)) {
+        const u = deepFindUrl(v, depth + 1);
+        if (u) return u;
+      }
+    }
+    return null;
+  }
+
+  function pack(hash, streamUrl, extra = {}) {
+    const h = hash ? String(hash).toLowerCase() : null;
+    const candidates = h
+      ? [
+          streamUrl,
+          `https://z1.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
+          `https://z2.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
+          `https://z3.c-cdn.online/2026/videos/${h}/480/playlist.m3u8`,
+          `https://z1.c-cdn.online/2026/videos/${h}/playlist.m3u8`,
+          `https://z1.c-cdn.online/2026/videos/${h}/master.m3u8`,
+          `https://c-cdn.online/2026/videos/${h}/480/playlist.m3u8`
+        ].filter(Boolean)
+      : [streamUrl].filter(Boolean);
+    return {
+      videoId: String(h || vid),
+      numericId: vid,
+      token: extra.token || tok,
+      streamUrl: candidates[0],
+      mode: "cdn",
+      contentHash: h,
+      keyUrl: h ? `${CONFIG.COURSATK_API}/user/auth/${h}` : null,
+      playlistCandidates: [...new Set(candidates)]
+    };
+  }
+
+  async function tryPlaylistReachable(url) {
     try {
-      const data = await upstreamJsonWithToken(pathApi, tok, {
-        method: /\/play$/.test(pathApi) ? "POST" : "GET",
-        headers: { Accept: "application/json" }
+      const r = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${tok}`,
+          Accept: "*/*",
+          Origin: CONFIG.STREAM_ORIGIN,
+          Referer: CONFIG.STREAM_REFERER,
+          "User-Agent": CONFIG.STREAM_UA
+        },
+        cache: "no-store"
       });
-      const hit = tryExtract(data?.data || data);
-      if (hit) return hit;
-      errors.push(pathApi + ": no extract");
-    } catch (e) {
-      errors.push(pathApi + ": " + e.message);
+      if (!r.ok) return false;
+      const t = await r.text();
+      return t.includes("#EXTM3U");
+    } catch {
+      return false;
     }
   }
 
-  // 4) Known hash map + captured playlist bootstrap (works while CDN signatures valid)
+  async function finalize(hit) {
+    if (!hit) return null;
+    const list = hit.playlistCandidates || [hit.streamUrl];
+    for (const u of list) {
+      if (!u) continue;
+      if (await tryPlaylistReachable(u)) {
+        hit.streamUrl = u;
+        return hit;
+      }
+    }
+    // keep first candidate even if not reachable now (signed URLs may need key path later)
+    return hit;
+  }
+
+  const apiTries = [
+    { path: `/video/${enc}/otp`, method: "GET" },
+    { path: `/video/${enc}`, method: "GET" },
+    { path: `/video/${enc}/platforms`, method: "GET" },
+    { path: `/video/${enc}/cdn/play`, method: "POST" },
+    { path: `/video/${enc}/play`, method: "POST" },
+    { path: `/user/videos/${enc}`, method: "GET" },
+    { path: `/user/videos/${enc}/play`, method: "POST" },
+    { path: `/user/video/${enc}`, method: "GET" },
+    { path: `/user/videos/${enc}/playlist`, method: "GET" },
+    { path: `/user/videos/${enc}/manifest`, method: "GET" }
+  ];
+
+  for (const t of apiTries) {
+    try {
+      const data = await upstreamJsonWithToken(t.path, tok, {
+        method: t.method,
+        headers: { Accept: "application/json" }
+      });
+      const root = data?.data || data;
+      const hash = deepFindHash(root);
+      const streamUrl = deepFindUrl(root);
+      if (streamUrl || hash) {
+        const hit = await finalize(pack(hash, streamUrl, { token: root?.token || tok }));
+        if (hit) {
+          if (hash) {
+            CDN_HASH_BY_VIDEO[vid] = hash;
+            try { saveCdnHashes(); } catch {}
+          }
+          console.log("[cdn] resolved via", t.path, "hash=", hit.contentHash, "url=", hit.streamUrl?.slice(0, 80));
+          return hit;
+        }
+      }
+      // platforms array special
+      const plats = root?.platforms || [];
+      for (const p of plats) {
+        const h = deepFindHash(p);
+        const u = deepFindUrl(p) || p.url || null;
+        if (h || u) {
+          const hit = await finalize(pack(h, u));
+          if (hit) return hit;
+        }
+      }
+      errors.push(t.path + ": no hash/url");
+    } catch (e) {
+      errors.push(t.path + ": " + e.message);
+    }
+  }
+
+  // Known hash map
   const knownHash = CDN_HASH_BY_VIDEO[vid];
   if (knownHash) {
     const boot = CDN_PLAYLIST_BOOTSTRAP[vid];
     if (boot && fs.existsSync(boot)) {
-      // Serve via local file URL handled by our own stream bootstrap route
       return {
-        videoId: knownHash, // key unwrap id = content hash
+        videoId: knownHash,
         numericId: vid,
         token: tok,
         streamUrl: `file://${boot}`,
@@ -1585,33 +1666,23 @@ async function resolveCdnPlayback(videoId, studentBearer, studentCode) {
         localPlaylist: boot
       };
     }
-    return {
-      videoId: knownHash,
-      numericId: vid,
-      token: tok,
-      streamUrl: `https://z1.c-cdn.online/2026/videos/${knownHash}/480/playlist.m3u8`,
-      mode: "cdn",
-      contentHash: knownHash,
-      keyUrl: `${CONFIG.COURSATK_API}/user/auth/${knownHash}`
-    };
+    const hit = await finalize(pack(knownHash, null));
+    if (hit) return hit;
   }
 
-  throw new Error("CDN resolve failed for " + videoId + " | " + errors.join(" · "));
+  // Last resort: try stream-weave style id as hash if video details returned numeric only
+  throw new Error("CDN resolve failed for " + videoId + " | " + errors.slice(0, 8).join(" · "));
 }
 
-/**
- * Try multiple upstream playback strategies and return normalized:
- * { videoId, token, streamUrl, mode, ... }
- */
 async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
-  const vid = encodeURIComponent(videoId);
+  const numericId = String(videoId);
+  const vid = encodeURIComponent(numericId);
   const errors = [];
-  const platforms = await detectPlatforms(videoId, studentBearer);
-  console.log("[play] platforms for", videoId, platforms);
+  const platforms = await detectPlatforms(numericId, studentBearer);
+  console.log("[play] platforms for", numericId, platforms);
 
-  // Prefer explicit platform order
-  const preferCdn = platforms.includes("cdn") && !platforms.includes("stream-weave");
-  const preferSw = platforms.includes("stream-weave");
+  const hasCdn = platforms.includes("cdn");
+  const hasSw = platforms.includes("stream-weave") || platforms.includes("stream_weave") || platforms.includes("streamweave");
 
   const tryStreamWeave = async () => {
     const data = await upstreamJson(`/video/${vid}/stream-weave/play`, {
@@ -1620,7 +1691,8 @@ async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
     });
     if (data?.success && data?.data?.token && data?.data?.stream_url) {
       return {
-        videoId: String(data.data.video_id || videoId),
+        videoId: String(data.data.video_id || numericId),
+        numericId,
         token: data.data.token,
         streamUrl: data.data.stream_url,
         mode: "stream-weave"
@@ -1629,65 +1701,68 @@ async function resolveUpstreamPlayback(videoId, studentBearer, studentCode) {
     throw new Error("stream-weave response ناقص");
   };
 
-  if (preferSw || (!preferCdn && platforms.length === 0)) {
-    try {
-      return await tryStreamWeave();
-    } catch (e) {
-      errors.push("stream-weave: " + e.message);
-    }
-  }
+  // Prefer platform hints but ALWAYS fall back to the other
+  const order = [];
+  if (hasSw && !hasCdn) order.push("sw", "cdn");
+  else if (hasCdn && !hasSw) order.push("cdn", "sw");
+  else if (hasCdn && hasSw) order.push("cdn", "sw"); // 2026 often cdn
+  else order.push("sw", "cdn"); // unknown → try weave first (2027), then cdn
 
-  if (preferCdn || platforms.includes("cdn") || platforms.length === 0) {
+  for (const step of order) {
     try {
-      return await resolveCdnPlayback(videoId, studentBearer, studentCode);
+      if (step === "sw") return await tryStreamWeave();
+      return await resolveCdnPlayback(numericId, studentBearer, studentCode);
     } catch (e) {
-      errors.push("cdn: " + e.message);
-    }
-  }
-
-  // Last resort: stream-weave if not tried
-  if (!preferSw) {
-    try {
-      return await tryStreamWeave();
-    } catch (e) {
-      errors.push("stream-weave: " + e.message);
+      errors.push(step + ": " + e.message);
+      console.warn("[play]", step, "failed:", e.message);
     }
   }
 
   throw new Error(
-    "فشل كل طرق التشغيل للفيديو " + videoId + " | " + errors.join(" · ")
+    "فشل كل طرق التشغيل للفيديو " + numericId + " | " + errors.join(" · ")
   );
 }
 
+/**
+ * POST /api/play/:videoId
+ * Same for every video (2026 CDN or 2027 stream-weave):
+ *   → resolve upstream playlist
+ *   → create stream session
+ *   → return { session, video_id, mode, manifest_url }
+ */
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    // For CDN (2026) we need the student JWT (user/auth key + signed segments)
-    // Prefer upstream admin token for stream-weave, student token for CDN detection
+    const numericId = String(req.params.videoId);
     const studentBearer = getCoursatkTokenSync() || null;
     const studentCode = req.session?.code || req.student?.code || "";
-    // Also try with a stored upstream token; CDN key endpoint needs a valid user JWT —
-    // when the site COURSATK_TOKEN is a student-capable token it works; otherwise admin token.
+
     const playback = await resolveUpstreamPlayback(
-      req.params.videoId,
+      numericId,
       studentBearer,
       studentCode
     );
+
     const id = crypto.randomUUID();
     const hosts = new Set([
       "z1.c-cdn.online",
+      "z2.c-cdn.online",
+      "z3.c-cdn.online",
       "c-cdn.online",
       "api.coursatk.online",
-      "api.stream-weave.com"
+      "api.stream-weave.com",
+      "stream-weave.com"
     ]);
-    try { hosts.add(new URL(playback.streamUrl).hostname); } catch {}
+    if (playback.streamUrl && !String(playback.streamUrl).startsWith("file:")) {
+      try { hosts.add(new URL(playback.streamUrl).hostname); } catch {}
+    }
 
     streamSessions.set(id, {
       id,
-      videoId: playback.videoId,
-      numericId: playback.numericId || req.params.videoId,
+      videoId: playback.videoId, // may be content-hash for CDN key unwrap
+      numericId: playback.numericId || numericId,
       token: playback.token,
       streamUrl: playback.streamUrl,
-      mode: playback.mode, // stream-weave | cdn
+      mode: playback.mode,
       contentHash: playback.contentHash || null,
       keyUrl: playback.keyUrl || null,
       localPlaylist: playback.localPlaylist || null,
@@ -1700,16 +1775,17 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     });
 
     console.log(
-      `[play] video=${playback.videoId} mode=${playback.mode}` +
+      `[play] numeric=${numericId} mode=${playback.mode}` +
         (playback.contentHash ? ` hash=${playback.contentHash}` : "") +
         ` session=${id}`
     );
 
+    // Same response shape for all years / platforms
     res.json({
       success: true,
       data: {
         session: id,
-        video_id: playback.videoId,
+        video_id: numericId,
         mode: playback.mode,
         manifest_url: `/api/stream/manifest/${id}`
       }
@@ -1750,9 +1826,32 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
         ? `https://z1.c-cdn.online/2026/videos/${session.contentHash}/480/playlist.m3u8`
         : "https://z1.c-cdn.online/";
     } else {
-      const master = await streamFetch(session, session.streamUrl, {}, req.headers);
-      if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
-      masterText = await master.text();
+      const tryUrls = [session.streamUrl, ...(session.playlistCandidates || [])].filter(Boolean);
+      const seen = new Set();
+      let lastErr = null;
+      for (const u of tryUrls) {
+        if (seen.has(u)) continue;
+        seen.add(u);
+        try {
+          const master = await streamFetch(session, u, {}, req.headers);
+          if (!master.ok) {
+            lastErr = new Error(`Stream master HTTP ${master.status} @ ${u}`);
+            continue;
+          }
+          const txt = await master.text();
+          if (!txt.includes("#EXTM3U")) {
+            lastErr = new Error("not m3u8 @ " + u);
+            continue;
+          }
+          masterText = txt;
+          baseUrl = u;
+          session.streamUrl = u;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (!masterText) throw lastErr || new Error("تعذر جلب playlist");
     }
 
     const lines = masterText.split(/\r?\n/);
@@ -1805,15 +1904,45 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
       if (ivHex) currentIv = parseIvHex(ivHex);
       if (uri && !keyFetched) {
-        const keyUrl = new URL(uri, baseUrl).href;
+        let keyUrl;
+        // CDN 2026: KEY often points at /api/v1/user/auth/{hash} (coursatk API)
+        if (/user\/auth\//i.test(uri) || /\/auth\/[a-f0-9]{32}/i.test(uri)) {
+          if (/^https?:\/\//i.test(uri)) keyUrl = uri;
+          else {
+            const pathPart = uri.startsWith("/") ? uri.replace(/^\/api\/v1/, "") : "/" + uri;
+            keyUrl = CONFIG.COURSATK_API.replace(/\/api\/v1$/, "") + (pathPart.startsWith("/api/") ? pathPart : `/api/v1${pathPart.startsWith("/") ? pathPart : "/" + pathPart}`);
+            // normalize: COURSATK_API already includes /api/v1
+            if (uri.includes("user/auth/")) {
+              const hash = (uri.match(/user\/auth\/([a-f0-9]{32})/i) || session.contentHash && [0, session.contentHash] || [])[1];
+              if (hash) keyUrl = `${CONFIG.COURSATK_API}/user/auth/${hash}`;
+            }
+          }
+        } else {
+          keyUrl = new URL(uri, baseUrl).href;
+        }
+        // Prefer session.keyUrl when set (CDN)
+        if (session.keyUrl && session.contentHash) {
+          keyUrl = session.keyUrl;
+        }
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
-        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
+        // ensure api.coursatk.online allowed
+        try { session.allowedHosts.add("api.coursatk.online"); } catch {}
+
+        let keyRes = await streamFetch(session, keyUrl, {
+          Authorization: `Bearer ${session.token || getCoursatkTokenSync()}`
+        }, clientHeaders);
+        if (!keyRes.ok && session.keyUrl && keyUrl !== session.keyUrl) {
+          keyRes = await streamFetch(session, session.keyUrl, {
+            Authorization: `Bearer ${session.token || getCoursatkTokenSync()}`
+          }, clientHeaders);
+        }
+        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status} @ ${keyUrl}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        const unwrapId = session.contentHash || session.videoId;
+        session.plainKey = await unwrapKey(wrapped, unwrapId);
         session.defaultIv = currentIv;
         keyFetched = true;
-        console.log(`[key] unwrapped for ${session.videoId}`);
+        console.log(`[key] unwrapped for ${unwrapId} (${wrapped.byteLength}b)`);
       }
       continue; // strip KEY — segments are plain
     }
@@ -1994,6 +2123,20 @@ app.get("/api/admin/me", requireAdmin(null), (req, res) => {
   });
 });
 
+// CDN hash map — register content hashes so POST /api/play/:id creates a session for 2026 videos
+app.get("/api/admin/cdn-hashes", requireAdmin("sections_manage"), (_req, res) => {
+  res.json({ success: true, data: CDN_HASH_BY_VIDEO });
+});
+
+app.post("/api/admin/cdn-hashes", requireAdmin("sections_manage"), (req, res) => {
+  const videoId = String(req.body?.videoId || req.body?.video_id || "").trim();
+  const hash = String(req.body?.hash || req.body?.content_hash || "").trim().toLowerCase();
+  if (!/^\d+$/.test(videoId)) return jsonError(res, 400, "videoId مطلوب");
+  if (!/^[a-f0-9]{32}$/.test(hash)) return jsonError(res, 400, "hash يجب أن يكون 32 hex");
+  CDN_HASH_BY_VIDEO[videoId] = hash;
+  saveCdnHashes();
+  res.json({ success: true, data: { videoId, hash } });
+});
 
 // ═══════════════════════════════════════════════════════════
 // ADMIN — App config (Coursatk token)
@@ -3100,7 +3243,12 @@ app.get("/api/admin/messages/:code", requireAdmin("students_view"), async (req, 
  */
 app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 120, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
   try {
-    const code = String(req.params.code).replace(/\D/g, "");
+    let code = String(req.params.code || "").trim();
+    if (code.startsWith("guest_")) {
+      code = code.replace(/[^a-zA-Z0-9_\-]/g, "");
+    } else {
+      code = code.replace(/\D/g, "");
+    }
     if (!code) return jsonError(res, 400, "كود غير صالح");
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     const id = makeMsgId();
