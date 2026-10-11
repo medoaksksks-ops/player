@@ -231,6 +231,7 @@ function loadRuntimeFile() {
     if (Array.isArray(raw.packages)) runtime.packages = raw.packages;
     if (Array.isArray(raw.agents)) runtime.agents = raw.agents;
     if (raw.storageBucket) runtime.storageBucket = String(raw.storageBucket);
+    if (raw.notify && typeof raw.notify === "object") runtime.notify = raw.notify;
     console.log("[API] runtime.json loaded");
   } catch (e) {
     console.warn("[API] runtime load:", e.message);
@@ -245,6 +246,7 @@ function saveRuntimeFile() {
     siteName: runtime.siteName,
     packages: runtime.packages,
     agents: runtime.agents,
+    notify: runtime.notify || null,
     updatedAt: Date.now()
   };
   fs.writeFileSync(RUNTIME_PATH, JSON.stringify(out, null, 2), "utf8");
@@ -752,6 +754,154 @@ function requireAdmin(permission) {
       return jsonError(res, 500, "خطأ في تحقق الأدمن");
     }
   };
+}
+
+// ═══════════════════════════════════════════════════════════
+// OWNER — سجل المبيعات + نسبة صاحب النظام + إشعارات تليجرام
+// صاحب النظام = الأكونتات في OWNER_USERNAMES (متغير بيئة بفواصل)،
+// ولو مش متحدد بيبقى الأدمن الأساسي (BOOTSTRAP_ADMIN). أي أدمن تاني = 403 "قيد التطوير".
+// ═══════════════════════════════════════════════════════════
+const OWNER_PCT = 30; // نسبة صاحب النظام الثابتة من سعر كل كود
+const OWNER_USERNAMES = (() => {
+  const l = String(process.env.OWNER_USERNAMES || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return l.length ? l : [CONFIG.BOOTSTRAP_ADMIN.username];
+})();
+const isOwnerName = (u) => OWNER_USERNAMES.includes(String(u || ""));
+function requireOwner(req, res, next) {
+  if (!isOwnerName(req.admin && req.admin.username)) return jsonError(res, 403, "قيد التطوير");
+  next();
+}
+const SALE_DEFAULT_PRICES = { month: 200, term: 500, year: 900 };
+const SALE_TYPE_LABEL = { trial: "تجربة", month: "شهر", term: "ترم", year: "سنة", custom: "مخصص" };
+function priceForType(type) {
+  const pkg = (runtime.packages || []).find((p) => p.id === type);
+  if (pkg && Number(pkg.price) > 0) return Number(pkg.price);
+  return SALE_DEFAULT_PRICES[type] || 0;
+}
+const saleMonthKey = (ms) => new Date(ms).toISOString().slice(0, 7);
+const cairoDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(ms);
+const fmtMoney = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
+
+async function recordSale(s) {
+  try {
+    if (!s || s.type === "trial") return; // كود التجربة مش بيتحسب
+    const ts = now();
+    const entry = {
+      code: String(s.code),
+      name: String(s.name || "").slice(0, 120),
+      type: String(s.type || "custom"),
+      price: priceForType(s.type),
+      kind: s.kind === "renew" ? "renew" : "new",
+      by: String(s.by || ""),
+      ts
+    };
+    await fbSet(`sales/${saleMonthKey(ts)}/${entry.kind}_${entry.code}_${ts}`, entry);
+    if (!isOwnerName(entry.by)) queueOwnerNotify(entry);
+  } catch (e) {
+    console.warn("[sales] record:", e.message);
+  }
+}
+
+// يقرا سجل المبيعات من تاريخ معيّن (من غير تكرار للأكواد الجديدة، ومن غير التجربة)
+async function readSales(fromTs) {
+  const DAYMS = 24 * 3600 * 1000;
+  const t = now();
+  const keys = new Set([saleMonthKey(t)]);
+  for (let x = fromTs; x <= t; x += 7 * DAYMS) keys.add(saleMonthKey(x));
+  const out = [];
+  const seenNew = new Set();
+  for (const k of keys) {
+    const b = (await fbGet(`sales/${k}`)) || {};
+    for (const [id, e] of Object.entries(b)) {
+      if (!e || e.type === "trial" || !(e.ts >= fromTs)) continue;
+      if (e.kind === "new") { if (seenNew.has(e.code)) continue; seenNew.add(e.code); }
+      out.push({ id, ...e });
+    }
+  }
+  out.sort((a, b) => b.ts - a.ts);
+  return out;
+}
+
+// مرة واحدة: يسجّل الأكواد الموجودة (آخر 70 يوم) في سجل المبيعات (من غير ما يكرر اللي اتسجل بالفعل)
+async function backfillSales() {
+  const meta = await fbGet("sales_meta");
+  if (meta && meta.backfilledAt) return;
+  const all = (await fbGet("students")) || {};
+  const since = now() - 70 * 24 * 3600 * 1000;
+  const have = new Set((await readSales(since)).filter((e) => e.kind === "new").map((e) => e.code));
+  const byMonth = {};
+  for (const [code, st] of Object.entries(all)) {
+    if (!st || !st.createdAt || st.createdAt < since || st.importedAt || st.type === "trial" || have.has(String(code))) continue;
+    const mk = saleMonthKey(st.createdAt);
+    (byMonth[mk] = byMonth[mk] || {})[`new_${code}_${st.createdAt}`] = {
+      code: String(code), name: String(st.name || "").slice(0, 120), type: String(st.type || "custom"),
+      price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: st.createdAt
+    };
+  }
+  for (const [mk, obj] of Object.entries(byMonth)) await fbPatch(`sales/${mk}`, obj);
+  await fbSet("sales_meta", { backfilledAt: now() });
+}
+
+function notifyCfg() {
+  const n = runtime.notify || {};
+  return {
+    token: String(n.tgToken || process.env.OWNER_TG_TOKEN || ""),
+    chat: String(n.tgChatId || process.env.OWNER_TG_CHAT || ""),
+    on: n.on !== false
+  };
+}
+async function sendOwnerTelegram(text) {
+  const c = notifyCfg();
+  if (!c.on || !c.token || !c.chat) return false;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${c.token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: c.chat, text })
+    });
+    const j = await r.json().catch(() => ({}));
+    return !!j.ok;
+  } catch {
+    return false;
+  }
+}
+
+let notifyBuf = [];
+let notifyTimer = null;
+function queueOwnerNotify(entry) {
+  notifyBuf.push(entry);
+  if (!notifyTimer) notifyTimer = setTimeout(flushOwnerNotify, 8000); // يجمّع الدفعات في رسالة واحدة
+}
+async function flushOwnerNotify() {
+  const list = notifyBuf;
+  notifyBuf = [];
+  notifyTimer = null;
+  if (!list.length) return;
+  const c = notifyCfg();
+  if (!c.on || !c.token || !c.chat) return;
+  const total = list.reduce((a, e) => a + (Number(e.price) || 0), 0);
+  const by = Array.from(new Set(list.map((e) => e.by).filter(Boolean))).join("، ") || "أدمن";
+  let lines;
+  if (list.length === 1) {
+    const e = list[0];
+    lines = [`• ${e.name || "—"} (${e.code})`, `• ${e.kind === "renew" ? "تجديد " : ""}${SALE_TYPE_LABEL[e.type] || e.type} — ${fmtMoney(e.price)} ج`];
+  } else {
+    const g = {};
+    list.forEach((e) => {
+      const k = (e.kind === "renew" ? "تجديد " : "") + (SALE_TYPE_LABEL[e.type] || e.type);
+      (g[k] = g[k] || { n: 0, v: 0 }).n++;
+      g[k].v += Number(e.price) || 0;
+    });
+    lines = Object.keys(g).map((k) => `• ${k} × ${g[k].n} = ${fmtMoney(g[k].v)} ج`);
+  }
+  let todayLine = "";
+  try {
+    const day = cairoDay(now());
+    const sum = (await readSales(now() - 3 * 24 * 3600 * 1000)).filter((e) => cairoDay(e.ts) === day).reduce((s, e) => s + (Number(e.price) || 0), 0);
+    todayLine = `\n📊 نصيبك النهاردة لحد دلوقتي: ${fmtMoney(sum * OWNER_PCT / 100)} ج (من ${fmtMoney(sum)} ج)`;
+  } catch {}
+  const head = list.length === 1 ? `🔔 ${list[0].kind === "renew" ? "تجديد" : "كود جديد"} من ${by}` : `🔔 ${list.length} عمليات جديدة من ${by}`;
+  await sendOwnerTelegram(`${head}\n${lines.join("\n")}\n💰 نصيبك (${OWNER_PCT}%): ${fmtMoney(total * OWNER_PCT / 100)} ج${todayLine}`);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1647,6 +1797,7 @@ app.post("/api/admin/login", rateLimit({ max: 20, windowMs: 60_000, scope: "admi
         expiresAt: sess.expiresAt,
         username,
         permissions: perms,
+        isOwner: isOwnerName(username),
         needsSetup: !getFirebaseUrl()
       }
     });
@@ -1667,9 +1818,43 @@ app.get("/api/admin/me", requireAdmin(null), (req, res) => {
     data: {
       username: req.admin.username,
       permissions: req.admin.permissions || {},
-      bootstrap: !!req.admin.bootstrap
+      bootstrap: !!req.admin.bootstrap,
+      isOwner: isOwnerName(req.admin.username)
     }
   });
+});
+
+// ── OWNER-only: الأرباح + إعدادات الإشعارات ──
+app.get("/api/admin/earnings", requireAdmin(null), requireOwner, async (req, res) => {
+  try {
+    await backfillSales().catch((e) => console.warn("[sales] backfill:", e.message));
+    const days = Math.min(120, Math.max(1, Number(req.query.days) || 62));
+    const t = now();
+    const out = await readSales(t - days * 24 * 3600 * 1000);
+    res.json({ success: true, data: { pct: OWNER_PCT, now: t, sales: out } });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+app.get("/api/admin/owner/notify", requireAdmin(null), requireOwner, (_req, res) => {
+  const c = notifyCfg();
+  res.json({ success: true, data: { on: c.on, chat: c.chat, tokenSet: !!c.token, tokenMasked: c.token ? c.token.slice(0, 6) + "…" + c.token.slice(-4) : "" } });
+});
+app.put("/api/admin/owner/notify", requireAdmin(null), requireOwner, (req, res) => {
+  const b = req.body || {};
+  const n = Object.assign({}, runtime.notify || {});
+  if (typeof b.token === "string" && b.token.trim()) n.tgToken = b.token.trim();
+  if (b.chat != null) n.tgChatId = String(b.chat).trim();
+  if (b.on != null) n.on = !!b.on;
+  runtime.notify = n;
+  saveRuntimeFile();
+  res.json({ success: true, message: "تم الحفظ" });
+});
+app.post("/api/admin/owner/notify/test", requireAdmin(null), requireOwner, async (_req, res) => {
+  const ok = await sendOwnerTelegram("✅ اختبار — إشعارات أرباح الأكواد شغالة");
+  if (!ok) return res.status(502).json({ success: false, message: "فشل الإرسال — راجع التوكن والـ Chat ID (وابعت للبوت /start الأول)" });
+  res.json({ success: true, message: "اتبعتت على تليجرام ✓" });
 });
 
 
@@ -1920,6 +2105,7 @@ app.post("/api/admin/students", requireAdmin("students_create"), async (req, res
       createdBy: req.admin.username
     };
     await fbSet(`students/${code}`, record);
+    recordSale({ code, name, type: record.type, by: req.admin.username, kind: "new" });
     res.json({ success: true, data: { code, ...record } });
   } catch (e) {
     jsonError(res, 500, e.message);
@@ -1981,6 +2167,9 @@ app.patch("/api/admin/students/:code", requireAdmin("students_edit"), async (req
       patch.expiresAt = base + Number(req.body.extendDays) * 24 * 3600 * 1000;
     }
     await fbPatch(`students/${code}`, patch);
+    if (req.body.renew === true && patch.type) {
+      recordSale({ code, name: s.name, type: patch.type, by: req.admin.username, kind: "renew" });
+    }
 
     // force logout all sessions for this code
     if (req.body.forceLogout) {
