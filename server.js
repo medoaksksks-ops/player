@@ -321,9 +321,12 @@ const YEAR_2026_SUBJECTS = {
 
 function resolveYearId(raw) {
   if (raw == null || raw === "") return CONFIG.DEFAULT_YEAR_ID;
-  const n = Number(raw);
+  // أرقام عربية (٢٠٢٦) → إنجليزي
+  const s = String(raw).trim().replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d));
+  const n = Number(s);
   if (n === 3 || n === 4 || n === 5) return n;
-  const s = String(raw).trim();
+  if (n === 26 || n === 2026) return 3; // 26 → yearId 3 (2026)
+  if (n === 27 || n === 2027) return 4; // 27 → yearId 4 (2027)
   if (s.includes("2026")) return 3;
   if (s.includes("2027")) return 4;
   return CONFIG.DEFAULT_YEAR_ID;
@@ -2759,7 +2762,11 @@ app.get("/api/admin/messages/:code", requireAdmin("students_view"), async (req, 
  */
 app.post("/api/admin/messages/:code", requireAdmin("students_view"), rateLimit({ max: 120, windowMs: 60_000, scope: "msg-admin" }), async (req, res) => {
   try {
-    const code = String(req.params.code).replace(/\D/g, "");
+    // طالب: كود رقمي — زائر: guest_xxx (لازم نحافظ عليه، متتشالش منه الحروف)
+    const rawCode = String(req.params.code || "");
+    const code = rawCode.startsWith("guest_")
+      ? guestThreadKey(rawCode.slice(6))
+      : rawCode.replace(/\D/g, "");
     if (!code) return jsonError(res, 400, "كود غير صالح");
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     const id = makeMsgId();
