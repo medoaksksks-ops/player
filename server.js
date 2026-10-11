@@ -781,26 +781,6 @@ async function unwrapKey(wrappedBuf, videoId) {
   return aes;
 }
 
-/** CDN كورساتك (2026): salt(16)+iv(12)+cipher → PBKDF2 → AES-GCM → hex key */
-const CDN_KEY_PASSWORD = "pQDKIpCkQxsulP";
-async function unwrapCdnKey(wrappedBuf) {
-  const buf = Buffer.isBuffer(wrappedBuf) ? wrappedBuf : Buffer.from(wrappedBuf);
-  if (buf.length === 16) return buf;
-  if (buf.length < 60) throw new Error("CDN key blob قصير");
-  const salt = buf.subarray(0, 16);
-  const iv = buf.subarray(16, 28);
-  const data = buf.subarray(28);
-  const derived = crypto.pbkdf2Sync(CDN_KEY_PASSWORD, salt, 100, 32, "sha256");
-  const tag = data.subarray(data.length - 16);
-  const ciphertext = data.subarray(0, data.length - 16);
-  const decipher = crypto.createDecipheriv("aes-256-gcm", derived, iv);
-  decipher.setAuthTag(tag);
-  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  const hexKey = plain.toString("utf8").trim().slice(0, 32);
-  if (!/^[0-9a-fA-F]{32}$/.test(hexKey)) throw new Error("CDN key format غير متوقع");
-  return Buffer.from(hexKey, "hex");
-}
-
 function decryptSegment(encrypted, key, iv) {
   const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
@@ -1277,126 +1257,34 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    const videoId = String(req.params.videoId);
-    const upstreamTok = await getCoursatkToken();
-    if (!upstreamTok) return jsonError(res, 503, "توكن كورساتك غير مضبوط");
-
-    // prefer: query ?platform=cdn|weave  أو body.platform  أو من yearId الطالب
-    const prefer =
-      String(req.query.platform || req.body?.platform || "").toLowerCase() ||
-      (Number(req.student?.yearId) === 3 || Number(req.query.year) === 3 || Number(req.query.year) === 2026
-        ? "cdn"
-        : "");
-
-    let mode = null; // "cdn" | "weave"
-    let streamUrl = null;
-    let sessionToken = null;
-    let resolvedVideoId = videoId;
-    const errors = [];
-
-    async function tryCdn() {
-      const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
-      const probe = await fetch(masterUrl, {
-        headers: {
-          Authorization: `Bearer ${upstreamTok}`,
-          Accept: "*/*",
-          Origin: CONFIG.STREAM_ORIGIN,
-          Referer: CONFIG.STREAM_REFERER,
-          "User-Agent": CONFIG.STREAM_UA
-        },
-        cache: "no-store"
-      });
-      if (!probe.ok) {
-        const t = await probe.text().catch(() => "");
-        throw new Error(`CDN ${probe.status}: ${t.slice(0, 100)}`);
-      }
-      const masterText = await probe.text();
-      if (!masterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
-      mode = "cdn";
-      streamUrl = masterUrl;
-      sessionToken = upstreamTok;
+    const data = await upstreamJson(
+      `/video/${encodeURIComponent(req.params.videoId)}/stream-weave/play`,
+      { method: "POST", headers: { Accept: "application/json" } }
+    );
+    if (!data?.success || !data?.data?.token || !data?.data?.stream_url || !data?.data?.video_id) {
+      throw new Error("Playback response ناقص");
     }
-
-    async function tryWeave() {
-      const data = await upstreamJson(
-        `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
-        { method: "POST", headers: { Accept: "application/json" } }
-      );
-      if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
-        throw new Error("Weave response ناقص");
-      }
-      mode = "weave";
-      sessionToken = data.data.token;
-      streamUrl = data.data.stream_url;
-      resolvedVideoId = String(data.data.video_id || videoId);
-    }
-
-    // 2026 / cdn أولاً — من غير ما نجرب Weave
-    if (prefer === "cdn" || prefer === "" || prefer === "auto") {
-      // default: CDN الأول (2026)، ولو فشل → Weave (2027)
-      try {
-        await tryCdn();
-      } catch (e) {
-        errors.push(e.message);
-        console.log("[play] CDN skip:", e.message);
-      }
-      if (!mode) {
-        try {
-          await tryWeave();
-        } catch (e) {
-          errors.push(e.message);
-          console.log("[play] Weave skip:", e.message);
-        }
-      }
-    } else if (prefer === "weave") {
-      try {
-        await tryWeave();
-      } catch (e) {
-        errors.push(e.message);
-      }
-      if (!mode) {
-        try {
-          await tryCdn();
-        } catch (e) {
-          errors.push(e.message);
-        }
-      }
-    }
-
-    if (!mode || !streamUrl || !sessionToken) {
-      throw new Error(errors.join(" | ") || "مفيش منصة تشغيل متاحة للفيديو");
-    }
-
     const id = crypto.randomUUID();
-    const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
-    try {
-      allowedHosts.add(new URL(streamUrl).hostname);
-    } catch {}
-
     streamSessions.set(id, {
       id,
-      videoId: resolvedVideoId,
-      token: sessionToken,
-      streamUrl,
-      mode,
+      videoId: String(data.data.video_id),
+      token: data.data.token,
+      streamUrl: data.data.stream_url,
       createdAt: now(),
       plainKey: null,
       defaultIv: null,
-      allowedHosts,
+      allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
       ownerCode: req.session.code
     });
-
     res.json({
       success: true,
       data: {
         session: id,
-        video_id: resolvedVideoId,
-        mode,
+        video_id: data.data.video_id,
         manifest_url: `/api/stream/manifest/${id}`
       }
     });
   } catch (e) {
-    console.error("[play]", e.message);
     jsonError(res, 502, e.message);
   }
 });
@@ -1477,15 +1365,10 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        if (session.mode === "cdn" || keyUrl.includes("/user/auth/")) {
-          session.plainKey = await unwrapCdnKey(wrapped);
-          console.log(`[key] CDN for ${session.videoId}`);
-        } else {
-          session.plainKey = await unwrapKey(wrapped, session.videoId);
-          console.log(`[key] Weave for ${session.videoId}`);
-        }
+        session.plainKey = await unwrapKey(wrapped, session.videoId);
         session.defaultIv = currentIv;
         keyFetched = true;
+        console.log(`[key] unwrapped for ${session.videoId}`);
       }
       continue; // strip KEY — segments are plain
     }
