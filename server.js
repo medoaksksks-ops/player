@@ -152,7 +152,8 @@ const CONFIG = {
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
-  DEFAULT_YEAR_ID: 4,
+  // year API ids on upstream: 3 = 2026, 4 = 2027
+  DEFAULT_YEAR_ID: 3,
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
@@ -278,29 +279,73 @@ function packageDurationMs(pkg) {
 }
 
 
-// Canonical subject IDs per section (fallback if Firebase section missing)
+/**
+ * Years on upstream API
+ * 3 → 2026  |  4 → 2027
+ * Subject IDs verified against /user/subjects/:yearId
+ */
+const YEAR_CATALOG = {
+  3: {
+    id: 3,
+    label: "2026",
+    name: "2026",
+    subjects: {
+      // علمي علوم
+      scientific_sciences: [40, 41, 42, 43, 44], // عربي، English، فيزياء، كيمياء، أحياء
+      // علمي رياضة — مفيش مادة رياضة منفصلة في قائمة 2026 حالياً؛ نفس أساس العلوم بدون أحياء
+      scientific_math: [40, 41, 42, 43],
+      literary: [40, 41, 52, 56], // عربي، English، فرنساوي، تربية وطنية
+      "بكالوريا": [40, 41, 52, 56]
+    }
+  },
+  4: {
+    id: 4,
+    label: "2027",
+    name: "2027",
+    subjects: {
+      scientific_sciences: [57, 58, 59, 60, 61], // عربي، English، فيزياء، كيمياء، أحياء
+      scientific_math: [57, 58, 59, 60],
+      literary: [57, 58],
+      "بكالوريا": [57, 58]
+    }
+  }
+};
+
+// Canonical section defaults → year 2026 (id 3)
 const SECTION_CATALOG = {
   scientific_sciences: {
     name: "علمي علوم",
-    yearId: 4,
-    subjectIds: [57, 58, 59, 60, 61]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.scientific_sciences
   },
   scientific_math: {
     name: "علمي رياضة",
-    yearId: 4,
-    subjectIds: [57, 58, 59, 60, 65]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.scientific_math
   },
   literary: {
     name: "أدبي",
-    yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.literary
   },
   "بكالوريا": {
     name: "بكالوريا",
-    yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects["بكالوريا"]
   }
 };
+
+function resolveYearId(raw) {
+  if (raw == null || raw === "") return CONFIG.DEFAULT_YEAR_ID;
+  const n = Number(raw);
+  if (YEAR_CATALOG[n]) return n;
+  const s = String(raw).trim();
+  if (s === "2026" || s.includes("2026")) return 3;
+  if (s === "2027" || s.includes("2027")) return 4;
+  if (s === "2025" || s.includes("2025")) return 2;
+  if (s === "2024" || s.includes("2024")) return 1;
+  return CONFIG.DEFAULT_YEAR_ID;
+}
 
 /** Normalize section key from admin/UI variants */
 function normalizeSection(raw) {
@@ -335,30 +380,59 @@ function normalizeSection(raw) {
   return s;
 }
 
-/** Resolve section config: Firebase first, then hardcoded catalog */
-async function resolveSection(sectionRaw) {
+/**
+ * Resolve section config: Firebase first, then YEAR_CATALOG / SECTION_CATALOG
+ * @param {string} sectionRaw
+ * @param {number|string} [yearOverride] — calendar year or API year id
+ */
+async function resolveSection(sectionRaw, yearOverride = null) {
   const id = normalizeSection(sectionRaw);
   if (!id) return null;
+
+  let yearId = yearOverride != null ? resolveYearId(yearOverride) : null;
+
   try {
     if (getFirebaseUrl()) {
       const sec = await fbGetCached(`sections/${id}`, 60_000);
-      if (sec && Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
-        return {
-          id,
-          name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-          yearId: Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID,
-          subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
-        };
+      if (sec) {
+        if (yearId == null) {
+          yearId = Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID;
+        }
+        // If Firebase has subjectIds and year matches (or no override), use them
+        if (Array.isArray(sec.subjectIds) && sec.subjectIds.length && yearOverride == null) {
+          return {
+            id,
+            name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
+            yearId,
+            subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
+          };
+        }
       }
     }
   } catch (e) {
     console.warn("[section]", e.message);
   }
+
+  if (yearId == null) {
+    yearId = (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID;
+  }
+
+  // Prefer per-year subject list
+  const yearDef = YEAR_CATALOG[yearId];
+  if (yearDef && yearDef.subjects && yearDef.subjects[id]) {
+    return {
+      id,
+      name: (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
+      yearId,
+      subjectIds: [...yearDef.subjects[id]]
+    };
+  }
+
   const def = SECTION_CATALOG[id];
   if (def) {
-    return { id, name: def.name, yearId: def.yearId, subjectIds: [...def.subjectIds] };
+    return { id, name: def.name, yearId: yearId || def.yearId, subjectIds: [...def.subjectIds] };
   }
-  return { id, name: id, yearId: CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
+  return { id, name: id, yearId: yearId || CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
 }
 
 
@@ -919,10 +993,27 @@ app.get("/api/public/site", rateLimit({ max: 120, windowMs: 60_000, scope: "publ
       siteName: runtime.siteName || "كورساتك",
       packages,
       agents,
+      years: Object.values(YEAR_CATALOG).map((y) => ({
+        id: y.id,
+        label: y.label,
+        name: y.name
+      })),
+      defaultYearId: CONFIG.DEFAULT_YEAR_ID,
       firebaseConfigured: Boolean(getFirebaseUrl()),
       tokenConfigured: Boolean(getCoursatkTokenSync())
     }
   });
+});
+
+/** Public: list supported academic years (2026 / 2027 …) */
+app.get("/api/public/years", rateLimit({ max: 120, windowMs: 60_000, scope: "public-years" }), (_req, res) => {
+  const list = Object.values(YEAR_CATALOG).map((y) => ({
+    id: y.id,
+    label: y.label,
+    name: y.name,
+    sections: Object.keys(y.subjects || {})
+  }));
+  res.json({ success: true, data: list, defaultYearId: CONFIG.DEFAULT_YEAR_ID });
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -1121,17 +1212,20 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
 // CATALOG (student token required) — proxies upstream, hides COURSATK token
 // ═══════════════════════════════════════════════════════════
 app.get("/api/config", requireStudent, async (req, res) => {
-  let yearId = CONFIG.DEFAULT_YEAR_ID;
+  const yearOverride = req.query.year || req.student.yearId || null;
+  let yearId = yearOverride != null ? resolveYearId(yearOverride) : CONFIG.DEFAULT_YEAR_ID;
   let subjectIds = [];
-  const secInfo = await resolveSection(req.student.section);
+  const secInfo = await resolveSection(req.student.section, yearOverride);
   if (secInfo) {
     yearId = secInfo.yearId || yearId;
     subjectIds = secInfo.subjectIds || [];
   }
+  const years = Object.values(YEAR_CATALOG).map((y) => ({ id: y.id, label: y.label, name: y.name }));
   res.json({
     success: true,
     yearId,
     subjectIds,
+    years,
     cryptoReady: Boolean(decryptPlaybackKeyFn),
     decryptSegments: true
   });
@@ -1140,9 +1234,12 @@ app.get("/api/config", requireStudent, async (req, res) => {
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     // 1) Load section subject IDs (Firebase + hardcoded catalog)
+    // :id can be year API id (3/4) or ignored if section forces year
     let wantedIds = [];
-    let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(req.student.section);
+    const paramYear = resolveYearId(req.params.id);
+    const yearOverride = req.query.year || req.student.yearId || paramYear || null;
+    let yearId = resolveYearId(yearOverride);
+    const secInfo = await resolveSection(req.student.section, yearOverride);
     if (secInfo) {
       if (Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
         wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
@@ -2826,24 +2923,22 @@ if (!getFirebaseUrl()) {
   console.warn("[API] WARNING: Firebase URL not set — configure from admin panel (إعدادات التشغيل)");
 }
 
-// Seed default sections if missing
+// Seed default sections if missing (defaults → year 2026 / id 3)
 try {
   if (!getFirebaseUrl()) throw new Error("no firebase");
-  // Always ensure correct subject IDs for the 3 main sections
-  // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
-  // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
-  // أدبي: 57 عربي، 58 English + 62،63،64
+  // 2026 (yearId 3): عربي 40، English 41، فيزياء 42، كيمياء 43، أحياء 44
+  // 2027 (yearId 4): عربي 57، English 58، فيزياء 59، كيمياء 60، أحياء 61
   const sectionDefaults = {};
   for (const [id, def] of Object.entries(SECTION_CATALOG)) {
     sectionDefaults[id] = { ...def, updatedAt: Date.now() };
   }
-  // Sync sections only when missing or IDs changed (avoid write storm on every restart)
   const existing = (await fbGet("sections")) || {};
   let changed = 0;
   for (const [id, def] of Object.entries(sectionDefaults)) {
     const cur = existing[id];
     const same =
       cur &&
+      Number(cur.yearId) === Number(def.yearId) &&
       Array.isArray(cur.subjectIds) &&
       cur.subjectIds.length === def.subjectIds.length &&
       def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
@@ -2852,7 +2947,14 @@ try {
       changed++;
     }
   }
-  console.log("[API] sections synced, updated:", changed);
+  // Mirror year catalog for admin reference
+  try {
+    await fbSet("years", {
+      3: { id: 3, label: "2026", name: "2026" },
+      4: { id: 4, label: "2027", name: "2027" }
+    });
+  } catch {}
+  console.log("[API] sections synced, updated:", changed, "· years 2026/2027 ready");
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
