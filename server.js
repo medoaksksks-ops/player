@@ -152,7 +152,8 @@ const CONFIG = {
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
   COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
-  DEFAULT_YEAR_ID: 4,
+  // 3 = 2026 ، 4 = 2027
+  DEFAULT_YEAR_ID: 3,
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
@@ -278,27 +279,64 @@ function packageDurationMs(pkg) {
 }
 
 
-// Canonical subject IDs per section (fallback if Firebase section missing)
+/**
+ * Years: 3=2026 ، 4=2027
+ * Subject IDs from upstream /user/subjects/:yearId
+ */
+const YEAR_CATALOG = {
+  3: {
+    id: 3,
+    label: "2026",
+    subjects: {
+      scientific_sciences: [40, 41, 42, 43, 44], // عربي English فيزياء كيمياء أحياء
+      scientific_math: [40, 41, 42, 43],
+      literary: [40, 41, 52, 56],
+      "بكالوريا": [40, 41, 52, 56]
+    }
+  },
+  4: {
+    id: 4,
+    label: "2027",
+    subjects: {
+      scientific_sciences: [57, 58, 59, 60, 61],
+      scientific_math: [57, 58, 59, 60],
+      literary: [57, 58],
+      "بكالوريا": [57, 58]
+    }
+  }
+};
+
+function resolveYearId(raw) {
+  if (raw == null || raw === "") return CONFIG.DEFAULT_YEAR_ID;
+  const n = Number(raw);
+  if (YEAR_CATALOG[n]) return n;
+  const s = String(raw).trim();
+  if (s.includes("2026")) return 3;
+  if (s.includes("2027")) return 4;
+  return CONFIG.DEFAULT_YEAR_ID;
+}
+
+// Default sections → 2026
 const SECTION_CATALOG = {
   scientific_sciences: {
     name: "علمي علوم",
-    yearId: 4,
-    subjectIds: [57, 58, 59, 60, 61]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.scientific_sciences
   },
   scientific_math: {
     name: "علمي رياضة",
-    yearId: 4,
-    subjectIds: [57, 58, 59, 60, 65]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.scientific_math
   },
   literary: {
     name: "أدبي",
-    yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects.literary
   },
   "بكالوريا": {
     name: "بكالوريا",
-    yearId: 4,
-    subjectIds: [57, 58, 62, 63, 64]
+    yearId: 3,
+    subjectIds: YEAR_CATALOG[3].subjects["بكالوريا"]
   }
 };
 
@@ -335,30 +373,45 @@ function normalizeSection(raw) {
   return s;
 }
 
-/** Resolve section config: Firebase first, then hardcoded catalog */
-async function resolveSection(sectionRaw) {
+/**
+ * Resolve section: YEAR_CATALOG is source of truth for subject IDs per year.
+ * Firebase can override name only; yearOverride wins when provided.
+ */
+async function resolveSection(sectionRaw, yearOverride = null) {
   const id = normalizeSection(sectionRaw);
   if (!id) return null;
+
+  let yearId =
+    yearOverride != null
+      ? resolveYearId(yearOverride)
+      : (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID;
+
+  let name = (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id;
+
   try {
     if (getFirebaseUrl()) {
       const sec = await fbGetCached(`sections/${id}`, 60_000);
-      if (sec && Array.isArray(sec.subjectIds) && sec.subjectIds.length) {
-        return {
-          id,
-          name: sec.name || (SECTION_CATALOG[id] && SECTION_CATALOG[id].name) || id,
-          yearId: Number(sec.yearId) || (SECTION_CATALOG[id] && SECTION_CATALOG[id].yearId) || CONFIG.DEFAULT_YEAR_ID,
-          subjectIds: sec.subjectIds.map(Number).filter((n) => !Number.isNaN(n))
-        };
+      if (sec) {
+        if (sec.name) name = sec.name;
+        // use Firebase year only if no explicit override
+        if (yearOverride == null && sec.yearId != null) {
+          yearId = resolveYearId(sec.yearId);
+        }
       }
     }
   } catch (e) {
     console.warn("[section]", e.message);
   }
+
+  const yearDef = YEAR_CATALOG[yearId];
+  if (yearDef && yearDef.subjects && yearDef.subjects[id]) {
+    return { id, name, yearId, subjectIds: [...yearDef.subjects[id]] };
+  }
   const def = SECTION_CATALOG[id];
   if (def) {
-    return { id, name: def.name, yearId: def.yearId, subjectIds: [...def.subjectIds] };
+    return { id, name: def.name, yearId, subjectIds: [...def.subjectIds] };
   }
-  return { id, name: id, yearId: CONFIG.DEFAULT_YEAR_ID, subjectIds: [] };
+  return { id, name, yearId, subjectIds: [] };
 }
 
 
@@ -781,6 +834,26 @@ async function unwrapKey(wrappedBuf, videoId) {
   return aes;
 }
 
+/** CDN 2026: salt(16)+iv(12)+data → PBKDF2+AES-GCM → hex AES key */
+const CDN_KEY_PASSWORD = "pQDKIpCkQxsulP";
+async function unwrapCdnKey(wrappedBuf) {
+  const buf = Buffer.isBuffer(wrappedBuf) ? wrappedBuf : Buffer.from(wrappedBuf);
+  if (buf.length === 16) return buf;
+  if (buf.length < 60) throw new Error("CDN key blob قصير");
+  const salt = buf.subarray(0, 16);
+  const iv = buf.subarray(16, 28);
+  const data = buf.subarray(28);
+  const derived = crypto.pbkdf2Sync(CDN_KEY_PASSWORD, salt, 100, 32, "sha256");
+  const tag = data.subarray(data.length - 16);
+  const ciphertext = data.subarray(0, data.length - 16);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", derived, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  const hexKey = plain.toString("utf8").trim().slice(0, 32);
+  if (!/^[0-9a-fA-F]{32}$/.test(hexKey)) throw new Error("CDN key format غير متوقع");
+  return Buffer.from(hexKey, "hex");
+}
+
 function decryptSegment(encrypted, key, iv) {
   const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]);
@@ -1121,9 +1194,10 @@ app.get("/api/auth/me", requireStudent, async (req, res) => {
 // CATALOG (student token required) — proxies upstream, hides COURSATK token
 // ═══════════════════════════════════════════════════════════
 app.get("/api/config", requireStudent, async (req, res) => {
-  let yearId = CONFIG.DEFAULT_YEAR_ID;
+  const yearOverride = req.query.year || null;
+  let yearId = yearOverride != null ? resolveYearId(yearOverride) : CONFIG.DEFAULT_YEAR_ID;
   let subjectIds = [];
-  const secInfo = await resolveSection(req.student.section);
+  const secInfo = await resolveSection(req.student.section, yearOverride);
   if (secInfo) {
     yearId = secInfo.yearId || yearId;
     subjectIds = secInfo.subjectIds || [];
@@ -1132,6 +1206,7 @@ app.get("/api/config", requireStudent, async (req, res) => {
     success: true,
     yearId,
     subjectIds,
+    years: Object.values(YEAR_CATALOG).map((y) => ({ id: y.id, label: y.label })),
     cryptoReady: Boolean(decryptPlaybackKeyFn),
     decryptSegments: true
   });
@@ -1139,19 +1214,17 @@ app.get("/api/config", requireStudent, async (req, res) => {
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
-    // 1) Load section subject IDs (Firebase + hardcoded catalog)
+    // :id أو ?year= → سنة مطلوبة من الفرونت (3=2026, 4=2027)
+    const yearId = resolveYearId(req.query.year || req.params.id || CONFIG.DEFAULT_YEAR_ID);
+    const secInfo = await resolveSection(req.student.section, yearId);
     let wantedIds = [];
-    let yearId = Number(req.params.id) || CONFIG.DEFAULT_YEAR_ID;
-    const secInfo = await resolveSection(req.student.section);
-    if (secInfo) {
-      if (Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
-        wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
-      }
-      if (secInfo.yearId) yearId = Number(secInfo.yearId) || yearId;
+    if (secInfo && Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
+      wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
     }
     console.log("[subjects]", {
       student: req.student.code,
       section: req.student.section,
+      yearId,
       wantedIds
     });
 
@@ -1257,34 +1330,94 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    const data = await upstreamJson(
-      `/video/${encodeURIComponent(req.params.videoId)}/stream-weave/play`,
-      { method: "POST", headers: { Accept: "application/json" } }
-    );
-    if (!data?.success || !data?.data?.token || !data?.data?.stream_url || !data?.data?.video_id) {
-      throw new Error("Playback response ناقص");
+    const videoId = String(req.params.videoId);
+    const upstreamTok = await getCoursatkToken();
+    if (!upstreamTok) return jsonError(res, 503, "توكن كورساتك غير مضبوط");
+
+    let mode = null;
+    let streamUrl = null;
+    let sessionToken = null;
+    let resolvedVideoId = videoId;
+    const errors = [];
+
+    // 1) CDN أولاً (2026)
+    try {
+      const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
+      const probe = await fetch(masterUrl, {
+        headers: {
+          Authorization: `Bearer ${upstreamTok}`,
+          Accept: "*/*",
+          Origin: CONFIG.STREAM_ORIGIN,
+          Referer: CONFIG.STREAM_REFERER,
+          "User-Agent": CONFIG.STREAM_UA
+        },
+        cache: "no-store"
+      });
+      if (!probe.ok) throw new Error(`CDN ${probe.status}`);
+      const masterText = await probe.text();
+      if (!masterText.includes("#EXTM3U")) throw new Error("CDN playlist غير صالح");
+      mode = "cdn";
+      streamUrl = masterUrl;
+      sessionToken = upstreamTok;
+    } catch (e) {
+      errors.push(e.message);
+      console.log("[play] CDN skip:", e.message);
     }
+
+    // 2) Stream-Weave (2027)
+    if (!mode) {
+      try {
+        const data = await upstreamJson(
+          `/video/${encodeURIComponent(videoId)}/stream-weave/play`,
+          { method: "POST", headers: { Accept: "application/json" } }
+        );
+        if (!data?.success || !data?.data?.token || !data?.data?.stream_url) {
+          throw new Error("Weave response ناقص");
+        }
+        mode = "weave";
+        sessionToken = data.data.token;
+        streamUrl = data.data.stream_url;
+        resolvedVideoId = String(data.data.video_id || videoId);
+      } catch (e) {
+        errors.push(e.message);
+        console.log("[play] Weave skip:", e.message);
+      }
+    }
+
+    if (!mode || !streamUrl || !sessionToken) {
+      throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
+    }
+
     const id = crypto.randomUUID();
+    const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
+    try {
+      allowedHosts.add(new URL(streamUrl).hostname);
+    } catch {}
+
     streamSessions.set(id, {
       id,
-      videoId: String(data.data.video_id),
-      token: data.data.token,
-      streamUrl: data.data.stream_url,
+      videoId: resolvedVideoId,
+      token: sessionToken,
+      streamUrl,
+      mode,
       createdAt: now(),
       plainKey: null,
       defaultIv: null,
-      allowedHosts: new Set([new URL(data.data.stream_url).hostname]),
+      allowedHosts,
       ownerCode: req.session.code
     });
+
     res.json({
       success: true,
       data: {
         session: id,
-        video_id: data.data.video_id,
+        video_id: resolvedVideoId,
+        mode,
         manifest_url: `/api/stream/manifest/${id}`
       }
     });
   } catch (e) {
+    console.error("[play]", e.message);
     jsonError(res, 502, e.message);
   }
 });
@@ -1365,10 +1498,15 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
         if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        if (session.mode === "cdn" || (uri && uri.includes("/user/auth/"))) {
+          session.plainKey = await unwrapCdnKey(wrapped);
+          console.log(`[key] CDN ${session.videoId}`);
+        } else {
+          session.plainKey = await unwrapKey(wrapped, session.videoId);
+          console.log(`[key] Weave ${session.videoId}`);
+        }
         session.defaultIv = currentIv;
         keyFetched = true;
-        console.log(`[key] unwrapped for ${session.videoId}`);
       }
       continue; // strip KEY — segments are plain
     }
@@ -2826,24 +2964,21 @@ if (!getFirebaseUrl()) {
   console.warn("[API] WARNING: Firebase URL not set — configure from admin panel (إعدادات التشغيل)");
 }
 
-// Seed default sections if missing
+// Seed default sections → 2026 subject IDs
 try {
   if (!getFirebaseUrl()) throw new Error("no firebase");
-  // Always ensure correct subject IDs for the 3 main sections
-  // علمي علوم: 57 عربي، 58 English، 59 فيزياء، 60 كيمياء، 61 أحياء
-  // علمي رياضة: نفس علوم مع 65 رياضة بدل 61 أحياء
-  // أدبي: 57 عربي، 58 English + 62،63،64
+  // 2026: عربي40 English41 فيزياء42 كيمياء43 أحياء44
   const sectionDefaults = {};
   for (const [id, def] of Object.entries(SECTION_CATALOG)) {
     sectionDefaults[id] = { ...def, updatedAt: Date.now() };
   }
-  // Sync sections only when missing or IDs changed (avoid write storm on every restart)
   const existing = (await fbGet("sections")) || {};
   let changed = 0;
   for (const [id, def] of Object.entries(sectionDefaults)) {
     const cur = existing[id];
     const same =
       cur &&
+      Number(cur.yearId) === Number(def.yearId) &&
       Array.isArray(cur.subjectIds) &&
       cur.subjectIds.length === def.subjectIds.length &&
       def.subjectIds.every((x, i) => Number(cur.subjectIds[i]) === x);
@@ -2852,7 +2987,7 @@ try {
       changed++;
     }
   }
-  console.log("[API] sections synced, updated:", changed);
+  console.log("[API] sections synced, updated:", changed, "· default year 2026");
 } catch (e) {
   console.warn("[API] section seed skip:", e.message);
 }
