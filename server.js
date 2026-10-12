@@ -1566,37 +1566,20 @@ function getStreamSession(id) {
 }
 
 /**
- * يتحقق من صلاحية الوصول لجلسة التشغيل:
- * 1) X-Stream-Token (المفضّل — للـ manifest)
- * 2) Bearer جلسة الطالب (توافق قديم)
- * 3) للمقاطع فقط: توقيع HMAC صالح في المسار (لأن HLS مش بيبعت headers)
+ * صلاحية جلسة التشغيل — صارمة:
+ * - manifest: لازم X-Stream-Token (أو ?st=) مطابق لجلسة التشغيل فقط
+ *   توكن حساب الطالب/الأدمن وحده مرفوض
+ * - segment: لازم توقيع HMAC في المسار (HLS مش بيبعت headers)
  */
 function requireStreamAccess(req, res, next) {
   const sessionId = req.params.sessionId;
   const session = getStreamSession(sessionId);
   if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
 
-  const st = getStreamAccessToken(req);
-  if (st && session.streamToken && st === session.streamToken) {
-    req.streamSession = session;
-    return next();
-  }
+  const isSegment = req.path.includes("/segment/") && req.params.encoded;
 
-  const bearer = getBearer(req);
-  if (bearer) {
-    const stu = studentSessions.get(bearer);
-    if (stu && String(stu.code) === String(session.ownerCode)) {
-      if (stu.expiresAt && now() > stu.expiresAt) {
-        return jsonError(res, 401, "انتهت صلاحية الجلسة");
-      }
-      req.streamSession = session;
-      req.session = stu;
-      return next();
-    }
-  }
-
-  // Segment path: /api/stream/segment/:sessionId/:payload.sig
-  if (req.path.includes("/segment/") && req.params.encoded) {
+  // المقاطع: التوقيع في المسار يكفي (بعد ما العميل خد الـ playlist بتوكن التشغيل)
+  if (isSegment) {
     const rawEnc = String(req.params.encoded || "");
     const dot = rawEnc.lastIndexOf(".");
     if (dot > 0) {
@@ -1607,9 +1590,17 @@ function requireStreamAccess(req, res, next) {
         return next();
       }
     }
+    return jsonError(res, 403, "توقيع المقطع غير صالح");
   }
 
-  return jsonError(res, 401, "توكن تشغيل غير صالح — افتح الفيديو من جديد");
+  // الـ manifest: streamToken إجباري — Bearer الحساب مش كفاية
+  const st = getStreamAccessToken(req);
+  if (st && session.streamToken && st === session.streamToken) {
+    req.streamSession = session;
+    return next();
+  }
+
+  return jsonError(res, 401, "مطلوب توكن التشغيل (X-Stream-Token) — افتح الفيديو من /api/play");
 }
 
 /**
