@@ -20,7 +20,20 @@ const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
 const app = express();
 app.set("trust proxy", 1);
-app.use(cors({ origin: true, credentials: false }));
+app.use(cors({
+  origin: true,
+  credentials: false,
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Session-Token",
+    "X-Stream-Token",
+    "X-Requested-With",
+    "Accept",
+    "Range"
+  ],
+  exposedHeaders: ["X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"]
+}));
 app.use(express.json({ limit: "20mb" }));
 app.use(compression());
 
@@ -459,6 +472,22 @@ setInterval(() => {
 }, 60_000).unref();
 
 // ═══════════════════════════════════════════════════════════
+// Single-flight — طلبات متزامنة لنفس المفتاح = تنفيذ مرة واحدة
+// ═══════════════════════════════════════════════════════════
+const inFlight = new Map();
+function singleFlight(key, fn) {
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+  const p = Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      if (inFlight.get(key) === p) inFlight.delete(key);
+    });
+  inFlight.set(key, p);
+  return p;
+}
+
+// ═══════════════════════════════════════════════════════════
 // Crypto helpers
 // ═══════════════════════════════════════════════════════════
 function scryptHash(password, saltHex) {
@@ -491,8 +520,30 @@ function scryptVerify(password, stored) {
   }
 }
 
-function randomToken(bytes = 32) {
+/** توكن طويل — 48 بايت ≈ 64 حرف base64url (كان 32 ≈ 43) */
+function randomToken(bytes = 48) {
   return crypto.randomBytes(bytes).toString("base64url");
+}
+
+/** سر توقيع روابط المقاطع — يتغير مع كل إقلاع إن لم يُضبط */
+const STREAM_HMAC_SECRET =
+  process.env.STREAM_HMAC_SECRET ||
+  crypto.createHash("sha256").update("coursatk-stream|" + (process.env.PORT || "3000") + "|" + String(Date.now() >> 16)).digest();
+
+function hmacSign(payload) {
+  return crypto.createHmac("sha256", STREAM_HMAC_SECRET).update(payload).digest("base64url");
+}
+function hmacVerify(payload, sig) {
+  if (!sig || typeof sig !== "string") return false;
+  const expect = hmacSign(payload);
+  try {
+    const a = Buffer.from(expect);
+    const b = Buffer.from(sig);
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 function randomCode9() {
@@ -640,7 +691,14 @@ function getBearer(req) {
   if (h.startsWith("Bearer ")) return h.slice(7).trim();
   const xt = req.headers["x-session-token"];
   if (xt) return String(xt).trim();
-  if (req.query && req.query.token) return String(req.query.token).trim();
+  // query token فقط للمسارات اللي محتاجة (ميديا) — مش للـ auth العام عشان ما يتسربش في اللوجات/الريفرر
+  return "";
+}
+
+function getStreamAccessToken(req) {
+  const h = req.headers["x-stream-token"];
+  if (h) return String(h).trim();
+  if (req.query && req.query.st) return String(req.query.st).trim();
   return "";
 }
 
@@ -1023,17 +1081,31 @@ async function upstreamHeaders(extra = {}) {
 }
 
 async function upstreamJson(apiPath, options = {}) {
-  const r = await fetch(`${CONFIG.COURSATK_API}${apiPath}`, {
-    ...options,
-    headers: await upstreamHeaders(options.headers || {})
-  });
-  const text = await r.text();
-  let data;
-  try { data = JSON.parse(text); } catch {
-    throw new Error(`Upstream non-JSON (${r.status})`);
+  const method = String(options.method || "GET").toUpperCase();
+  const cacheable = method === "GET" && !options.body;
+  const flightKey = `up:${method}:${apiPath}`;
+  if (cacheable) {
+    const hit = cacheGet(flightKey);
+    if (hit !== null) return hit;
   }
-  if (!r.ok) throw new Error(data?.message || `Upstream HTTP ${r.status}`);
-  return data;
+  return singleFlight(flightKey, async () => {
+    if (cacheable) {
+      const hit2 = cacheGet(flightKey);
+      if (hit2 !== null) return hit2;
+    }
+    const r = await fetch(`${CONFIG.COURSATK_API}${apiPath}`, {
+      ...options,
+      headers: await upstreamHeaders(options.headers || {})
+    });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch {
+      throw new Error(`Upstream non-JSON (${r.status})`);
+    }
+    if (!r.ok) throw new Error(data?.message || `Upstream HTTP ${r.status}`);
+    if (cacheable) cacheSet(flightKey, data, 45_000);
+    return data;
+  });
 }
 
 function allowedStreamUrl(raw, session = null) {
@@ -1239,7 +1311,7 @@ app.post("/api/auth/login", rateLimit({ max: 30, windowMs: 60_000, scope: "stude
       CONFIG.STUDENT_SESSION_MS,
       Math.max(60_000, (student.expiresAt || now() + CONFIG.STUDENT_SESSION_MS) - now())
     );
-    const token = randomToken(32);
+    const token = randomToken(48);
     const sess = {
       token,
       code,
@@ -1465,13 +1537,96 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// STREAM (student token) — decrypted segments
+// STREAM — توكن تشغيل منفصل لكل فيديو + فك تشفير السيرفر
+// - توكن الحساب (Bearer) يُستخدم مرة عند /api/play فقط
+// - بعدين الـ client يشتغل بـ streamToken قصير العمر (مش توكن الحساب)
+// - روابط المقاطع موقّعة HMAC عشان ما تتزورش
 // ═══════════════════════════════════════════════════════════
-app.post("/api/play/:videoId", requireStudent, async (req, res) => {
-  try {
-    const videoId = String(req.params.videoId);
-    const upstreamTok = await getCoursatkToken();
-    if (!upstreamTok) return jsonError(res, 503, "توكن كورساتك غير مضبوط");
+
+/** حد أقصى لجلسات تشغيل متزامنة لكل كود طالب */
+const MAX_STREAMS_PER_STUDENT = 3;
+
+function countStudentStreams(code) {
+  let n = 0;
+  const t = now();
+  for (const s of streamSessions.values()) {
+    if (s.ownerCode === code && t - s.createdAt <= CONFIG.STREAM_SESSION_MS) n++;
+  }
+  return n;
+}
+
+function getStreamSession(id) {
+  const s = streamSessions.get(id);
+  if (!s) return null;
+  if (now() - s.createdAt > CONFIG.STREAM_SESSION_MS) {
+    streamSessions.delete(id);
+    return null;
+  }
+  return s;
+}
+
+/**
+ * يتحقق من صلاحية الوصول لجلسة التشغيل:
+ * 1) X-Stream-Token (المفضّل — للـ manifest)
+ * 2) Bearer جلسة الطالب (توافق قديم)
+ * 3) للمقاطع فقط: توقيع HMAC صالح في المسار (لأن HLS مش بيبعت headers)
+ */
+function requireStreamAccess(req, res, next) {
+  const sessionId = req.params.sessionId;
+  const session = getStreamSession(sessionId);
+  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+
+  const st = getStreamAccessToken(req);
+  if (st && session.streamToken && st === session.streamToken) {
+    req.streamSession = session;
+    return next();
+  }
+
+  const bearer = getBearer(req);
+  if (bearer) {
+    const stu = studentSessions.get(bearer);
+    if (stu && String(stu.code) === String(session.ownerCode)) {
+      if (stu.expiresAt && now() > stu.expiresAt) {
+        return jsonError(res, 401, "انتهت صلاحية الجلسة");
+      }
+      req.streamSession = session;
+      req.session = stu;
+      return next();
+    }
+  }
+
+  // Segment path: /api/stream/segment/:sessionId/:payload.sig
+  if (req.path.includes("/segment/") && req.params.encoded) {
+    const rawEnc = String(req.params.encoded || "");
+    const dot = rawEnc.lastIndexOf(".");
+    if (dot > 0) {
+      const payloadPart = rawEnc.slice(0, dot);
+      const sigPart = rawEnc.slice(dot + 1);
+      if (sigPart && hmacVerify(sessionId + "." + payloadPart, sigPart)) {
+        req.streamSession = session;
+        return next();
+      }
+    }
+  }
+
+  return jsonError(res, 401, "توكن تشغيل غير صالح — افتح الفيديو من جديد");
+}
+
+/**
+ * يجلب بيانات التشغيل من upstream مرة واحدة ويشاركها (single-flight + cache قصير)
+ * المفتاح = videoId فقط — مش مربوط بالطالب عشان 10 طلبات لنفس الفيديو = طلب upstream واحد
+ */
+async function resolveUpstreamPlay(videoId) {
+  const flightKey = `play:${videoId}`;
+  const cached = cacheGet(flightKey);
+  if (cached) return cached;
+
+  return singleFlight(flightKey, async () => {
+    const hit = cacheGet(flightKey);
+    if (hit) return hit;
+
+    const upstreamTok = getCoursatkTokenSync() || (await getCoursatkToken());
+    if (!upstreamTok) throw new Error("توكن كورساتك غير مضبوط");
 
     let mode = null;
     let streamUrl = null;
@@ -1479,7 +1634,7 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     let resolvedVideoId = videoId;
     const errors = [];
 
-    // CDN أولاً (2026) — لو فشل → Weave (2027 زي ما هو)
+    // CDN أولاً (2026)
     try {
       const masterUrl = `${CONFIG.COURSATK_API}/video/stream/${encodeURIComponent(videoId)}/playlist.m3u8`;
       const probe = await fetch(masterUrl, {
@@ -1524,6 +1679,34 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       throw new Error(errors.join(" | ") || "مفيش منصة تشغيل");
     }
 
+    const result = { mode, streamUrl, sessionToken, resolvedVideoId, upstreamTok };
+    // كاش قصير: يقلل ضغط upstream لما ناس كتير تفتح نفس الفيديو
+    cacheSet(flightKey, result, 90_000);
+    return result;
+  });
+}
+
+app.post("/api/play/:videoId", requireStudent, rateLimit({ max: 40, windowMs: 60_000, scope: "play" }), async (req, res) => {
+  try {
+    const videoId = String(req.params.videoId);
+    if (!videoId || videoId.length > 80) return jsonError(res, 400, "videoId غير صالح");
+
+    if (countStudentStreams(req.session.code) >= MAX_STREAMS_PER_STUDENT) {
+      // امسح الأقدم
+      let oldest = null;
+      for (const [k, s] of streamSessions) {
+        if (s.ownerCode === req.session.code) {
+          if (!oldest || s.createdAt < oldest.createdAt) oldest = { k, ...s };
+        }
+      }
+      if (oldest) streamSessions.delete(oldest.k);
+    }
+
+    const resolved = await resolveUpstreamPlay(videoId);
+    const { mode, streamUrl, sessionToken, resolvedVideoId } = resolved;
+
+    // توكن تشغيل طويل ومنفصل عن توكن الحساب
+    const streamToken = randomToken(48);
     const id = crypto.randomUUID();
     const allowedHosts = new Set(CONFIG.STREAM_HOSTS);
     try {
@@ -1533,22 +1716,30 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     streamSessions.set(id, {
       id,
       videoId: resolvedVideoId,
-      token: sessionToken,
+      token: sessionToken, // توكن upstream — ما بيطلعش للعميل أبداً
       streamUrl,
       mode,
+      streamToken, // توكن التشغيل اللي العميل بيستخدمه
       createdAt: now(),
       plainKey: null,
       defaultIv: null,
       allowedHosts,
-      ownerCode: req.session.code
+      ownerCode: req.session.code,
+      deviceId: req.session.deviceId || null,
+      // مرجع مشترك لـ plainKey بين جلسات نفس الفيديو (بعد أول unwrap)
+      shareKey: `pkey:${resolvedVideoId}:${mode}`
     });
 
+    const expiresIn = Math.floor(CONFIG.STREAM_SESSION_MS / 1000);
     res.json({
       success: true,
       data: {
         session: id,
+        streamToken, // لازم الفرونت يحطه في X-Stream-Token لكل طلب manifest/segment
         video_id: resolvedVideoId,
         mode,
+        expiresIn,
+        // URL بدون توكن الحساب في الـ query
         manifest_url: `/api/stream/manifest/${id}`
       }
     });
@@ -1558,22 +1749,8 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   }
 });
 
-function getStreamSession(id) {
-  const s = streamSessions.get(id);
-  if (!s) return null;
-  if (now() - s.createdAt > CONFIG.STREAM_SESSION_MS) {
-    streamSessions.delete(id);
-    return null;
-  }
-  return s;
-}
-
-app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) {
-    return jsonError(res, 403, "جلسة تشغيل ليست لك");
-  }
+app.get("/api/stream/manifest/:sessionId", requireStreamAccess, async (req, res) => {
+  const session = req.streamSession;
 
   try {
     const master = await streamFetch(session, session.streamUrl, {}, req.headers);
@@ -1608,6 +1785,43 @@ app.get("/api/stream/manifest/:sessionId", requireStudent, async (req, res) => {
   }
 });
 
+async function ensurePlainKey(session, uri, baseUrl, clientHeaders) {
+  if (session.plainKey) return session.plainKey;
+  // مشاركة المفتاح بين جلسات نفس الفيديو (بعد أول unwrap)
+  if (session.shareKey) {
+    const shared = cacheGet(session.shareKey);
+    if (shared && Buffer.isBuffer(shared)) {
+      session.plainKey = shared;
+      return shared;
+    }
+  }
+  return singleFlight(`keyunwrap:${session.videoId}:${session.mode}`, async () => {
+    if (session.plainKey) return session.plainKey;
+    if (session.shareKey) {
+      const shared = cacheGet(session.shareKey);
+      if (shared && Buffer.isBuffer(shared)) {
+        session.plainKey = shared;
+        return shared;
+      }
+    }
+    const keyUrl = new URL(uri, baseUrl).href;
+    try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+    const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+    if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
+    const wrapped = Buffer.from(await keyRes.arrayBuffer());
+    let plain;
+    if (session.mode === "cdn" || (uri && String(uri).includes("/user/auth/"))) {
+      plain = await unwrapCdnKey(wrapped);
+    } else {
+      plain = await unwrapKey(wrapped, session.videoId);
+    }
+    session.plainKey = plain;
+    if (session.shareKey) cacheSet(session.shareKey, plain, 10 * 60_000);
+    console.log(`[key] ${session.mode || "weave"} for ${session.videoId}`);
+    return plain;
+  });
+}
+
 async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
   try { session.allowedHosts.add(new URL(baseUrl).hostname); } catch {}
   const lines = text.split(/\r?\n/);
@@ -1629,19 +1843,9 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
       if (ivHex) currentIv = parseIvHex(ivHex);
       if (uri && !keyFetched) {
-        const keyUrl = new URL(uri, baseUrl).href;
-        try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
-        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
-        const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        if (session.mode === "cdn" || (uri && String(uri).includes("/user/auth/"))) {
-          session.plainKey = await unwrapCdnKey(wrapped);
-        } else {
-          session.plainKey = await unwrapKey(wrapped, session.videoId);
-        }
+        await ensurePlainKey(session, uri, baseUrl, clientHeaders);
         session.defaultIv = currentIv;
         keyFetched = true;
-        console.log(`[key] ${session.mode || "weave"} for ${session.videoId}`);
       }
       continue; // strip KEY — segments are plain
     }
@@ -1650,11 +1854,16 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
       try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
-      const payload = Buffer.from(
-        JSON.stringify({ u: segmentUrl, iv: iv.toString("hex"), s: seq }),
-        "utf8"
-      ).toString("base64url");
-      out.push(`/api/stream/segment/${sessionId}/${payload}`);
+      const body = JSON.stringify({
+        u: segmentUrl,
+        iv: iv.toString("hex"),
+        s: seq,
+        exp: now() + CONFIG.STREAM_SESSION_MS
+      });
+      const payload = Buffer.from(body, "utf8").toString("base64url");
+      const sig = hmacSign(sessionId + "." + payload);
+      // التوقيع في المسار — HLS players غالباً مش بتبعت headers مخصصة على كل segment
+      out.push(`/api/stream/segment/${sessionId}/${payload}.${sig}`);
       segIndex++;
       continue;
     }
@@ -1664,23 +1873,48 @@ async function rewritePlaylist(sessionId, session, text, baseUrl, res, clientHea
 
   res.set({
     "Content-Type": "application/vnd.apple.mpegurl",
-    "Cache-Control": "no-store",
-    "Access-Control-Allow-Origin": "*"
+    "Cache-Control": "no-store, private",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Expose-Headers": "X-Stream-Token"
   });
   res.send(out.join("\n"));
 }
 
-app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
-  const session = getStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-  if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
+app.get("/api/stream/segment/:sessionId/:encoded", requireStreamAccess, async (req, res) => {
+  const session = req.streamSession;
+  if (!session.plainKey) {
+    // حاول من الكاش المشترك
+    if (session.shareKey) {
+      const shared = cacheGet(session.shareKey);
+      if (shared && Buffer.isBuffer(shared)) session.plainKey = shared;
+    }
+  }
+  if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح — أعد فتح الفيديو");
+
+  // encoded = payload.sig
+  const rawEnc = String(req.params.encoded || "");
+  const dot = rawEnc.lastIndexOf(".");
+  let payloadPart = rawEnc;
+  let sigPart = "";
+  if (dot > 0) {
+    payloadPart = rawEnc.slice(0, dot);
+    sigPart = rawEnc.slice(dot + 1);
+  }
+
+  // تحقق HMAC — يمنع تزوير روابط المقاطع
+  if (!sigPart || !hmacVerify(req.params.sessionId + "." + payloadPart, sigPart)) {
+    // توافق مع روابط قديمة بدون توقيع (اختياري: ارفض)
+    if (sigPart) return jsonError(res, 403, "توقيع المقطع غير صالح");
+  }
 
   let meta;
   try {
-    meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
+    meta = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8"));
   } catch {
     return jsonError(res, 400, "segment meta غير صالح");
+  }
+  if (meta.exp && now() > Number(meta.exp)) {
+    return jsonError(res, 403, "انتهت صلاحية رابط المقطع");
   }
   const url = meta?.u;
   if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
@@ -1707,7 +1941,7 @@ app.get("/api/stream/segment/:sessionId/:encoded", requireStudent, async (req, r
     res.set({
       "Content-Type": "video/mp2t",
       "Content-Length": String(plain.length),
-      "Cache-Control": "no-store",
+      "Cache-Control": "private, max-age=30",
       "Access-Control-Allow-Origin": "*"
     });
     res.send(plain);
@@ -1771,7 +2005,7 @@ app.post("/api/admin/login", rateLimit({ max: 20, windowMs: 60_000, scope: "admi
     }
     clearLoginFail("admin", ip, username);
 
-    const token = randomToken(32);
+    const token = randomToken(48);
     const sess = {
       token,
       adminId,
