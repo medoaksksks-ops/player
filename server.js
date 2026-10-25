@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.7-cplay";
+const APP_VERSION = "v1.8-cplay-light";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -1656,7 +1656,6 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
-  // مثل السيرفر الصغير: CDN بدون Authorization
   if (!isMediaSegmentHost(url) && session?.token) {
     headers.Authorization = `Bearer ${session.token}`;
   }
@@ -1670,7 +1669,6 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     if (v != null && v !== "") headers[k] = v;
   }
   if (isMediaSegmentHost(url)) delete headers.Authorization;
-
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
     fetchT(url, { headers, cache: "no-store", redirect: "follow" }, {
@@ -2673,34 +2671,54 @@ async function getStreamSession(id, touch = true) {
 
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    let videoId = String(req.params.videoId);
-    // Resolve thv_<numeric> using lectureId from body/query → playlist hash → thp_
-    if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
-      const pageId = videoId.slice(4);
-      const lecRaw = req.body?.lectureId ?? req.query?.lectureId ?? req.body?.lecture ?? req.query?.lecture;
-      let lec = lecRaw != null ? Number(lecRaw) : null;
-      if (lec != null && lec >= 9_000_000) lec = lec - 9_000_000;
-      if (lec != null && Number.isFinite(lec) && lec > 0) {
-        try {
-          const resolved = await thResolveVideo(lec, pageId);
-          if (resolved.kind === "youtube") {
-            videoId = "thy_" + resolved.youtubeId;
-          } else if (resolved.kind === "hls") {
-            videoId = "thp_" + resolved.hash;
-          } else if (resolved.kind === "mp4") {
-            videoId = "thm_" + resolved.id;
-          } else {
-            return jsonError(res, 502, "مصدر فيديو ثناويكا غير معروف");
-          }
-        } catch (e) {
-          return jsonError(res, 502, e.message || "تعذر جلب فيديو ثناويكا");
+    const videoId = String(req.params.videoId || "").trim();
+    if (!videoId) return jsonError(res, 400, "videoId مطلوب");
+
+    // ثناويكا ids → المسار القديم تحت
+    const isThanawicaId = /^th[pvmy]_/i.test(videoId);
+
+    // كورساتك: مسار خفيف زي السيرفر الصغير (من غير buildPlaylist)
+    if (!isThanawicaId) {
+      try {
+        const data = await upstreamJson(
+          "/video/" + encodeURIComponent(videoId) + "/stream-weave/play",
+          { method: "POST", headers: { Accept: "application/json" } }
+        );
+        if (data && data.success && data.data && data.data.token && data.data.stream_url) {
+          const id = crypto.randomUUID();
+          const hosts = new Set(CONFIG.STREAM_HOSTS);
+          try { hosts.add(new URL(data.data.stream_url).hostname); } catch {}
+          streamSessions.set(id, {
+            id,
+            kind: "coursatk-stream",
+            videoId: String(data.data.video_id || videoId),
+            token: data.data.token,
+            streamUrl: data.data.stream_url,
+            playId: videoId,
+            createdAt: now(),
+            lastUsed: now(),
+            plainKey: null,
+            defaultIv: null,
+            allowedHosts: hosts,
+            ownerCode: req.session.code
+          });
+          return res.json({
+            success: true,
+            data: {
+              session: id,
+              video_id: data.data.video_id || videoId,
+              manifest_url: "/api/cplay/manifest/" + id,
+              play_url: "/api/cplay/manifest/" + id
+            }
+          });
         }
+      } catch (e) {
+        console.warn("[play] light coursatek failed, fallback:", e.message);
+        // fall through to getVideoSource (youtube/mp4/cdn)
       }
     }
-        // منع طلاب بكالوريا/أدبي من تشغيل مصادر ثناويكا حتى لو عرفوا الـ id
-    if (/^th[pvmy]_/i.test(videoId) && !studentAllowsThanawica(req.student)) {
-      return jsonError(res, 403, "المصدر غير متاح لشعبتك");
-    }
+
+    // Fallback: ثناويكا / يوتيوب / cdn
     const src = await getVideoSource(videoId, req.headers);
 
     // كوكي جلسة
@@ -2746,35 +2764,7 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       });
     }
 
-    // كورساتك → مسار cplay (زي السيرفر الصغير)
-    if (src.mode !== "thanawica" && src.streamUrl && src.token) {
-      const id = crypto.randomUUID();
-      streamSessions.set(id, {
-        id,
-        kind: "coursatk-stream",
-        videoId: String(src.videoId || req.params.videoId),
-        token: src.token,
-        streamUrl: src.streamUrl,
-        playId: String(req.params.videoId),
-        createdAt: now(),
-        lastUsed: now(),
-        plainKey: null,
-        defaultIv: null,
-        allowedHosts: new Set([hostOf(src.streamUrl)].filter(Boolean)),
-        ownerCode: req.session.code
-      });
-      return res.json({
-        success: true,
-        data: {
-          session: id,
-          video_id: src.videoId,
-          manifest_url: `/api/cplay/manifest/${id}`,
-          play_url: `/api/cplay/manifest/${id}`
-        }
-      });
-    }
-
-    // ثناويكا وغيرها → /api/hls
+    // معرف تشغيل معتم — HLS
     const id = crypto.randomUUID().replace(/-/g, "");
     const streamKey = crypto.randomBytes(16).toString("hex");
     const deviceId =
@@ -2782,6 +2772,7 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       (req.student && req.student.deviceId) ||
       null;
 
+    // إلغاء جلسات قديمة لنفس الفيديو لنفس الطالب
     revokeOtherSessions(req.session.code, src.videoId, id);
 
     const sessionRow = {
@@ -2801,6 +2792,7 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     res.json({
       success: true,
       data: {
+        // المفتاح جزء من الرابط — من غيره المقاطع ومش هتشتغل
         play_url: `/api/hls/${id}/master.m3u8?sk=${streamKey}`
       }
     });
@@ -2867,7 +2859,7 @@ function playlistBodyFromSession(session) {
 
 
 // ═══════════════════════════════════════════════════════════
-// COURSATK PLAY (server-2-2 flow) — /api/cplay/* (not locked 410 paths)
+// COURSATK = small-server flow (/api/cplay)
 // ═══════════════════════════════════════════════════════════
 function getCoursatkStreamSession(id) {
   const s = streamSessions.get(id);
@@ -2877,11 +2869,14 @@ function getCoursatkStreamSession(id) {
 }
 
 async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
-  const lines = text.split(/\r?\n/);
+  const lines = String(text || "").split(/\r?\n/);
   const out = [];
   let mediaSeq = 0;
   let currentIv = null;
   let keyFetched = false;
+  if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
+    session.allowedHosts = new Set(session.allowedHosts || []);
+  }
   for (const raw of lines) {
     const tline = raw.trim();
     if (tline.startsWith("#EXT-X-MEDIA-SEQUENCE:")) mediaSeq = Number(tline.split(":")[1]) || 0;
@@ -2897,12 +2892,16 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
-        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
+        if (!keyRes.ok) throw new Error("Key HTTP " + keyRes.status);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
-        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        if (String(uri).includes("/user/auth/") || session.mode === "cdn") {
+          session.plainKey = await unwrapCdnKey(wrapped);
+        } else {
+          session.plainKey = await unwrapKey(wrapped, session.videoId);
+        }
         session.defaultIv = currentIv;
         keyFetched = true;
-        console.log("[key] cplay for", session.videoId);
+        console.log("[key] cplay", session.videoId, session.plainKey && session.plainKey.length);
       }
       continue;
     }
@@ -2911,7 +2910,7 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
       try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
       const iv = currentIv || ivFromMediaSequence(seq);
       const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: iv.toString("hex"), s: seq }), "utf8").toString("base64url");
-      out.push(`/api/cplay/segment/${sessionId}/${payload}`);
+      out.push("/api/cplay/segment/" + sessionId + "/" + payload);
       seq++;
       continue;
     }
@@ -2929,29 +2928,34 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
 app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
   try {
     const session = getCoursatkStreamSession(req.params.sessionId);
-    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية — افتح الفيديو من جديد");
     if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
 
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
-    if (master.status === 401 && session.playId) {
+    if ((master.status === 401 || master.status === 403) && session.playId) {
       try {
-        const data = await upstreamJson(`/video/${encodeURIComponent(session.playId)}/stream-weave/play`, {
-          method: "POST", headers: { Accept: "application/json" }
+        const data = await upstreamJson("/video/" + encodeURIComponent(session.playId) + "/stream-weave/play", {
+          method: "POST",
+          headers: { Accept: "application/json" }
         });
-        if (data?.data?.token) {
+        if (data && data.data && data.data.token) {
           session.token = data.data.token;
-          session.streamUrl = data.data.stream_url || session.streamUrl;
+          if (data.data.stream_url) session.streamUrl = data.data.stream_url;
         }
-      } catch {}
+      } catch (e) {
+        console.warn("[cplay] refresh token", e.message);
+      }
       master = await streamFetch(session, session.streamUrl, {}, req.headers);
     }
-    if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
+    if (!master.ok) return jsonError(res, 502, "Stream master HTTP " + master.status);
     const masterText = await master.text();
+    if (!masterText.includes("#EXTM3U")) return jsonError(res, 502, "قائمة تشغيل غير صالحة");
+
     const mLines = masterText.split(/\r?\n/);
     let variant = null;
     for (let i = 0; i < mLines.length; i++) {
       if (mLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
-        const next = mLines[i + 1]?.trim();
+        const next = (mLines[i + 1] || "").trim();
         if (next && !next.startsWith("#")) {
           variant = new URL(next, session.streamUrl).href;
           break;
@@ -2960,44 +2964,49 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
     }
     if (variant) {
       const variantRes = await streamFetch(session, variant, {}, req.headers);
-      if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
+      if (!variantRes.ok) return jsonError(res, 502, "Variant HTTP " + variantRes.status);
       return rewriteCoursatkPlaylist(req.params.sessionId, session, await variantRes.text(), variant, res, req.headers);
     }
     return rewriteCoursatkPlaylist(req.params.sessionId, session, masterText, session.streamUrl, res, req.headers);
   } catch (e) {
-    console.error("[cplay-manifest]", e.message);
-    return jsonError(res, 502, e.message || "فشل قائمة التشغيل");
+    console.error("[cplay-manifest]", e && e.stack || e);
+    return jsonError(res, 502, (e && e.message) || "فشل قائمة التشغيل");
   }
 });
 
 app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
-  const session = getCoursatkStreamSession(req.params.sessionId);
-  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-  if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
+  try {
+    const session = getCoursatkStreamSession(req.params.sessionId);
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+    if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح — حدّث الصفحة");
 
-  let meta;
-  try {
-    meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
-  } catch {
-    return jsonError(res, 400, "segment meta غير صالح");
-  }
-  const url = meta && meta.u;
-  if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
-  const iv = parseIvHex(meta.iv) || session.defaultIv || ivFromMediaSequence(meta.s || 0);
-  try {
+    let meta;
+    try {
+      meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
+    } catch {
+      return jsonError(res, 400, "segment meta غير صالح");
+    }
+    const url = meta && meta.u;
+    if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
+    const iv = parseIvHex(meta.iv) || session.defaultIv || ivFromMediaSequence(meta.s || 0);
+
     const upstream = await streamFetch(session, url, { Range: req.headers.range || undefined }, req.headers);
     if (!upstream.ok && upstream.status !== 206) {
       let body = "";
-      try { body = (await upstream.text()).slice(0, 120); } catch {}
-      console.error("[cplay-seg]", upstream.status, hostOf(url), body.slice(0, 60));
-      throw new Error("Segment HTTP " + upstream.status);
+      try { body = (await upstream.text()).slice(0, 100); } catch {}
+      console.error("[cplay-seg]", upstream.status, hostOf(url), body);
+      return jsonError(res, 502, "Segment HTTP " + upstream.status);
     }
     const encrypted = Buffer.from(await upstream.arrayBuffer());
     if (encrypted.length > CONFIG.MAX_PROXY_BYTES) return jsonError(res, 413, "المقطع كبير");
     let plain;
-    try { plain = decryptSegment(encrypted, session.plainKey, iv); }
-    catch (e) { console.warn("[cplay-dec]", e.message); plain = encrypted; }
+    try {
+      plain = decryptSegment(encrypted, session.plainKey, iv);
+    } catch (e) {
+      console.warn("[cplay-dec]", e.message);
+      plain = encrypted;
+    }
     res.status(200);
     res.set({
       "Content-Type": "video/mp2t",
@@ -3005,10 +3014,11 @@ app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, re
       "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*"
     });
-    res.send(plain);
+    return res.send(plain);
   } catch (e) {
-    if (!res.headersSent) jsonError(res, 502, e.message);
-    else res.end();
+    console.error("[cplay-seg]", e && e.stack || e);
+    if (!res.headersSent) return jsonError(res, 502, (e && e.message) || "فشل المقطع");
+    res.end();
   }
 });
 
@@ -4814,7 +4824,7 @@ app.use((err, req, res, _next) => {
   const status = (err && (err.status || err.statusCode)) || 500;
   res.status(status >= 400 && status < 600 ? status : 500).json({
     success: false,
-    message: status === 400 ? "طلب غير صالح" : "حصل خطأ في السيرفر — جرّب تاني"
+    message: (err && err.message) ? String(err.message).slice(0, 200) : (status === 400 ? "طلب غير صالح" : "حصل خطأ في السيرفر — جرّب تاني")
   });
 });
 
