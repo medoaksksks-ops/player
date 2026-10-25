@@ -79,13 +79,25 @@ function resolveThanawicaCode(explicit) {
 
 /** Year on Thanawica → subject ids for chem + math (scientific tracks) */
 const YEAR_SUBJECTS = {
-  // year key on thanawica URL /years/27 or /years/26
-  27: { chemistry: 154, math: 160, physics: 156, arabic: 150, english: 152 },
-  26: { chemistry: 111, math: 128, physics: 114, arabic: 101, english: 104 }
+  // year key on thanawica URL /years/27 or /years/26 — ids verified 2026-10-25
+  // ملاحظة: أحياء غير ظاهرة على حساب العينة لسنة 26
+  27: {
+    arabic: 150, english: 152, chemistry: 154, physics: 156, math: 160
+  },
+  26: {
+    arabic: 101, english: 104, chemistry: 111, physics: 114, math: 121,
+    french: 128, german: 130, abilities: 174
+  }
 };
 
 const NAME_CHEM = /كيمياء|chemistry/i;
 const NAME_MATH = /رياض|math|جبر|تفاضل|إحصاء|استاتيكا|ديناميكا/i;
+const NAME_PHYS = /فيزياء|physics/i;
+const NAME_AR = /عربي|عربية|arabic/i;
+const NAME_EN = /english|إنجل|انجليز/i;
+const NAME_BIO = /أحياء|احياء|حيه|biology/i;
+const NAME_FR = /فرنس|french/i;
+const NAME_DE = /ألمان|المان|german/i;
 
 let session = {
   cookies: "",
@@ -436,10 +448,22 @@ export function isChemOrMathName(name) {
   return NAME_CHEM.test(s) || NAME_MATH.test(s);
 }
 
-export function chemMathKind(name) {
+export function subjectKind(name) {
   const s = String(name || "");
   if (NAME_CHEM.test(s)) return "chemistry";
   if (NAME_MATH.test(s)) return "math";
+  if (NAME_PHYS.test(s)) return "physics";
+  if (NAME_BIO.test(s)) return "biology";
+  if (NAME_AR.test(s)) return "arabic";
+  if (NAME_EN.test(s)) return "english";
+  if (NAME_FR.test(s)) return "french";
+  if (NAME_DE.test(s)) return "german";
+  return "other";
+}
+
+export function chemMathKind(name) {
+  const k = subjectKind(name);
+  if (k === "chemistry" || k === "math") return k;
   return null;
 }
 
@@ -477,61 +501,107 @@ async function getHtml(urlPath) {
   return await res.text();
 }
 
-/** Subjects for chem+math only (for a given year) */
+/** All subjects for a year from Thanawica (not just chem/math) */
 export async function thSubjectsForYear(yearId) {
   const yk = mapYearKey(yearId);
-  const ck = `subj:${yk}`;
+  const ck = `subj:all:${yk}`;
   const hit = cget(ck);
   if (hit) return hit;
   const html = await getHtml(`/years/${yk}`);
   const flight = extractFlight(html) + "\n" + html;
   const imgByName = parseImageByName(flight);
   const out = [];
-  // article","154" ... alt":"كيمياء"
-  const re = /article","(\d+)"[\s\S]{0,1500}?alt":"([^"]+)"/g;
-  let m;
-  while ((m = re.exec(flight))) {
-    const id = Number(m[1]);
-    const name = m[2];
-    const kind = chemMathKind(name);
-    if (!kind) continue;
-    out.push({
-      id: encodeThId(id),
-      name,
-      image_url: imgByName.get(name) || null,
-      year_id: yearId,
-      is_published: true,
-      _source: "thanawica",
-      _kind: kind,
-      _thId: id
-    });
+  const seen = new Set();
+
+  // Ordered: alt then href /subjects/ID (RSC flight pattern)
+  const events = [];
+  const evRe = /alt":"([^"]+)"|href":"\/subjects\/(\d+)"/g;
+  let em;
+  while ((em = evRe.exec(flight))) {
+    if (em[1]) events.push({ type: "alt", v: em[1] });
+    else if (em[2]) events.push({ type: "href", v: Number(em[2]) });
   }
-  // fallback fixed map
+  let lastAlt = null;
+  for (const ev of events) {
+    if (ev.type === "alt") {
+      lastAlt = ev.v;
+      continue;
+    }
+    if (ev.type === "href" && lastAlt) {
+      const id = ev.v;
+      if (!isSaneId(id) || seen.has(id)) {
+        lastAlt = null;
+        continue;
+      }
+      seen.add(id);
+      const name = lastAlt;
+      out.push({
+        id: encodeThId(id),
+        name,
+        image_url: imgByName.get(name) || null,
+        year_id: yearId,
+        is_published: true,
+        _source: "thanawica",
+        _kind: subjectKind(name),
+        _thId: id
+      });
+      lastAlt = null;
+    }
+  }
+
+  // Fallback: article blocks
+  if (!out.length) {
+    const re = /article","(\d+)"[\s\S]{0,1500}?alt":"([^"]+)"/g;
+    let m2;
+    while ((m2 = re.exec(flight))) {
+      const id = Number(m2[1]);
+      const name = m2[2];
+      if (!isSaneId(id) || seen.has(id)) continue;
+      // skip junk article ids that aren't real subject cards
+      if (id < 50) continue;
+      seen.add(id);
+      out.push({
+        id: encodeThId(id),
+        name,
+        image_url: imgByName.get(name) || null,
+        year_id: yearId,
+        is_published: true,
+        _source: "thanawica",
+        _kind: subjectKind(name),
+        _thId: id
+      });
+    }
+  }
+
+  // Fixed map fallback
   if (!out.length) {
     const map = YEAR_SUBJECTS[yk] || YEAR_SUBJECTS[27];
-    out.push(
-      {
-        id: encodeThId(map.chemistry),
-        name: "كيمياء",
-        image_url: imgByName.get("كيمياء") || null,
+    const labels = {
+      arabic: "اللغة العربية",
+      english: "English",
+      chemistry: "كيمياء",
+      physics: "فيزياء",
+      math: "الرياضيات",
+      french: "اللغة الفرنسية",
+      german: "اللغة الألمانية",
+      abilities: "القدرات",
+      biology: "أحياء"
+    };
+    for (const [kind, sid] of Object.entries(map)) {
+      if (sid == null) continue;
+      out.push({
+        id: encodeThId(sid),
+        name: labels[kind] || kind,
+        image_url: imgByName.get(labels[kind] || "") || null,
         year_id: yearId,
         is_published: true,
         _source: "thanawica",
-        _kind: "chemistry",
-        _thId: map.chemistry
-      },
-      {
-        id: encodeThId(map.math),
-        name: "الرياضيات",
-        image_url: imgByName.get("الرياضيات") || null,
-        year_id: yearId,
-        is_published: true,
-        _source: "thanawica",
-        _kind: "math",
-        _thId: map.math
-      }
-    );
+        _kind: kind,
+        _thId: sid
+      });
+    }
   }
+
   cset(ck, out, 5 * 60_000);
   return out;
 }
@@ -642,8 +712,7 @@ export async function thLectures(chapterId) {
 
 /**
  * Resolve video source from a Thanawica video page.
- * Returns { kind: "hls", hash } أو { kind: "mp4", id }
- * (2027 غالبًا HLS مشفّر — 2026 وحديثًا MP4 موقّع على video.thanawica.com)
+ * Returns { kind: "youtube", youtubeId, url } | { kind: "hls", hash } | { kind: "mp4", id }
  */
 export async function thResolveVideo(lectureId, videoPageId) {
   const lec = Number(lectureId);
@@ -654,6 +723,20 @@ export async function thResolveVideo(lectureId, videoPageId) {
   await ensureLogin();
   const vhtml = await getHtml(`/lectures/${lec}/videos/${vid}`);
   const vf = extractFlight(vhtml) + "\n" + vhtml;
+
+  // يوتيوب (embed / watch / nocookie) — قبل HLS/MP4
+  const yt =
+    vf.match(/(?:youtube(?:-nocookie)?\.com\/(?:embed\/|watch\?[^"'\s]*v=)|youtu\.be\/)([A-Za-z0-9_-]{6,})/i);
+  if (yt) {
+    const youtubeId = yt[1];
+    const out = {
+      kind: "youtube",
+      youtubeId,
+      url: "https://www.youtube.com/watch?v=" + youtubeId
+    };
+    cset(ck, out, 10 * 60_000);
+    return out;
+  }
 
   const pm = vf.match(/\/api\/stream\/playlist\/([a-f0-9]{16,})/i);
   if (pm) {
@@ -676,6 +759,12 @@ export async function thResolveVideo(lectureId, videoPageId) {
 export async function thResolvePlaylistHash(lectureId, videoPageId) {
   const src = await thResolveVideo(lectureId, videoPageId);
   if (src.kind === "hls") return src.hash;
+  if (src.kind === "youtube") {
+    const e = new Error("الفيديو ده على يوتيوب");
+    e.status = 400;
+    e.youtube = src;
+    throw e;
+  }
   throw new Error("الفيديو ده MP4 مش playlist — استخدم thResolveVideo");
 }
 
@@ -796,7 +885,12 @@ export async function thLectureContent(lectureId) {
     if (v._playlistHash || v._mp4Id) continue;
     try {
       const src = await thResolveVideo(th, v._videoPageId);
-      if (src.kind === "hls") {
+      if (src.kind === "youtube") {
+        v._kind = "youtube";
+        v._youtubeId = src.youtubeId;
+        v.youtube_url = src.url;
+        v.type = "youtube";
+      } else if (src.kind === "hls") {
         v._playlistHash = src.hash;
         v._kind = "hls";
       } else if (src.kind === "mp4") {
@@ -808,9 +902,13 @@ export async function thLectureContent(lectureId) {
     }
   }
 
-  // Prefer playable ids: thp_<hash> (HLS) أو thm_<id> (MP4) — مت downstreamش الاسم الحقيقي
+  // Prefer playable ids: thp_ HLS | thm_ MP4 | thy_ YouTube
   for (const v of videos) {
-    if (v._playlistHash) {
+    if (v._kind === "youtube" && v._youtubeId) {
+      v.id = `thy_${v._youtubeId}`;
+      v.youtube_url = v.youtube_url || ("https://www.youtube.com/watch?v=" + v._youtubeId);
+      v.type = "youtube";
+    } else if (v._playlistHash) {
       v.id = `thp_${v._playlistHash}`;
     } else if (v._mp4Id) {
       v.id = `thm_${v._mp4Id}`;
@@ -903,6 +1001,16 @@ export async function thLectureContent(lectureId) {
 
 // ─── Stream: playlist + WASM decrypt ─────────────────────────
 let wasmApi = null;
+// قفل لكل slot — يمنع تداخل storeKey/decrypt بين فيديوهات متزامنة
+const slotLocks = new Map(); // slot -> Promise
+function withSlotLock(slot, fn) {
+  const prev = slotLocks.get(slot) || Promise.resolve();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  slotLocks.set(slot, prev.then(() => gate));
+  return prev.then(fn).finally(() => release());
+}
+
 
 async function loadWasm() {
   if (wasmApi) return wasmApi;
@@ -1019,10 +1127,17 @@ export async function thGetVideoSource(playlistHash, { sidToken = "__SID__" } = 
   if (!xkm || !xks) throw new Error("Thanawica playlist missing x-km/x-ks");
   const km = JSON.parse(Buffer.from(xkm, "base64").toString("utf8"));
   const sessionKey = hexToBytes(xks);
-  // use first key entry
-  const keyName = Object.keys(km)[0];
-  const mapKey = hexToBytes(km[keyName]);
-  api.storeKey(0, mapKey, sessionKey);
+  // كل مفاتيح الـ map (مش أول واحد بس) — بعض الفيديوهات بتستخدم أكتر من مفتاح
+  const allMapKeys = Object.entries(km).map(([name, hex]) => ({
+    name,
+    bytes: hexToBytes(hex)
+  }));
+  if (!allMapKeys.length) throw new Error("Thanawica playlist empty key map");
+
+  // slot مخصص لكل playlist عشان فيديوهات متزامنة متدوسش على بعض
+  let slot = 0;
+  for (let i = 0; i < playlistHash.length; i++) slot = (slot + playlistHash.charCodeAt(i) * (i + 1)) % 16;
+  api.storeKey(slot, allMapKeys[0].bytes, sessionKey);
 
   const mediaText = await mediaRes.text();
   const lines = mediaText.split(/\r?\n/);
@@ -1062,25 +1177,64 @@ export async function thGetVideoSource(playlistHash, { sidToken = "__SID__" } = 
     outLines.push(line);
   }
 
+  /** هل البافر يبدأ كـ MPEG-TS صالح؟ */
+  function looksLikeTS(buf) {
+    if (!buf || buf.length < 188) return false;
+    if (buf[0] === 0x47 && buf.length >= 376 && buf[188] === 0x47) return true;
+    // بعد fixTS ممكن الـ sync يتزاح
+    const limit = Math.min(buf.length - 376, 2048);
+    for (let r = 0; r <= limit; r++) {
+      if (buf[r] === 0x47 && buf[r + 188] === 0x47) return true;
+    }
+    return false;
+  }
+
+  function decryptWithKey(mapKeyBytes, cipherBuf, ivHex) {
+    api.storeKey(slot, mapKeyBytes, sessionKey);
+    const padded = new Uint8Array(210 + cipherBuf.length);
+    padded.set(cipherBuf instanceof Uint8Array ? cipherBuf : new Uint8Array(cipherBuf), 210);
+    const iv = hexToBytes(ivHex || "0".repeat(32));
+    const plain = api.decrypt(slot, padded, iv);
+    return fixTS(plain);
+  }
+
   return {
     mode: "thanawica",
     videoId: playlistHash,
     playlist: outLines.join("\n"),
-    plainKey: Buffer.from("thanawica"), // marker — real key inside wasm slot 0
+    plainKey: Buffer.from("thanawica"), // marker — المفتاح الحقيقي جوه WASM
     defaultIv: null,
     segs,
     mediaSeq,
-    // يسمح لـ allowedStreamUrl بقبول روابط thanawica.com للمقاطع
     allowedHosts: new Set(["thanawica.com", "www.thanawica.com"]),
     streamUrl: BASE + "/",
-    thMeta: { playlistHash, quality, xkv, keyName },
-    _thWasmSlot: 0,
+    thMeta: {
+      playlistHash,
+      quality,
+      xkv,
+      keyName: allMapKeys[0].name,
+      keyCount: allMapKeys.length
+    },
+    _thWasmSlot: slot,
     _thDecrypt: async (cipherBuf, ivHex) => {
-      const padded = new Uint8Array(210 + cipherBuf.length);
-      padded.set(cipherBuf instanceof Uint8Array ? cipherBuf : new Uint8Array(cipherBuf), 210);
-      const iv = hexToBytes(ivHex || "0".repeat(32));
-      const plain = api.decrypt(0, padded, iv);
-      return fixTS(plain);
+      return withSlotLock(slot, async () => {
+        // جرّب كل مفتاح لحد ما يطلع TS سليم
+        let last = null;
+        for (const k of allMapKeys) {
+          try {
+            const plain = decryptWithKey(k.bytes, cipherBuf, ivHex);
+            last = plain;
+            if (looksLikeTS(plain)) return plain;
+          } catch (e) {
+            last = null;
+          }
+        }
+        if (last) {
+          console.warn("[thanawica] decrypt no valid TS for", playlistHash, "keys", allMapKeys.length);
+          return last;
+        }
+        throw new Error("فشل فك تشفير مقطع ثناويكا");
+      });
     }
   };
 }
