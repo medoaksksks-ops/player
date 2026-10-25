@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.6-coursatk-like-small";
+const APP_VERSION = "v1.7-cplay";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -1641,19 +1641,10 @@ function allowedStreamUrl(raw, session = null) {
 function hostOf(u) {
   try { return new URL(u).hostname; } catch { return ""; }
 }
-
-/** CDN media hosts — query token only, NEVER Authorization (matches working small server) */
 function isMediaSegmentHost(urlOrHost) {
-  const h = String(urlOrHost || "");
-  return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(h);
+  return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(String(urlOrHost || ""));
 }
 
-/**
- * Upstream fetch — same rules as server-2-2 (working Coursatk proxy):
- * - stream-weave / coursatek API: Bearer token
- * - floravon / c-cdn / cloudfront: NO Authorization
- * - forward browser sec-ch-* when available
- */
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
@@ -1665,13 +1656,10 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
-
-  // Master/key on api.stream-weave.com NEED Authorization.
-  // Media segments on floravon / c-cdn / cloudfront must NOT get Authorization.
+  // مثل السيرفر الصغير: CDN بدون Authorization
   if (!isMediaSegmentHost(url) && session?.token) {
     headers.Authorization = `Bearer ${session.token}`;
   }
-
   for (const name of [
     "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
     "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
@@ -1681,7 +1669,6 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  // Hard guarantee: never leak Authorization to CDN
   if (isMediaSegmentHost(url)) delete headers.Authorization;
 
   const hasRange = Boolean(headers.Range || headers.range);
@@ -1704,7 +1691,7 @@ app.use(
     max: 1500,
     windowMs: 60_000,
     scope: "global",
-    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health"
+    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/cplay/") || req.path.startsWith("/api/hls/") || req.path === "/health"
   })
 );
 app.use(
@@ -2759,7 +2746,7 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       });
     }
 
-    // ── كورساتك HLS: نفس مسار السيرفر الصغير (server-2-2) ──
+    // كورساتك → مسار cplay (زي السيرفر الصغير)
     if (src.mode !== "thanawica" && src.streamUrl && src.token) {
       const id = crypto.randomUUID();
       streamSessions.set(id, {
@@ -2781,13 +2768,13 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
         data: {
           session: id,
           video_id: src.videoId,
-          manifest_url: `/api/stream/manifest/${id}`,
-          play_url: `/api/stream/manifest/${id}`
+          manifest_url: `/api/cplay/manifest/${id}`,
+          play_url: `/api/cplay/manifest/${id}`
         }
       });
     }
 
-    // ── ثناويكا / باقي المصادر: مسار /api/hls ──
+    // ثناويكا وغيرها → /api/hls
     const id = crypto.randomUUID().replace(/-/g, "");
     const streamKey = crypto.randomBytes(16).toString("hex");
     const deviceId =
@@ -2877,6 +2864,154 @@ function playlistBodyFromSession(session) {
   }
   return body;
 }
+
+
+// ═══════════════════════════════════════════════════════════
+// COURSATK PLAY (server-2-2 flow) — /api/cplay/* (not locked 410 paths)
+// ═══════════════════════════════════════════════════════════
+function getCoursatkStreamSession(id) {
+  const s = streamSessions.get(id);
+  if (!s || s.kind !== "coursatk-stream") return null;
+  s.lastUsed = now();
+  return s;
+}
+
+async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  let mediaSeq = 0;
+  let currentIv = null;
+  let keyFetched = false;
+  for (const raw of lines) {
+    const tline = raw.trim();
+    if (tline.startsWith("#EXT-X-MEDIA-SEQUENCE:")) mediaSeq = Number(tline.split(":")[1]) || 0;
+  }
+  let seq = mediaSeq;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith("#EXT-X-KEY:")) {
+      const uri = line.match(/URI="([^"]+)"/)?.[1];
+      const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
+      if (ivHex) currentIv = parseIvHex(ivHex);
+      if (uri && !keyFetched) {
+        const keyUrl = new URL(uri, baseUrl).href;
+        try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        if (!keyRes.ok) throw new Error(`Key HTTP ${keyRes.status}`);
+        const wrapped = Buffer.from(await keyRes.arrayBuffer());
+        session.plainKey = await unwrapKey(wrapped, session.videoId);
+        session.defaultIv = currentIv;
+        keyFetched = true;
+        console.log("[key] cplay for", session.videoId);
+      }
+      continue;
+    }
+    if (line && !line.startsWith("#")) {
+      const segmentUrl = new URL(line, baseUrl).href;
+      try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
+      const iv = currentIv || ivFromMediaSequence(seq);
+      const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: iv.toString("hex"), s: seq }), "utf8").toString("base64url");
+      out.push(`/api/cplay/segment/${sessionId}/${payload}`);
+      seq++;
+      continue;
+    }
+    out.push(raw);
+  }
+  if (!session.plainKey) throw new Error("فشل تجهيز مفتاح التشفير");
+  res.set({
+    "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.send(out.join("\n"));
+}
+
+app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
+  try {
+    const session = getCoursatkStreamSession(req.params.sessionId);
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+
+    let master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    if (master.status === 401 && session.playId) {
+      try {
+        const data = await upstreamJson(`/video/${encodeURIComponent(session.playId)}/stream-weave/play`, {
+          method: "POST", headers: { Accept: "application/json" }
+        });
+        if (data?.data?.token) {
+          session.token = data.data.token;
+          session.streamUrl = data.data.stream_url || session.streamUrl;
+        }
+      } catch {}
+      master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    }
+    if (!master.ok) throw new Error(`Stream master HTTP ${master.status}`);
+    const masterText = await master.text();
+    const mLines = masterText.split(/\r?\n/);
+    let variant = null;
+    for (let i = 0; i < mLines.length; i++) {
+      if (mLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
+        const next = mLines[i + 1]?.trim();
+        if (next && !next.startsWith("#")) {
+          variant = new URL(next, session.streamUrl).href;
+          break;
+        }
+      }
+    }
+    if (variant) {
+      const variantRes = await streamFetch(session, variant, {}, req.headers);
+      if (!variantRes.ok) throw new Error(`Variant HTTP ${variantRes.status}`);
+      return rewriteCoursatkPlaylist(req.params.sessionId, session, await variantRes.text(), variant, res, req.headers);
+    }
+    return rewriteCoursatkPlaylist(req.params.sessionId, session, masterText, session.streamUrl, res, req.headers);
+  } catch (e) {
+    console.error("[cplay-manifest]", e.message);
+    return jsonError(res, 502, e.message || "فشل قائمة التشغيل");
+  }
+});
+
+app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
+  const session = getCoursatkStreamSession(req.params.sessionId);
+  if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+  if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+  if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح");
+
+  let meta;
+  try {
+    meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
+  } catch {
+    return jsonError(res, 400, "segment meta غير صالح");
+  }
+  const url = meta && meta.u;
+  if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
+  const iv = parseIvHex(meta.iv) || session.defaultIv || ivFromMediaSequence(meta.s || 0);
+  try {
+    const upstream = await streamFetch(session, url, { Range: req.headers.range || undefined }, req.headers);
+    if (!upstream.ok && upstream.status !== 206) {
+      let body = "";
+      try { body = (await upstream.text()).slice(0, 120); } catch {}
+      console.error("[cplay-seg]", upstream.status, hostOf(url), body.slice(0, 60));
+      throw new Error("Segment HTTP " + upstream.status);
+    }
+    const encrypted = Buffer.from(await upstream.arrayBuffer());
+    if (encrypted.length > CONFIG.MAX_PROXY_BYTES) return jsonError(res, 413, "المقطع كبير");
+    let plain;
+    try { plain = decryptSegment(encrypted, session.plainKey, iv); }
+    catch (e) { console.warn("[cplay-dec]", e.message); plain = encrypted; }
+    res.status(200);
+    res.set({
+      "Content-Type": "video/mp2t",
+      "Content-Length": String(plain.length),
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*"
+    });
+    res.send(plain);
+  } catch (e) {
+    if (!res.headersSent) jsonError(res, 502, e.message);
+    else res.end();
+  }
+});
+
 
 app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
   try {
@@ -3044,13 +3179,6 @@ app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
   }
 });
 
-// ── مسارات قديمة (مقفولة) — عشان محدش يستخدم الشكل اللي بيفضح البيانات ──
-app.get("/api/stream/manifest/:sessionId", (_req, res) => {
-  return jsonError(res, 410, "المسار لم يعد متاحًا");
-});
-app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
-  return jsonError(res, 410, "المسار لم يعد متاحًا");
-});
 
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
