@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v2.1-catalog-safe";
+const APP_VERSION = "v2.2-thanawica-no-coursatk";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -398,7 +398,8 @@ const CONFIG = {
   STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
   THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
-  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0",
+  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0", // الموقع من ثناويكا — مش محتاج توكن كورساتك
+  COURSATK_DISABLED: process.env.COURSATK_DISABLED !== "0", // افتراضي: كورساتك مقفول
   CODE_TYPES: {
     trial: { label: "تجربة", ms: 1 * 3600 * 1000 },
     month: { label: "شهر", ms: 30 * 24 * 3600 * 1000 },
@@ -1602,6 +1603,12 @@ function upTtl(apiPath) {
   return /\/lectures\/[^/]+\/content/.test(apiPath) ? 60_000 : 180_000;
 }
 async function upstreamJson(apiPath, options = {}) {
+  if (CONFIG.COURSATK_DISABLED) {
+    const err = new Error("كورساتك متوقف — المصدر ثناويكا فقط");
+    err.status = 503;
+    throw err;
+  }
+
   const isGet = !options.method || String(options.method).toUpperCase() === "GET";
   if (!isGet) return upstreamJsonRaw(apiPath, options);
   const hit = upCache.get(apiPath);
@@ -1976,100 +1983,65 @@ app.get("/api/config", requireStudent, async (req, res) => {
 /** شعب يحق لها رياضة ثناويكا (الكيمياء من كورساتك) — غير كده كورساتك فقط */
 const THANAWICA_ALLOWED_SECTIONS = new Set(["scientific_sciences", "scientific_math"]);
 function studentAllowsThanawica(student) {
-  return Boolean(student); // كل الشعب — ثناويكا
+  return Boolean(student);
+}
+
+function publicTeacher(t) {
+  if (!t || typeof t !== "object") return t;
+  return {
+    id: t.id,
+    name: t.name,
+    image_url: t.image_url || null,
+    subject_id: t.subject_id,
+    chapters_count: t.chapters_count ?? t.count ?? null,
+    count: t.chapters_count ?? t.count ?? null
+  };
+}
+function publicSubject(s) {
+  if (!s || typeof s !== "object") return s;
+  return {
+    id: s.id,
+    name: s.name,
+    image_url: s.image_url || s.icon || null,
+    icon: s.icon || null,
+    order_index: s.order_index,
+    year_id: s.year_id,
+    teacher_count: s.teacher_count ?? s.chapters_count ?? null,
+    is_published: true
+  };
 }
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     const yearId = resolveYearId(req.query.year || req.params.id || CONFIG.DEFAULT_YEAR_ID);
-    const secInfo = await resolveSection(req.student.section, yearId);
-    let wantedIds = [];
-    if (secInfo && Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
-      wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
+    if (!CONFIG.THANAWICA_ENABLED) {
+      return jsonError(res, 503, "ثناويكا غير مفعّلة على السيرفر");
     }
-    // log only when debugging: console.log("[subjects]", ...)
-
-    // 2) قائمة مواد السنة — كاش قوي + دمج الطلبات المتزامنة
-    const cacheKey = `subjects:year:${yearId}`;
-    let yearList = cacheGet(cacheKey);
-    let yearData = { success: true, message: "Success", data: yearList };
-    if (!yearList) {
-      yearData = await coalesce("up:subjects:" + yearId, () =>
-        upstreamJson(`/user/subjects/${encodeURIComponent(yearId)}`)
-      );
-      yearList = Array.isArray(yearData.data) ? yearData.data : [];
-      cacheSet(cacheKey, yearList, 15 * 60_000);
-    }
-    const byId = new Map(yearList.map((s) => [Number(s.id), s]));
-
-    // 3) If no section filter → return full year list
-    if (!wantedIds.length) {
-      return res.json({ ...yearData, data: yearList });
-    }
-
-    // 4) Resolve subjects — year list first, missing IDs in parallel via /teachers
-
-    async function resolveOne(sid) {
-      if (byId.has(sid)) return byId.get(sid);
-      const ck = `subj:meta:${sid}`;
-      const hit = cacheGet(ck);
-      if (hit) return hit;
-      try {
-        const t = await upstreamJson(`/user/subjects/${sid}/teachers`);
-        const d = t?.data;
-        const item = {
-          id: Number(d?.id) || sid,
-          name: d?.name || `مادة ${sid}`,
-          image_url: d?.image_url || null,
-          year_id: yearId,
-          is_published: true
-        };
-        cacheSet(ck, item, 20 * 60_000);
-        return item;
-      } catch (err) {
-        console.warn(`[subjects] resolve ${sid}:`, err.message);
-        return { id: sid, name: `مادة ${sid}`, image_url: null, year_id: yearId, is_published: true };
-      }
-    }
-
-    let results = await Promise.all(wantedIds.map((sid, idx) =>
-      resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))
-    ));
-
-    // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
-    // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
-    if (CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
-      try {
-        const thList = await thSubjectsForYear(yearId);
-        if (thList && thList.length) {
-          await loadCatalogOverrides();
-          results = applySubjectOverrides(thList, yearId);
-          console.log("[subjects] thanawica-only", { student: req.student.code, yearId, count: results.length });
-        }
-      } catch (e) {
-        console.warn("[subjects] thanawica", e.message);
-      }
-    }
-
-    res.json({
-      success: true,
-      message: "Success",
-      data: scrubSensitive(Array.isArray(results) ? results.map(publicSubject) : results)
+    // ثناويكا فقط — مفيش upstream كورساتك خالص
+    const thList = await thSubjectsForYear(yearId);
+    const results = (thList || []).map((s, i) => publicSubject({
+      ...s,
+      order_index: i + 1,
+      year_id: yearId
+    }));
+    console.log("[subjects] thanawica-only (no coursatk)", {
+      student: req.student.code,
+      yearId,
+      count: results.length
     });
+    res.json({ success: true, message: "Success", data: results });
   } catch (e) {
-    jsonError(res, 502, e.message);
+    console.error("[subjects]", e.message);
+    jsonError(res, 502, e.message || "فشل جلب المواد من ثناويكا");
   }
 });
 
 app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
   try {
-    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
-      const data = await thTeachers(req.params.id);
-      return res.json({ success: true, message: "Success", data });
-    }
-    res.json(
-      await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)
-    );
+    if (!isThId(req.params.id)) return jsonError(res, 404, "مادة غير موجودة (ثناويكا فقط)");
+    const data = await thTeachers(req.params.id);
+    const list = Array.isArray(data) ? data.map(publicTeacher) : data;
+    return res.json({ success: true, message: "Success", data: list });
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2077,13 +2049,9 @@ app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
 
 app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
   try {
-    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
-      const data = await thChapters(req.params.id);
-      return res.json({ success: true, message: "Success", data });
-    }
-    res.json(
-      await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)
-    );
+    if (!isThId(req.params.id)) return jsonError(res, 404, "مدرس غير موجود (ثناويكا فقط)");
+    const data = await thChapters(req.params.id);
+    return res.json({ success: true, message: "Success", data });
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2091,13 +2059,9 @@ app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
 
 app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
   try {
-    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
-      const data = await thLectures(req.params.id);
-      return res.json({ success: true, message: "Success", data });
-    }
-    res.json(
-      await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)
-    );
+    if (!isThId(req.params.id)) return jsonError(res, 404, "فصل غير موجود (ثناويكا فقط)");
+    const data = await thLectures(req.params.id);
+    return res.json({ success: true, message: "Success", data });
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2105,12 +2069,16 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
-    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
-      return res.json(await thLectureContent(req.params.id));
+    if (!isThId(req.params.id)) return jsonError(res, 404, "محاضرة غير موجودة (ثناويكا فقط)");
+    const data = await thLectureContent(req.params.id);
+    // امسح أي حقول حسّاسة لو موجودة
+    if (data && typeof data === "object") {
+      const d = data.data || data;
+      if (d && typeof d === "object") {
+        delete d.token; delete d.cookies; delete d.stream_url; delete d.streamUrl;
+      }
     }
-    res.json(
-      await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
-    );
+    return res.json(data);
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2969,226 +2937,6 @@ app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
 // ═══════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════
-// CATALOG CACHE (Firebase) — صور/أيقونات يدوية + تحديث يدوي فقط
-// مفيش توكن/كوكيز ثناويكا بتتشال للعميل أبدًا
-// ═══════════════════════════════════════════════════════════
-const catalogMem = { subjects: {}, meta: {}, at: 0 };
-
-function publicSubject(s) {
-  if (!s || typeof s !== "object") return s;
-  return {
-    id: s.id,
-    name: s.name,
-    image_url: s.image_url || s.icon || null,
-    icon: s.icon || null,
-    order_index: s.order_index,
-    year_id: s.year_id,
-    teacher_count: s.teacher_count ?? s.chapters_count ?? null,
-    is_published: true
-  };
-}
-function publicTeacher(t) {
-  if (!t || typeof t !== "object") return t;
-  return {
-    id: t.id,
-    name: t.name,
-    image_url: t.image_url || t.icon || null,
-    icon: t.icon || null,
-    subject_id: t.subject_id,
-    chapters_count: t.chapters_count ?? t.count ?? null,
-    count: t.chapters_count ?? t.count ?? null
-  };
-}
-function publicChapter(c) {
-  if (!c || typeof c !== "object") return c;
-  return {
-    id: c.id,
-    name: c.name,
-    image_url: c.image_url || c.icon || null,
-    icon: c.icon || null,
-    lecture_count: c.lecture_count ?? null,
-    teacher_name: c.teacher_name || null
-  };
-}
-function publicLecture(l) {
-  if (!l || typeof l !== "object") return l;
-  return {
-    id: l.id,
-    name: l.name || l.title,
-    title: l.title || l.name,
-    image_url: l.image_url || l.icon || null,
-    icon: l.icon || null,
-    video_count: l.video_count ?? null,
-    pdf_count: l.pdf_count ?? null
-  };
-}
-
-/** يشيل أي حقول حسّاسة قبل ما الرد يخرج */
-function scrubSensitive(obj, depth) {
-  depth = depth || 0;
-  if (depth > 8 || obj == null) return obj;
-  if (Array.isArray(obj)) return obj.map((x) => scrubSensitive(x, depth + 1));
-  if (typeof obj !== "object") return obj;
-  const ban = /^(token|cookies?|plainKey|streamUrl|stream_url|Authorization|student_session|student_device|sessionToken|ownerToken|wrapped|decrypt|_thDecrypt|sk)$/i;
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (ban.test(k)) continue;
-    if (k.startsWith("_") && k !== "_kind") continue; // _thId داخلي — متبعتش
-    out[k] = scrubSensitive(v, depth + 1);
-  }
-  return out;
-}
-
-async function loadCatalogOverrides() {
-  try {
-    const remote = (await fbGet("catalog")) || {};
-    catalogMem.subjects = remote.subjects || {};
-    catalogMem.meta = remote.meta || {};
-    catalogMem.at = Date.now();
-    return catalogMem;
-  } catch (e) {
-    console.warn("[catalog] load", e.message);
-    return catalogMem;
-  }
-}
-
-function applySubjectOverrides(list, yearId) {
-  const map = catalogMem.subjects || {};
-  return (list || []).map((s, i) => {
-    const key = String(s.id);
-    const o = map[key] || map["th:" + (s._thId || "")] || {};
-    return publicSubject({
-      ...s,
-      name: o.name || s.name,
-      image_url: o.image_url || o.icon || s.image_url || null,
-      icon: o.icon || null,
-      order_index: o.order_index != null ? o.order_index : (s.order_index || i + 1),
-      year_id: yearId
-    });
-  });
-}
-
-// ── Admin: كتالوج ثناويكا ─────────────────────────────────
-app.get("/api/admin/catalog", requireAdmin("sections_manage"), async (req, res) => {
-  try {
-    await loadCatalogOverrides();
-    const yearId = Number(req.query.year || 26);
-    let subjects = [];
-    try {
-      if (CONFIG.THANAWICA_ENABLED) {
-        const th = await thSubjectsForYear(yearId);
-        subjects = applySubjectOverrides(th, yearId);
-      }
-    } catch (e) {
-      console.warn("[admin/catalog]", e.message);
-    }
-    // overrides list even without live fetch
-    const overrides = catalogMem.subjects || {};
-    res.json(scrubSensitive({
-      success: true,
-      data: {
-        yearId,
-        refreshedAt: (catalogMem.meta && catalogMem.meta.refreshedAt) || null,
-        subjects,
-        overrides,
-        icons: [
-          "book", "flask", "atom", "calculator", "language", "globe",
-          "leaf", "microscope", "pencil", "star", "video", "graduation"
-        ]
-      }
-    }));
-  } catch (e) {
-    jsonError(res, 500, e.message);
-  }
-});
-
-/** تحديث يدوي من ثناويكا — مش تلقائي */
-app.post("/api/admin/catalog/refresh", requireAdmin("sections_manage"), async (req, res) => {
-  try {
-    const yearId = Number((req.body && req.body.yearId) || req.query.year || 26);
-    if (!CONFIG.THANAWICA_ENABLED) return jsonError(res, 400, "ثناويكا غير مفعّلة");
-
-    const thList = await thSubjectsForYear(yearId);
-    await loadCatalogOverrides();
-    const subjects = catalogMem.subjects || {};
-    let added = 0;
-    for (const s of thList) {
-      const key = String(s.id);
-      if (!subjects[key]) {
-        subjects[key] = {
-          id: s.id,
-          thId: s._thId,
-          name: s.name,
-          image_url: s.image_url || null,
-          icon: null,
-          yearId,
-          updatedAt: Date.now()
-        };
-        added++;
-      } else {
-        // حدّث الاسم بس — متلمسش صورة الأدمن
-        subjects[key].name = s.name || subjects[key].name;
-        subjects[key].thId = s._thId;
-        subjects[key].yearId = yearId;
-      }
-    }
-    const meta = {
-      ...(catalogMem.meta || {}),
-      refreshedAt: Date.now(),
-      lastYearId: yearId,
-      count: Object.keys(subjects).length
-    };
-    await fbSet("catalog/subjects", subjects);
-    await fbSet("catalog/meta", meta);
-    catalogMem.subjects = subjects;
-    catalogMem.meta = meta;
-    catalogMem.at = Date.now();
-    // امسح كاش قوائم المواد في الذاكرة لو موجود
-    try {
-      if (typeof sourceCache !== "undefined" && sourceCache.clear) sourceCache.clear();
-    } catch {}
-    res.json({
-      success: true,
-      message: "تم التحديث من ثناويكا",
-      data: { added, total: Object.keys(subjects).length, refreshedAt: meta.refreshedAt }
-    });
-  } catch (e) {
-    console.error("[catalog/refresh]", e);
-    jsonError(res, 500, e.message || "فشل التحديث");
-  }
-});
-
-/** حفظ صورة/أيقونة/اسم لمادة */
-app.put("/api/admin/catalog/subject/:id", requireAdmin("sections_manage"), async (req, res) => {
-  try {
-    const id = String(req.params.id);
-    await loadCatalogOverrides();
-    const subjects = catalogMem.subjects || {};
-    const prev = subjects[id] || { id: Number(id) || id };
-    const body = req.body || {};
-    const next = {
-      ...prev,
-      id: prev.id || id,
-      name: body.name != null ? String(body.name).trim() : prev.name,
-      image_url: body.image_url != null ? String(body.image_url).trim() || null : prev.image_url,
-      icon: body.icon != null ? String(body.icon).trim() || null : prev.icon,
-      order_index: body.order_index != null ? Number(body.order_index) : prev.order_index,
-      updatedAt: Date.now()
-    };
-    subjects[id] = next;
-    await fbSet("catalog/subjects/" + id.replace(/[.#$\[\]]/g, "_"), next);
-    // also full write for consistency
-    await fbSet("catalog/subjects", subjects);
-    catalogMem.subjects = subjects;
-    res.json({ success: true, data: next });
-  } catch (e) {
-    jsonError(res, 500, e.message);
-  }
-});
-
-
 app.post("/api/admin/login", rateLimit({ max: 10, windowMs: 60_000, scope: "admin-login", banAfter: 3, banMs: 15 * 60_000 }), async (req, res) => {
   try {
     const username = String(req.body?.username || "").trim();
@@ -4852,22 +4600,22 @@ await loadDecryptionUtils();
 try {
   if (CONFIG.THANAWICA_ENABLED) {
     try {
-      const fs = require("fs");
-      const path = require("path");
       const cookieFile = path.join(__dirname, "thanawica_cookies.txt");
       if (fs.existsSync(cookieFile)) {
         process.env.THANAWICA_COOKIES = fs.readFileSync(cookieFile, "utf8").trim();
         console.log("[thanawica] cookies loaded from file");
       }
     } catch (e) {}
-  }
-  if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
-    await loadMaintenanceFromFirebase();
-    await thanawicaLogin(CONFIG.THANAWICA_CODE);
-    console.log("[API] Thanawica hybrid ON — chemistry/math from thanawica.com");
+    await loadMaintenanceFromFirebase().catch(() => {});
+    try {
+      await thanawicaLogin(CONFIG.THANAWICA_CODE || process.env.THANAWICA_CODE || "");
+      console.log("[API] Thanawica ONLY — Coursatk catalog disabled");
+    } catch (e) {
+      console.warn("[API] Thanawica session:", e.message);
+    }
   }
 } catch (e) {
-  console.warn("[API] Thanawica login skipped:", e.message);
+  console.warn("[API] Thanawica boot:", e.message);
 }
 
 // Load site packages/agents from Firebase if configured
