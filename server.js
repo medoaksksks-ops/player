@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.3-cdn-fallback";
+const APP_VERSION = "v1.4-weave-first";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -1641,33 +1641,8 @@ function allowedStreamUrl(raw, session = null) {
 function hostOf(u) {
   try { return new URL(u).hostname; } catch { return ""; }
 }
-
-/** CDN hosts that reject Authorization + often block datacenter IPs */
 function isMediaCdnHost(host) {
   return /(?:^|\.)(floravon\.(?:online|shop)|c-cdn\.online|cloudfront\.shop)$/i.test(host || "");
-}
-
-/** Build api.stream-weave.com fallbacks from a floravon/c-cdn segment URL */
-function streamWeaveFallbacks(segmentUrl, videoId) {
-  const out = [];
-  try {
-    const u = new URL(segmentUrl);
-    const parts = u.pathname.split("/").filter(Boolean);
-    const vi = parts.indexOf("videos");
-    if (vi < 0 || !parts[vi + 1]) return out;
-    const vid = parts[vi + 1];
-    let rest = parts.slice(vi + 2); // quality/.../file or stream/quality/file
-    if (!rest.length) return out;
-    if (rest[0] === "stream") rest = rest.slice(1);
-    const pathRest = rest.join("/");
-    out.push(`https://api.stream-weave.com/videos/${vid}/stream/${pathRest}`);
-    out.push(`https://api.stream-weave.com/videos/${vid}/${pathRest}`);
-    // drop query on purpose — stream-weave uses Bearer
-  } catch {}
-  if (videoId && !out.length) {
-    // last resort if URL unparseable
-  }
-  return out;
 }
 
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
@@ -1690,10 +1665,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
     Priority: "u=1, i"
   };
-  // CDN: never Authorization. stream-weave / coursatek: Bearer
-  if (!isCdn && session?.token) {
-    headers.Authorization = `Bearer ${session.token}`;
-  }
+  if (!isCdn && session?.token) headers.Authorization = `Bearer ${session.token}`;
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
@@ -2087,7 +2059,6 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
     // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
     // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
-    // 2026 من كورساتك فقط
     if (yearId !== 3 && CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
       try {
         const thList = await thSubjectsForYear(yearId);
@@ -2271,9 +2242,31 @@ async function buildPlaylist(src, masterText, clientHeaders) {
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
       const ivHex = iv.toString("hex");
-      // مسار معتم: رقم المقطع فقط — مفيش روابط أبلستريم ولا base64 ظاهر للعميل
+      // Preferred: api.stream-weave.com (Railway IP not blocked) — CDN as fallback
+      const fileName = (line.split("?")[0].split("/").pop() || "").trim();
+      let quality = "480";
+      try {
+        const bm = String(baseUrl || "").match(/\/stream\/(\d{3,4})\//) ||
+                   String(baseUrl || "").match(/\/(\d{3,4})\/(?:index|playlist|seg)/i) ||
+                   String(segmentUrl).match(/\/(?:stream\/)?(\d{3,4})\/seg/i);
+        if (bm) quality = bm[1];
+      } catch {}
+      let weaveUrl = null;
+      if (src.videoId && fileName) {
+        weaveUrl = `https://api.stream-weave.com/videos/${src.videoId}/stream/${quality}/${fileName}`;
+        try { src.allowedHosts.add("api.stream-weave.com"); } catch {}
+      }
       out.push(`/api/hls/${SID_TOKEN}/seg/${segIndex}`);
-      segs.push({ u: segmentUrl, iv: ivHex, s: seq, i: segIndex });
+      segs.push({
+        u: weaveUrl || segmentUrl, // try weave first
+        uCdn: segmentUrl,
+        uWeave: weaveUrl,
+        iv: ivHex,
+        s: seq,
+        i: segIndex,
+        q: quality,
+        f: fileName
+      });
       segIndex++;
       continue;
     }
@@ -2931,38 +2924,52 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
       return plain;
     }
 
-    let up = await streamFetch(session.src, url, {}, headers);
-    if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
+    // Order: weave (Bearer, works on Railway) → CDN (query token, often CF-blocked) → refresh
+    const candidates = [];
+    const pushU = (u) => { if (u && !candidates.includes(u)) candidates.push(u); };
+    pushU(meta.uWeave);
+    pushU(url);
+    pushU(meta.u);
+    pushU(meta.uCdn);
+    // reconstruct weave if missing
+    if (session.src?.videoId && meta.f) {
+      pushU(`https://api.stream-weave.com/videos/${session.src.videoId}/stream/${meta.q || "480"}/${meta.f}`);
+    }
+
+    let up = null;
+    let lastStatus = 0;
+    for (const cand of candidates) {
+      try {
+        try { session.src.allowedHosts.add(new URL(cand).hostname); } catch {}
+        up = await streamFetch(session.src, cand, {}, headers);
+        lastStatus = up.status;
+        if (up.ok || up.status === 206) {
+          if (cand !== url) console.log("[seg] ok via", hostOf(cand));
+          break;
+        }
+        console.warn("[seg] fail", up.status, hostOf(cand));
+      } catch (e) {
+        console.warn("[seg] err", hostOf(cand), e.message);
+      }
+    }
+    if ((!up || !up.ok) && Number.isFinite(meta.s)) {
       try {
         const fresh = await refreshSource(session);
         const fu = fresh && fresh.segs[meta.s - (fresh.mediaSeq || 0)];
-        if (fu?.u) up = await streamFetch(fresh, fu.u, {}, headers);
-      } catch (e) {
-        console.warn("[seg] refreshSource", e.message);
-      }
-    }
-    // CDN blocked (Cloudflare on Railway IP) → try api.stream-weave.com with Bearer
-    if (!up.ok && (up.status === 403 || up.status === 401 || up.status === 502)) {
-      const alts = streamWeaveFallbacks(url, session.src?.videoId);
-      for (const alt of alts) {
-        try {
-          // ensure host allowed
-          try { session.src.allowedHosts.add(new URL(alt).hostname); } catch {}
-          const up2 = await streamFetch(session.src, alt, {}, headers);
-          if (up2.ok || up2.status === 206) {
-            console.log("[seg] weave-fallback ok", hostOf(alt));
-            up = up2;
-            break;
+        if (fu) {
+          for (const cand of [fu.uWeave, fu.u, fu.uCdn].filter(Boolean)) {
+            try { session.src.allowedHosts.add(new URL(cand).hostname); } catch {}
+            up = await streamFetch(fresh, cand, {}, headers);
+            if (up.ok || up.status === 206) break;
           }
-          console.warn("[seg] weave-fallback", up2.status, hostOf(alt));
-        } catch (e) {
-          console.warn("[seg] weave-fallback err", e.message);
         }
+      } catch (e) {
+        console.warn("[seg] refresh", e.message);
       }
     }
-    if (!up.ok) {
-      console.error("[seg-upstream]", up.status, hostOf(url));
-      throw new Error(`Segment HTTP ${up.status}`);
+    if (!up || (!up.ok && up.status !== 206)) {
+      console.error("[seg-upstream]", lastStatus || (up && up.status), hostOf(url));
+      throw new Error(`Segment HTTP ${lastStatus || (up && up.status) || 502}`);
     }
 
     const encrypted = Buffer.from(await up.arrayBuffer());
