@@ -79,23 +79,15 @@ function resolveThanawicaCode(explicit) {
 
 /** Year on Thanawica → subject ids for chem + math (scientific tracks) */
 const YEAR_SUBJECTS = {
-  // year key on thanawica URL /years/27 or /years/26 — ids verified 2026-10-25
-  // ملاحظة: أحياء غير ظاهرة على حساب العينة لسنة 26
-  27: {
-    arabic: 150, english: 152, chemistry: 154, physics: 156, math: 160
-  },
-  26: {
-    arabic: 101, english: 104, chemistry: 111, physics: 114, math: 121,
-    french: 128, german: 130, abilities: 174
-  }
+  27: { arabic: 150, english: 152, chemistry: 154, physics: 156, math: 160 },
+  26: { arabic: 101, english: 104, chemistry: 111, physics: 114, math: 121, french: 128, german: 130, abilities: 174 }
 };
-
 const NAME_CHEM = /كيمياء|chemistry/i;
 const NAME_MATH = /رياض|math|جبر|تفاضل|إحصاء|استاتيكا|ديناميكا/i;
 const NAME_PHYS = /فيزياء|physics/i;
 const NAME_AR = /عربي|عربية|arabic/i;
 const NAME_EN = /english|إنجل|انجليز/i;
-const NAME_BIO = /أحياء|احياء|حيه|biology/i;
+const NAME_BIO = /أحياء|احياء|biology/i;
 const NAME_FR = /فرنس|french/i;
 const NAME_DE = /ألمان|المان|german/i;
 
@@ -460,11 +452,9 @@ export function subjectKind(name) {
   if (NAME_DE.test(s)) return "german";
   return "other";
 }
-
 export function chemMathKind(name) {
   const k = subjectKind(name);
-  if (k === "chemistry" || k === "math") return k;
-  return null;
+  return (k === "chemistry" || k === "math") ? k : null;
 }
 
 /** Encode Thanawica numeric id so it never collides with Coursatk ids */
@@ -501,7 +491,7 @@ async function getHtml(urlPath) {
   return await res.text();
 }
 
-/** All subjects for a year from Thanawica (not just chem/math) */
+/** All subjects for a year from Thanawica */
 export async function thSubjectsForYear(yearId) {
   const yk = mapYearKey(yearId);
   const ck = `subj:all:${yk}`;
@@ -512,8 +502,6 @@ export async function thSubjectsForYear(yearId) {
   const imgByName = parseImageByName(flight);
   const out = [];
   const seen = new Set();
-
-  // Ordered: alt then href /subjects/ID (RSC flight pattern)
   const events = [];
   const evRe = /alt":"([^"]+)"|href":"\/subjects\/(\d+)"/g;
   let em;
@@ -523,85 +511,29 @@ export async function thSubjectsForYear(yearId) {
   }
   let lastAlt = null;
   for (const ev of events) {
-    if (ev.type === "alt") {
-      lastAlt = ev.v;
-      continue;
-    }
+    if (ev.type === "alt") { lastAlt = ev.v; continue; }
     if (ev.type === "href" && lastAlt) {
       const id = ev.v;
-      if (!isSaneId(id) || seen.has(id)) {
-        lastAlt = null;
-        continue;
-      }
+      if (!isSaneId(id) || seen.has(id)) { lastAlt = null; continue; }
       seen.add(id);
       const name = lastAlt;
       out.push({
-        id: encodeThId(id),
-        name,
+        id: encodeThId(id), name,
         image_url: imgByName.get(name) || null,
-        year_id: yearId,
-        is_published: true,
-        _source: "thanawica",
-        _kind: subjectKind(name),
-        _thId: id
+        year_id: yearId, is_published: true,
+        _source: "thanawica", _kind: subjectKind(name), _thId: id
       });
       lastAlt = null;
     }
   }
-
-  // Fallback: article blocks
-  if (!out.length) {
-    const re = /article","(\d+)"[\s\S]{0,1500}?alt":"([^"]+)"/g;
-    let m2;
-    while ((m2 = re.exec(flight))) {
-      const id = Number(m2[1]);
-      const name = m2[2];
-      if (!isSaneId(id) || seen.has(id)) continue;
-      // skip junk article ids that aren't real subject cards
-      if (id < 50) continue;
-      seen.add(id);
-      out.push({
-        id: encodeThId(id),
-        name,
-        image_url: imgByName.get(name) || null,
-        year_id: yearId,
-        is_published: true,
-        _source: "thanawica",
-        _kind: subjectKind(name),
-        _thId: id
-      });
-    }
-  }
-
-  // Fixed map fallback
   if (!out.length) {
     const map = YEAR_SUBJECTS[yk] || YEAR_SUBJECTS[27];
-    const labels = {
-      arabic: "اللغة العربية",
-      english: "English",
-      chemistry: "كيمياء",
-      physics: "فيزياء",
-      math: "الرياضيات",
-      french: "اللغة الفرنسية",
-      german: "اللغة الألمانية",
-      abilities: "القدرات",
-      biology: "أحياء"
-    };
+    const labels = { arabic: "اللغة العربية", english: "English", chemistry: "كيمياء", physics: "فيزياء", math: "الرياضيات", french: "اللغة الفرنسية", german: "اللغة الألمانية", abilities: "القدرات", biology: "أحياء" };
     for (const [kind, sid] of Object.entries(map)) {
       if (sid == null) continue;
-      out.push({
-        id: encodeThId(sid),
-        name: labels[kind] || kind,
-        image_url: imgByName.get(labels[kind] || "") || null,
-        year_id: yearId,
-        is_published: true,
-        _source: "thanawica",
-        _kind: kind,
-        _thId: sid
-      });
+      out.push({ id: encodeThId(sid), name: labels[kind] || kind, image_url: null, year_id: yearId, is_published: true, _source: "thanawica", _kind: kind, _thId: sid });
     }
   }
-
   cset(ck, out, 5 * 60_000);
   return out;
 }

@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v2.0-thanawica-only";
+const APP_VERSION = "v2.1-catalog-safe";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -1974,10 +1974,9 @@ app.get("/api/config", requireStudent, async (req, res) => {
 
 
 /** شعب يحق لها رياضة ثناويكا (الكيمياء من كورساتك) — غير كده كورساتك فقط */
-const THANAWICA_ALLOWED_SECTIONS = new Set(["scientific_sciences", "scientific_math", "literary", "arts", "all"]);
+const THANAWICA_ALLOWED_SECTIONS = new Set(["scientific_sciences", "scientific_math"]);
 function studentAllowsThanawica(student) {
-  // كل الموقع من ثناويكا — كل الشعب
-  return Boolean(student);
+  return Boolean(student); // كل الشعب — ثناويكا
 }
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
@@ -2039,16 +2038,12 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
     // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
     // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
-    // ثناويكا فقط — كل المواد (عربي / رياضة / كيميا / فيزياء / ...)
     if (CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
       try {
         const thList = await thSubjectsForYear(yearId);
         if (thList && thList.length) {
-          results = thList.map((s, idx2) => ({
-            ...s,
-            order_index: idx2 + 1,
-            year_id: yearId
-          }));
+          await loadCatalogOverrides();
+          results = applySubjectOverrides(thList, yearId);
           console.log("[subjects] thanawica-only", { student: req.student.code, yearId, count: results.length });
         }
       } catch (e) {
@@ -2059,7 +2054,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
     res.json({
       success: true,
       message: "Success",
-      data: results
+      data: scrubSensitive(Array.isArray(results) ? results.map(publicSubject) : results)
     });
   } catch (e) {
     jsonError(res, 502, e.message);
@@ -2974,6 +2969,226 @@ app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
 // ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+// CATALOG CACHE (Firebase) — صور/أيقونات يدوية + تحديث يدوي فقط
+// مفيش توكن/كوكيز ثناويكا بتتشال للعميل أبدًا
+// ═══════════════════════════════════════════════════════════
+const catalogMem = { subjects: {}, meta: {}, at: 0 };
+
+function publicSubject(s) {
+  if (!s || typeof s !== "object") return s;
+  return {
+    id: s.id,
+    name: s.name,
+    image_url: s.image_url || s.icon || null,
+    icon: s.icon || null,
+    order_index: s.order_index,
+    year_id: s.year_id,
+    teacher_count: s.teacher_count ?? s.chapters_count ?? null,
+    is_published: true
+  };
+}
+function publicTeacher(t) {
+  if (!t || typeof t !== "object") return t;
+  return {
+    id: t.id,
+    name: t.name,
+    image_url: t.image_url || t.icon || null,
+    icon: t.icon || null,
+    subject_id: t.subject_id,
+    chapters_count: t.chapters_count ?? t.count ?? null,
+    count: t.chapters_count ?? t.count ?? null
+  };
+}
+function publicChapter(c) {
+  if (!c || typeof c !== "object") return c;
+  return {
+    id: c.id,
+    name: c.name,
+    image_url: c.image_url || c.icon || null,
+    icon: c.icon || null,
+    lecture_count: c.lecture_count ?? null,
+    teacher_name: c.teacher_name || null
+  };
+}
+function publicLecture(l) {
+  if (!l || typeof l !== "object") return l;
+  return {
+    id: l.id,
+    name: l.name || l.title,
+    title: l.title || l.name,
+    image_url: l.image_url || l.icon || null,
+    icon: l.icon || null,
+    video_count: l.video_count ?? null,
+    pdf_count: l.pdf_count ?? null
+  };
+}
+
+/** يشيل أي حقول حسّاسة قبل ما الرد يخرج */
+function scrubSensitive(obj, depth) {
+  depth = depth || 0;
+  if (depth > 8 || obj == null) return obj;
+  if (Array.isArray(obj)) return obj.map((x) => scrubSensitive(x, depth + 1));
+  if (typeof obj !== "object") return obj;
+  const ban = /^(token|cookies?|plainKey|streamUrl|stream_url|Authorization|student_session|student_device|sessionToken|ownerToken|wrapped|decrypt|_thDecrypt|sk)$/i;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (ban.test(k)) continue;
+    if (k.startsWith("_") && k !== "_kind") continue; // _thId داخلي — متبعتش
+    out[k] = scrubSensitive(v, depth + 1);
+  }
+  return out;
+}
+
+async function loadCatalogOverrides() {
+  try {
+    const remote = (await fbGet("catalog")) || {};
+    catalogMem.subjects = remote.subjects || {};
+    catalogMem.meta = remote.meta || {};
+    catalogMem.at = Date.now();
+    return catalogMem;
+  } catch (e) {
+    console.warn("[catalog] load", e.message);
+    return catalogMem;
+  }
+}
+
+function applySubjectOverrides(list, yearId) {
+  const map = catalogMem.subjects || {};
+  return (list || []).map((s, i) => {
+    const key = String(s.id);
+    const o = map[key] || map["th:" + (s._thId || "")] || {};
+    return publicSubject({
+      ...s,
+      name: o.name || s.name,
+      image_url: o.image_url || o.icon || s.image_url || null,
+      icon: o.icon || null,
+      order_index: o.order_index != null ? o.order_index : (s.order_index || i + 1),
+      year_id: yearId
+    });
+  });
+}
+
+// ── Admin: كتالوج ثناويكا ─────────────────────────────────
+app.get("/api/admin/catalog", requireAdmin("sections_manage"), async (req, res) => {
+  try {
+    await loadCatalogOverrides();
+    const yearId = Number(req.query.year || 26);
+    let subjects = [];
+    try {
+      if (CONFIG.THANAWICA_ENABLED) {
+        const th = await thSubjectsForYear(yearId);
+        subjects = applySubjectOverrides(th, yearId);
+      }
+    } catch (e) {
+      console.warn("[admin/catalog]", e.message);
+    }
+    // overrides list even without live fetch
+    const overrides = catalogMem.subjects || {};
+    res.json(scrubSensitive({
+      success: true,
+      data: {
+        yearId,
+        refreshedAt: (catalogMem.meta && catalogMem.meta.refreshedAt) || null,
+        subjects,
+        overrides,
+        icons: [
+          "book", "flask", "atom", "calculator", "language", "globe",
+          "leaf", "microscope", "pencil", "star", "video", "graduation"
+        ]
+      }
+    }));
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+/** تحديث يدوي من ثناويكا — مش تلقائي */
+app.post("/api/admin/catalog/refresh", requireAdmin("sections_manage"), async (req, res) => {
+  try {
+    const yearId = Number((req.body && req.body.yearId) || req.query.year || 26);
+    if (!CONFIG.THANAWICA_ENABLED) return jsonError(res, 400, "ثناويكا غير مفعّلة");
+
+    const thList = await thSubjectsForYear(yearId);
+    await loadCatalogOverrides();
+    const subjects = catalogMem.subjects || {};
+    let added = 0;
+    for (const s of thList) {
+      const key = String(s.id);
+      if (!subjects[key]) {
+        subjects[key] = {
+          id: s.id,
+          thId: s._thId,
+          name: s.name,
+          image_url: s.image_url || null,
+          icon: null,
+          yearId,
+          updatedAt: Date.now()
+        };
+        added++;
+      } else {
+        // حدّث الاسم بس — متلمسش صورة الأدمن
+        subjects[key].name = s.name || subjects[key].name;
+        subjects[key].thId = s._thId;
+        subjects[key].yearId = yearId;
+      }
+    }
+    const meta = {
+      ...(catalogMem.meta || {}),
+      refreshedAt: Date.now(),
+      lastYearId: yearId,
+      count: Object.keys(subjects).length
+    };
+    await fbSet("catalog/subjects", subjects);
+    await fbSet("catalog/meta", meta);
+    catalogMem.subjects = subjects;
+    catalogMem.meta = meta;
+    catalogMem.at = Date.now();
+    // امسح كاش قوائم المواد في الذاكرة لو موجود
+    try {
+      if (typeof sourceCache !== "undefined" && sourceCache.clear) sourceCache.clear();
+    } catch {}
+    res.json({
+      success: true,
+      message: "تم التحديث من ثناويكا",
+      data: { added, total: Object.keys(subjects).length, refreshedAt: meta.refreshedAt }
+    });
+  } catch (e) {
+    console.error("[catalog/refresh]", e);
+    jsonError(res, 500, e.message || "فشل التحديث");
+  }
+});
+
+/** حفظ صورة/أيقونة/اسم لمادة */
+app.put("/api/admin/catalog/subject/:id", requireAdmin("sections_manage"), async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    await loadCatalogOverrides();
+    const subjects = catalogMem.subjects || {};
+    const prev = subjects[id] || { id: Number(id) || id };
+    const body = req.body || {};
+    const next = {
+      ...prev,
+      id: prev.id || id,
+      name: body.name != null ? String(body.name).trim() : prev.name,
+      image_url: body.image_url != null ? String(body.image_url).trim() || null : prev.image_url,
+      icon: body.icon != null ? String(body.icon).trim() || null : prev.icon,
+      order_index: body.order_index != null ? Number(body.order_index) : prev.order_index,
+      updatedAt: Date.now()
+    };
+    subjects[id] = next;
+    await fbSet("catalog/subjects/" + id.replace(/[.#$\[\]]/g, "_"), next);
+    // also full write for consistency
+    await fbSet("catalog/subjects", subjects);
+    catalogMem.subjects = subjects;
+    res.json({ success: true, data: next });
+  } catch (e) {
+    jsonError(res, 500, e.message);
+  }
+});
+
+
 app.post("/api/admin/login", rateLimit({ max: 10, windowMs: 60_000, scope: "admin-login", banAfter: 3, banMs: 15 * 60_000 }), async (req, res) => {
   try {
     const username = String(req.body?.username || "").trim();
