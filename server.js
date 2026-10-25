@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.2-segfix";
+const APP_VERSION = "v1.3-cdn-fallback";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -364,6 +364,7 @@ const CONFIG = {
     "api.stream-weave.com",
     "floravon.online",
     "floravon.shop",
+    "cloudfront.shop",
     "c-cdn.online",
     "thanawica.com",
     "www.thanawica.com"
@@ -1637,14 +1638,42 @@ function allowedStreamUrl(raw, session = null) {
   }
 }
 
-function hostOf(u) { try { return new URL(u).hostname; } catch { return String(u).slice(0, 40); } }
+function hostOf(u) {
+  try { return new URL(u).hostname; } catch { return ""; }
+}
+
+/** CDN hosts that reject Authorization + often block datacenter IPs */
+function isMediaCdnHost(host) {
+  return /(?:^|\.)(floravon\.(?:online|shop)|c-cdn\.online|cloudfront\.shop)$/i.test(host || "");
+}
+
+/** Build api.stream-weave.com fallbacks from a floravon/c-cdn segment URL */
+function streamWeaveFallbacks(segmentUrl, videoId) {
+  const out = [];
+  try {
+    const u = new URL(segmentUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    const vi = parts.indexOf("videos");
+    if (vi < 0 || !parts[vi + 1]) return out;
+    const vid = parts[vi + 1];
+    let rest = parts.slice(vi + 2); // quality/.../file or stream/quality/file
+    if (!rest.length) return out;
+    if (rest[0] === "stream") rest = rest.slice(1);
+    const pathRest = rest.join("/");
+    out.push(`https://api.stream-weave.com/videos/${vid}/stream/${pathRest}`);
+    out.push(`https://api.stream-weave.com/videos/${vid}/${pathRest}`);
+    // drop query on purpose — stream-weave uses Bearer
+  } catch {}
+  if (videoId && !out.length) {
+    // last resort if URL unparseable
+  }
+  return out;
+}
 
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
-  let host = "";
-  try { host = new URL(url).hostname; } catch {}
-  // CDN segments: MUST NOT send Authorization (browser doesn't; CF returns 403 if we do)
-  const isMediaCdn = /(?:^|\.)floravon\.(?:online|shop)$|(?:^|\.)c-cdn\.online$/i.test(host);
+  const host = hostOf(url);
+  const isCdn = isMediaCdnHost(host);
 
   const headers = {
     Accept: "*/*",
@@ -1658,17 +1687,17 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "sec-fetch-site": "cross-site",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
-    "Accept-Language": "ar-EG,ar;q=0.9,en-EG;q=0.8,en;q=0.6",
+    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
     Priority: "u=1, i"
   };
-  if (!isMediaCdn && session?.token) {
+  // CDN: never Authorization. stream-weave / coursatek: Bearer
+  if (!isCdn && session?.token) {
     headers.Authorization = `Bearer ${session.token}`;
   }
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  // Never allow caller to force Authorization onto CDN
-  if (isMediaCdn) delete headers.Authorization;
+  if (isCdn) delete headers.Authorization;
 
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
@@ -2058,7 +2087,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
     // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
     // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
-    // 2026 (yearId 3) من كورساتك فقط
+    // 2026 من كورساتك فقط
     if (yearId !== 3 && CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
       try {
         const thList = await thSubjectsForYear(yearId);
@@ -2904,13 +2933,35 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
 
     let up = await streamFetch(session.src, url, {}, headers);
     if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
-      const fresh = await refreshSource(session);
-      const fu = fresh && fresh.segs[meta.s - fresh.mediaSeq];
-      if (fu) up = await streamFetch(fresh, fu.u, {}, headers);
+      try {
+        const fresh = await refreshSource(session);
+        const fu = fresh && fresh.segs[meta.s - (fresh.mediaSeq || 0)];
+        if (fu?.u) up = await streamFetch(fresh, fu.u, {}, headers);
+      } catch (e) {
+        console.warn("[seg] refreshSource", e.message);
+      }
+    }
+    // CDN blocked (Cloudflare on Railway IP) → try api.stream-weave.com with Bearer
+    if (!up.ok && (up.status === 403 || up.status === 401 || up.status === 502)) {
+      const alts = streamWeaveFallbacks(url, session.src?.videoId);
+      for (const alt of alts) {
+        try {
+          // ensure host allowed
+          try { session.src.allowedHosts.add(new URL(alt).hostname); } catch {}
+          const up2 = await streamFetch(session.src, alt, {}, headers);
+          if (up2.ok || up2.status === 206) {
+            console.log("[seg] weave-fallback ok", hostOf(alt));
+            up = up2;
+            break;
+          }
+          console.warn("[seg] weave-fallback", up2.status, hostOf(alt));
+        } catch (e) {
+          console.warn("[seg] weave-fallback err", e.message);
+        }
+      }
     }
     if (!up.ok) {
-      const snippet = (await up.text().catch(() => "")).slice(0, 120);
-      console.error("[seg-upstream]", up.status, hostOf(url), snippet);
+      console.error("[seg-upstream]", up.status, hostOf(url));
       throw new Error(`Segment HTTP ${up.status}`);
     }
 
