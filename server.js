@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.2";
+const APP_VERSION = "v1.2-segfix";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -396,7 +396,7 @@ const CONFIG = {
   STUDENT_SESSION_MS: 7 * 24 * 3600 * 1000, // 7 days max (also capped by code expiry)
   ADMIN_SESSION_MS: 12 * 3600 * 1000, // 12h
   STREAM_SESSION_MS: 15 * 60 * 1000, // (قديم) — بقى فيه STREAM_IDLE_MS / STREAM_MAX_MS
-  STREAM_IDLE_MS: 6 * 3600 * 1000, // الجلسة بتنتهي بعد 45 دقيقة من آخر مقطع اتطلب (كانت 15 دقيقة ثابتة وبتقطع المحاضرات الطويلة)
+  STREAM_IDLE_MS: 45 * 60 * 1000, // الجلسة بتنتهي بعد 45 دقيقة من آخر مقطع اتطلب (كانت 15 دقيقة ثابتة وبتقطع المحاضرات الطويلة)
   STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
   THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
@@ -1637,13 +1637,14 @@ function allowedStreamUrl(raw, session = null) {
   }
 }
 
+function hostOf(u) { try { return new URL(u).hostname; } catch { return String(u).slice(0, 40); } }
+
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
-  const ch = clientHeaders || {};
   let host = "";
   try { host = new URL(url).hostname; } catch {}
-  // floravon / c-cdn: query token only — Authorization causes Cloudflare 403
-  const isMediaCdn = /floravon\.(online|shop)|c-cdn\.online|suo\d*\.floravon/i.test(host);
+  // CDN segments: MUST NOT send Authorization (browser doesn't; CF returns 403 if we do)
+  const isMediaCdn = /(?:^|\.)floravon\.(?:online|shop)$|(?:^|\.)c-cdn\.online$/i.test(host);
 
   const headers = {
     Accept: "*/*",
@@ -1657,7 +1658,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "sec-fetch-site": "cross-site",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
-    "Accept-Language": "ar-EG,ar;q=0.9,en-EG;q=0.8,en-US;q=0.7,en;q=0.6",
+    "Accept-Language": "ar-EG,ar;q=0.9,en-EG;q=0.8,en;q=0.6",
     Priority: "u=1, i"
   };
   if (!isMediaCdn && session?.token) {
@@ -1666,6 +1667,9 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
+  // Never allow caller to force Authorization onto CDN
+  if (isMediaCdn) delete headers.Authorization;
+
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
     fetchT(url, { headers, cache: "no-store", redirect: "follow" }, {
@@ -2054,7 +2058,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
 
     // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
     // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
-    // 2026 (yearId 3) من كورساتك فقط — ثناويكا للسنوات التانية
+    // 2026 (yearId 3) من كورساتك فقط
     if (yearId !== 3 && CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
       try {
         const thList = await thSubjectsForYear(yearId);
@@ -2904,7 +2908,11 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
       const fu = fresh && fresh.segs[meta.s - fresh.mediaSeq];
       if (fu) up = await streamFetch(fresh, fu.u, {}, headers);
     }
-    if (!up.ok) throw new Error(`Segment HTTP ${up.status}`);
+    if (!up.ok) {
+      const snippet = (await up.text().catch(() => "")).slice(0, 120);
+      console.error("[seg-upstream]", up.status, hostOf(url), snippet);
+      throw new Error(`Segment HTTP ${up.status}`);
+    }
 
     const encrypted = Buffer.from(await up.arrayBuffer());
     if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
