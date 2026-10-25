@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.4-weave-first";
+const APP_VERSION = "v1.6-coursatk-like-small";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -373,7 +373,7 @@ const CONFIG = {
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
   STREAM_UA:
-    "Mozilla/5.0 (Linux; Android 15; CPH2591 Build/AP3A.240617.008) AppleWebKit/537.36 (KHTML, like Gecko) Jrryilw/4.0 Chrome/155.0.8059.43 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
   // Firebase Realtime Database (NOT Firestore)
   FIREBASE: "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
@@ -1641,35 +1641,48 @@ function allowedStreamUrl(raw, session = null) {
 function hostOf(u) {
   try { return new URL(u).hostname; } catch { return ""; }
 }
-function isMediaCdnHost(host) {
-  return /(?:^|\.)(floravon\.(?:online|shop)|c-cdn\.online|cloudfront\.shop)$/i.test(host || "");
+
+/** CDN media hosts — query token only, NEVER Authorization (matches working small server) */
+function isMediaSegmentHost(urlOrHost) {
+  const h = String(urlOrHost || "");
+  return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(h);
 }
 
+/**
+ * Upstream fetch — same rules as server-2-2 (working Coursatk proxy):
+ * - stream-weave / coursatek API: Bearer token
+ * - floravon / c-cdn / cloudfront: NO Authorization
+ * - forward browser sec-ch-* when available
+ */
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
-  const host = hostOf(url);
-  const isCdn = isMediaCdnHost(host);
-
+  const ch = clientHeaders || {};
   const headers = {
     Accept: "*/*",
-    "User-Agent": CONFIG.STREAM_UA,
-    "sec-ch-ua-platform": '"Android"',
-    "sec-ch-ua": '"Android WebView";v="155", "Chromium";v="155", "Not(A:Brand";v="24"',
-    "sec-ch-ua-mobile": "?1",
+    "Cache-Control": "no-cache",
     Origin: CONFIG.STREAM_ORIGIN,
     Referer: CONFIG.STREAM_REFERER,
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
-    "sec-fetch-site": "cross-site",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
-    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-    Priority: "u=1, i"
+    "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
-  if (!isCdn && session?.token) headers.Authorization = `Bearer ${session.token}`;
+
+  // Master/key on api.stream-weave.com NEED Authorization.
+  // Media segments on floravon / c-cdn / cloudfront must NOT get Authorization.
+  if (!isMediaSegmentHost(url) && session?.token) {
+    headers.Authorization = `Bearer ${session.token}`;
+  }
+
+  for (const name of [
+    "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
+  ]) {
+    if (ch[name]) headers[name] = ch[name];
+  }
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  if (isCdn) delete headers.Authorization;
+  // Hard guarantee: never leak Authorization to CDN
+  if (isMediaSegmentHost(url)) delete headers.Authorization;
 
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
@@ -2242,31 +2255,9 @@ async function buildPlaylist(src, masterText, clientHeaders) {
       const seq = mediaSeq + segIndex;
       const iv = currentIv || ivFromMediaSequence(seq);
       const ivHex = iv.toString("hex");
-      // Preferred: api.stream-weave.com (Railway IP not blocked) — CDN as fallback
-      const fileName = (line.split("?")[0].split("/").pop() || "").trim();
-      let quality = "480";
-      try {
-        const bm = String(baseUrl || "").match(/\/stream\/(\d{3,4})\//) ||
-                   String(baseUrl || "").match(/\/(\d{3,4})\/(?:index|playlist|seg)/i) ||
-                   String(segmentUrl).match(/\/(?:stream\/)?(\d{3,4})\/seg/i);
-        if (bm) quality = bm[1];
-      } catch {}
-      let weaveUrl = null;
-      if (src.videoId && fileName) {
-        weaveUrl = `https://api.stream-weave.com/videos/${src.videoId}/stream/${quality}/${fileName}`;
-        try { src.allowedHosts.add("api.stream-weave.com"); } catch {}
-      }
+      // مسار معتم: رقم المقطع فقط — مفيش روابط أبلستريم ولا base64 ظاهر للعميل
       out.push(`/api/hls/${SID_TOKEN}/seg/${segIndex}`);
-      segs.push({
-        u: weaveUrl || segmentUrl, // try weave first
-        uCdn: segmentUrl,
-        uWeave: weaveUrl,
-        iv: ivHex,
-        s: seq,
-        i: segIndex,
-        q: quality,
-        f: fileName
-      });
+      segs.push({ u: segmentUrl, iv: ivHex, s: seq, i: segIndex });
       segIndex++;
       continue;
     }
@@ -2768,7 +2759,35 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       });
     }
 
-    // معرف تشغيل معتم — HLS
+    // ── كورساتك HLS: نفس مسار السيرفر الصغير (server-2-2) ──
+    if (src.mode !== "thanawica" && src.streamUrl && src.token) {
+      const id = crypto.randomUUID();
+      streamSessions.set(id, {
+        id,
+        kind: "coursatk-stream",
+        videoId: String(src.videoId || req.params.videoId),
+        token: src.token,
+        streamUrl: src.streamUrl,
+        playId: String(req.params.videoId),
+        createdAt: now(),
+        lastUsed: now(),
+        plainKey: null,
+        defaultIv: null,
+        allowedHosts: new Set([hostOf(src.streamUrl)].filter(Boolean)),
+        ownerCode: req.session.code
+      });
+      return res.json({
+        success: true,
+        data: {
+          session: id,
+          video_id: src.videoId,
+          manifest_url: `/api/stream/manifest/${id}`,
+          play_url: `/api/stream/manifest/${id}`
+        }
+      });
+    }
+
+    // ── ثناويكا / باقي المصادر: مسار /api/hls ──
     const id = crypto.randomUUID().replace(/-/g, "");
     const streamKey = crypto.randomBytes(16).toString("hex");
     const deviceId =
@@ -2776,7 +2795,6 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
       (req.student && req.student.deviceId) ||
       null;
 
-    // إلغاء جلسات قديمة لنفس الفيديو لنفس الطالب
     revokeOtherSessions(req.session.code, src.videoId, id);
 
     const sessionRow = {
@@ -2796,7 +2814,6 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     res.json({
       success: true,
       data: {
-        // المفتاح جزء من الرابط — من غيره المقاطع ومش هتشتغل
         play_url: `/api/hls/${id}/master.m3u8?sk=${streamKey}`
       }
     });
@@ -2924,53 +2941,13 @@ async function getSegmentPlain(session, meta, url, iv, headers) {
       return plain;
     }
 
-    // Order: weave (Bearer, works on Railway) → CDN (query token, often CF-blocked) → refresh
-    const candidates = [];
-    const pushU = (u) => { if (u && !candidates.includes(u)) candidates.push(u); };
-    pushU(meta.uWeave);
-    pushU(url);
-    pushU(meta.u);
-    pushU(meta.uCdn);
-    // reconstruct weave if missing
-    if (session.src?.videoId && meta.f) {
-      pushU(`https://api.stream-weave.com/videos/${session.src.videoId}/stream/${meta.q || "480"}/${meta.f}`);
+    let up = await streamFetch(session.src, url, {}, headers);
+    if ((up.status === 401 || up.status === 403) && Number.isFinite(meta.s)) {
+      const fresh = await refreshSource(session);
+      const fu = fresh && fresh.segs[meta.s - fresh.mediaSeq];
+      if (fu) up = await streamFetch(fresh, fu.u, {}, headers);
     }
-
-    let up = null;
-    let lastStatus = 0;
-    for (const cand of candidates) {
-      try {
-        try { session.src.allowedHosts.add(new URL(cand).hostname); } catch {}
-        up = await streamFetch(session.src, cand, {}, headers);
-        lastStatus = up.status;
-        if (up.ok || up.status === 206) {
-          if (cand !== url) console.log("[seg] ok via", hostOf(cand));
-          break;
-        }
-        console.warn("[seg] fail", up.status, hostOf(cand));
-      } catch (e) {
-        console.warn("[seg] err", hostOf(cand), e.message);
-      }
-    }
-    if ((!up || !up.ok) && Number.isFinite(meta.s)) {
-      try {
-        const fresh = await refreshSource(session);
-        const fu = fresh && fresh.segs[meta.s - (fresh.mediaSeq || 0)];
-        if (fu) {
-          for (const cand of [fu.uWeave, fu.u, fu.uCdn].filter(Boolean)) {
-            try { session.src.allowedHosts.add(new URL(cand).hostname); } catch {}
-            up = await streamFetch(fresh, cand, {}, headers);
-            if (up.ok || up.status === 206) break;
-          }
-        }
-      } catch (e) {
-        console.warn("[seg] refresh", e.message);
-      }
-    }
-    if (!up || (!up.ok && up.status !== 206)) {
-      console.error("[seg-upstream]", lastStatus || (up && up.status), hostOf(url));
-      throw new Error(`Segment HTTP ${lastStatus || (up && up.status) || 502}`);
-    }
+    if (!up.ok) throw new Error(`Segment HTTP ${up.status}`);
 
     const encrypted = Buffer.from(await up.arrayBuffer());
     if (encrypted.length > CONFIG.MAX_PROXY_BYTES) {
