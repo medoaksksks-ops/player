@@ -1784,7 +1784,7 @@ app.get("/api/public/site", rateLimit({ max: 120, windowMs: 60_000, scope: "publ
  * POST /api/auth/login
  * body: { code: "1234567", deviceId: "uuid", deviceName?: "Chrome" }
  */
-app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "student-login", banAfter: 3, banMs: 15 * 60_000 }), async (req, res) => {
+app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "student-login", keyFn: (req) => `${clientIp(req)}:${String(req.body?.deviceId || "no-device").slice(0, 120)}` }), async (req, res) => {
   try {
     const code = String(req.body?.code || "").trim();
     const deviceId = String(req.body?.deviceId || "").trim();
