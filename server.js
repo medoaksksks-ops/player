@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v2.2-thanawica-no-coursatk";
+const APP_VERSION = "v1.8-cplay-light";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -361,7 +361,10 @@ const CONFIG = {
   STREAM_HOSTS: [
     "api.coursatk.online",
     "stream-weave.com",
+    "api.stream-weave.com",
     "floravon.online",
+    "floravon.shop",
+    "cloudfront.shop",
     "c-cdn.online",
     "thanawica.com",
     "www.thanawica.com"
@@ -370,7 +373,7 @@ const CONFIG = {
   STREAM_REFERER: "https://coursatk.online/",
   STREAM_X_REQUESTED_WITH: "com.mycompany.app.soulbrowser",
   STREAM_UA:
-    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 Chrome/153.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
   // Firebase Realtime Database (NOT Firestore)
   FIREBASE: "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
@@ -398,8 +401,7 @@ const CONFIG = {
   STREAM_MAX_MS: 12 * 3600 * 1000,
   MAX_PROXY_BYTES: 12 * 1024 * 1024,
   THANAWICA_CODE: process.env.THANAWICA_CODE || "", // أو من thanawica_code.txt
-  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0", // الموقع من ثناويكا — مش محتاج توكن كورساتك
-  COURSATK_DISABLED: process.env.COURSATK_DISABLED !== "0", // افتراضي: كورساتك مقفول
+  THANAWICA_ENABLED: process.env.THANAWICA_ENABLED !== "0",
   CODE_TYPES: {
     trial: { label: "تجربة", ms: 1 * 3600 * 1000 },
     month: { label: "شهر", ms: 30 * 24 * 3600 * 1000 },
@@ -1603,12 +1605,6 @@ function upTtl(apiPath) {
   return /\/lectures\/[^/]+\/content/.test(apiPath) ? 60_000 : 180_000;
 }
 async function upstreamJson(apiPath, options = {}) {
-  if (CONFIG.COURSATK_DISABLED) {
-    const err = new Error("كورساتك متوقف — المصدر ثناويكا فقط");
-    err.status = 503;
-    throw err;
-  }
-
   const isGet = !options.method || String(options.method).toUpperCase() === "GET";
   if (!isGet) return upstreamJsonRaw(apiPath, options);
   const hit = upCache.get(apiPath);
@@ -1642,11 +1638,17 @@ function allowedStreamUrl(raw, session = null) {
   }
 }
 
+function hostOf(u) {
+  try { return new URL(u).hostname; } catch { return ""; }
+}
+function isMediaSegmentHost(urlOrHost) {
+  return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(String(urlOrHost || ""));
+}
+
 async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
   const headers = {
-    Authorization: `Bearer ${session.token}`,
     Accept: "*/*",
     "Cache-Control": "no-cache",
     Origin: CONFIG.STREAM_ORIGIN,
@@ -1654,6 +1656,9 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
+  if (!isMediaSegmentHost(url) && session?.token) {
+    headers.Authorization = `Bearer ${session.token}`;
+  }
   for (const name of [
     "sec-ch-ua-platform", "sec-ch-ua", "sec-ch-ua-mobile",
     "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "accept-language"
@@ -1663,8 +1668,14 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
+  if (isMediaSegmentHost(url)) delete headers.Authorization;
   const hasRange = Boolean(headers.Range || headers.range);
-  return upstreamSlot(() => fetchT(url, { headers, cache: "no-store" }, { timeout: 25_000, retries: hasRange ? 0 : 1 }));
+  return upstreamSlot(() =>
+    fetchT(url, { headers, cache: "no-store", redirect: "follow" }, {
+      timeout: 25_000,
+      retries: hasRange ? 0 : 1
+    })
+  );
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1678,7 +1689,7 @@ app.use(
     max: 1500,
     windowMs: 60_000,
     scope: "global",
-    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/hls/") || req.path === "/health"
+    skip: (req) => req.path.startsWith("/api/stream/") || req.path.startsWith("/api/cplay/") || req.path.startsWith("/api/hls/") || req.path === "/health"
   })
 );
 app.use(
@@ -1983,65 +1994,127 @@ app.get("/api/config", requireStudent, async (req, res) => {
 /** شعب يحق لها رياضة ثناويكا (الكيمياء من كورساتك) — غير كده كورساتك فقط */
 const THANAWICA_ALLOWED_SECTIONS = new Set(["scientific_sciences", "scientific_math"]);
 function studentAllowsThanawica(student) {
-  return Boolean(student);
-}
-
-function publicTeacher(t) {
-  if (!t || typeof t !== "object") return t;
-  return {
-    id: t.id,
-    name: t.name,
-    image_url: t.image_url || null,
-    subject_id: t.subject_id,
-    chapters_count: t.chapters_count ?? t.count ?? null,
-    count: t.chapters_count ?? t.count ?? null
-  };
-}
-function publicSubject(s) {
-  if (!s || typeof s !== "object") return s;
-  return {
-    id: s.id,
-    name: s.name,
-    image_url: s.image_url || s.icon || null,
-    icon: s.icon || null,
-    order_index: s.order_index,
-    year_id: s.year_id,
-    teacher_count: s.teacher_count ?? s.chapters_count ?? null,
-    is_published: true
-  };
+  const sec = normalizeSection(student && student.section);
+  return THANAWICA_ALLOWED_SECTIONS.has(sec || "");
 }
 
 app.get("/api/subjects/:id", requireStudent, async (req, res) => {
   try {
     const yearId = resolveYearId(req.query.year || req.params.id || CONFIG.DEFAULT_YEAR_ID);
-    if (!CONFIG.THANAWICA_ENABLED) {
-      return jsonError(res, 503, "ثناويكا غير مفعّلة على السيرفر");
+    const secInfo = await resolveSection(req.student.section, yearId);
+    let wantedIds = [];
+    if (secInfo && Array.isArray(secInfo.subjectIds) && secInfo.subjectIds.length) {
+      wantedIds = secInfo.subjectIds.map(Number).filter((n) => !Number.isNaN(n));
     }
-    // ثناويكا فقط — مفيش upstream كورساتك خالص
-    const thList = await thSubjectsForYear(yearId);
-    const results = (thList || []).map((s, i) => publicSubject({
-      ...s,
-      order_index: i + 1,
-      year_id: yearId
-    }));
-    console.log("[subjects] thanawica-only (no coursatk)", {
-      student: req.student.code,
-      yearId,
-      count: results.length
+    // log only when debugging: console.log("[subjects]", ...)
+
+    // 2) قائمة مواد السنة — كاش قوي + دمج الطلبات المتزامنة
+    const cacheKey = `subjects:year:${yearId}`;
+    let yearList = cacheGet(cacheKey);
+    let yearData = { success: true, message: "Success", data: yearList };
+    if (!yearList) {
+      yearData = await coalesce("up:subjects:" + yearId, () =>
+        upstreamJson(`/user/subjects/${encodeURIComponent(yearId)}`)
+      );
+      yearList = Array.isArray(yearData.data) ? yearData.data : [];
+      cacheSet(cacheKey, yearList, 15 * 60_000);
+    }
+    const byId = new Map(yearList.map((s) => [Number(s.id), s]));
+
+    // 3) If no section filter → return full year list
+    if (!wantedIds.length) {
+      return res.json({ ...yearData, data: yearList });
+    }
+
+    // 4) Resolve subjects — year list first, missing IDs in parallel via /teachers
+
+    async function resolveOne(sid) {
+      if (byId.has(sid)) return byId.get(sid);
+      const ck = `subj:meta:${sid}`;
+      const hit = cacheGet(ck);
+      if (hit) return hit;
+      try {
+        const t = await upstreamJson(`/user/subjects/${sid}/teachers`);
+        const d = t?.data;
+        const item = {
+          id: Number(d?.id) || sid,
+          name: d?.name || `مادة ${sid}`,
+          image_url: d?.image_url || null,
+          year_id: yearId,
+          is_published: true
+        };
+        cacheSet(ck, item, 20 * 60_000);
+        return item;
+      } catch (err) {
+        console.warn(`[subjects] resolve ${sid}:`, err.message);
+        return { id: sid, name: `مادة ${sid}`, image_url: null, year_id: yearId, is_published: true };
+      }
+    }
+
+    let results = await Promise.all(wantedIds.map((sid, idx) =>
+      resolveOne(sid).then((s) => ({ ...s, order_index: idx + 1 }))
+    ));
+
+    // Hybrid: رياضة فقط من ثناويكا — الكيمياء ترجع لكورساتك زي الأول
+    // علمي علوم / علمي رياضة فقط؛ باقي الشعب كورساتك كاملة
+    if (yearId !== 3 && CONFIG.THANAWICA_ENABLED && studentAllowsThanawica(req.student)) {
+      try {
+        const thList = await thSubjectsForYear(yearId);
+        // رياضة فقط — تجاهل كيمياء ثناويكا
+        const thMath = thList.find((s) => s._kind === "math") || null;
+        if (thMath) {
+          const filtered = [];
+          let replacedMath = false;
+          for (const s of results) {
+            const kind = chemMathKind(s.name);
+            if (kind === "math" && !replacedMath) {
+              filtered.push({
+                ...thMath,
+                order_index: s.order_index,
+                name: thMath.name || s.name,
+                image_url: s.image_url || thMath.image_url || null
+              });
+              replacedMath = true;
+            } else if (kind === "math" && replacedMath) {
+              continue; // تجاهل تكرار رياضة كورساتك
+            } else {
+              // كيمياء + باقي المواد من كورساتك
+              filtered.push(s);
+            }
+          }
+          if (!replacedMath) {
+            filtered.push({ ...thMath, order_index: filtered.length + 1 });
+          }
+          results = filtered;
+          console.log("[subjects] hybrid thanawica math only (chem=coursatk)", {
+            student: req.student.code,
+            section: normalizeSection(req.student.section)
+          });
+        }
+      } catch (e) {
+        console.warn("[subjects] thanawica hybrid skip:", e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: "Success",
+      data: results
     });
-    res.json({ success: true, message: "Success", data: results });
   } catch (e) {
-    console.error("[subjects]", e.message);
-    jsonError(res, 502, e.message || "فشل جلب المواد من ثناويكا");
+    jsonError(res, 502, e.message);
   }
 });
 
 app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
   try {
-    if (!isThId(req.params.id)) return jsonError(res, 404, "مادة غير موجودة (ثناويكا فقط)");
-    const data = await thTeachers(req.params.id);
-    const list = Array.isArray(data) ? data.map(publicTeacher) : data;
-    return res.json({ success: true, message: "Success", data: list });
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
+      const data = await thTeachers(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
+    res.json(
+      await upstreamJson(`/user/subjects/${encodeURIComponent(req.params.id)}/teachers`)
+    );
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2049,9 +2122,13 @@ app.get("/api/subjects/:id/teachers", requireStudent, async (req, res) => {
 
 app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
   try {
-    if (!isThId(req.params.id)) return jsonError(res, 404, "مدرس غير موجود (ثناويكا فقط)");
-    const data = await thChapters(req.params.id);
-    return res.json({ success: true, message: "Success", data });
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
+      const data = await thChapters(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
+    res.json(
+      await upstreamJson(`/user/teachers/${encodeURIComponent(req.params.id)}/chapters`)
+    );
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2059,9 +2136,13 @@ app.get("/api/teachers/:id/chapters", requireStudent, async (req, res) => {
 
 app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
   try {
-    if (!isThId(req.params.id)) return jsonError(res, 404, "فصل غير موجود (ثناويكا فقط)");
-    const data = await thLectures(req.params.id);
-    return res.json({ success: true, message: "Success", data });
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
+      const data = await thLectures(req.params.id);
+      return res.json({ success: true, message: "Success", data });
+    }
+    res.json(
+      await upstreamJson(`/user/chapters/${encodeURIComponent(req.params.id)}/lectures`)
+    );
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2069,16 +2150,12 @@ app.get("/api/chapters/:id/lectures", requireStudent, async (req, res) => {
 
 app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
   try {
-    if (!isThId(req.params.id)) return jsonError(res, 404, "محاضرة غير موجودة (ثناويكا فقط)");
-    const data = await thLectureContent(req.params.id);
-    // امسح أي حقول حسّاسة لو موجودة
-    if (data && typeof data === "object") {
-      const d = data.data || data;
-      if (d && typeof d === "object") {
-        delete d.token; delete d.cookies; delete d.stream_url; delete d.streamUrl;
-      }
+    if (CONFIG.THANAWICA_ENABLED && isThId(req.params.id) && studentAllowsThanawica(req.student)) {
+      return res.json(await thLectureContent(req.params.id));
     }
-    return res.json(data);
+    res.json(
+      await upstreamJson(`/user/lectures/${encodeURIComponent(req.params.id)}/content`)
+    );
   } catch (e) {
     jsonError(res, 502, e.message);
   }
@@ -2594,34 +2671,54 @@ async function getStreamSession(id, touch = true) {
 
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
-    let videoId = String(req.params.videoId);
-    // Resolve thv_<numeric> using lectureId from body/query → playlist hash → thp_
-    if (CONFIG.THANAWICA_ENABLED && /^thv_\d+$/i.test(videoId)) {
-      const pageId = videoId.slice(4);
-      const lecRaw = req.body?.lectureId ?? req.query?.lectureId ?? req.body?.lecture ?? req.query?.lecture;
-      let lec = lecRaw != null ? Number(lecRaw) : null;
-      if (lec != null && lec >= 9_000_000) lec = lec - 9_000_000;
-      if (lec != null && Number.isFinite(lec) && lec > 0) {
-        try {
-          const resolved = await thResolveVideo(lec, pageId);
-          if (resolved.kind === "youtube") {
-            videoId = "thy_" + resolved.youtubeId;
-          } else if (resolved.kind === "hls") {
-            videoId = "thp_" + resolved.hash;
-          } else if (resolved.kind === "mp4") {
-            videoId = "thm_" + resolved.id;
-          } else {
-            return jsonError(res, 502, "مصدر فيديو ثناويكا غير معروف");
-          }
-        } catch (e) {
-          return jsonError(res, 502, e.message || "تعذر جلب فيديو ثناويكا");
+    const videoId = String(req.params.videoId || "").trim();
+    if (!videoId) return jsonError(res, 400, "videoId مطلوب");
+
+    // ثناويكا ids → المسار القديم تحت
+    const isThanawicaId = /^th[pvmy]_/i.test(videoId);
+
+    // كورساتك: مسار خفيف زي السيرفر الصغير (من غير buildPlaylist)
+    if (!isThanawicaId) {
+      try {
+        const data = await upstreamJson(
+          "/video/" + encodeURIComponent(videoId) + "/stream-weave/play",
+          { method: "POST", headers: { Accept: "application/json" } }
+        );
+        if (data && data.success && data.data && data.data.token && data.data.stream_url) {
+          const id = crypto.randomUUID();
+          const hosts = new Set(CONFIG.STREAM_HOSTS);
+          try { hosts.add(new URL(data.data.stream_url).hostname); } catch {}
+          streamSessions.set(id, {
+            id,
+            kind: "coursatk-stream",
+            videoId: String(data.data.video_id || videoId),
+            token: data.data.token,
+            streamUrl: data.data.stream_url,
+            playId: videoId,
+            createdAt: now(),
+            lastUsed: now(),
+            plainKey: null,
+            defaultIv: null,
+            allowedHosts: hosts,
+            ownerCode: req.session.code
+          });
+          return res.json({
+            success: true,
+            data: {
+              session: id,
+              video_id: data.data.video_id || videoId,
+              manifest_url: "/api/cplay/manifest/" + id,
+              play_url: "/api/cplay/manifest/" + id
+            }
+          });
         }
+      } catch (e) {
+        console.warn("[play] light coursatek failed, fallback:", e.message);
+        // fall through to getVideoSource (youtube/mp4/cdn)
       }
     }
-        // منع طلاب بكالوريا/أدبي من تشغيل مصادر ثناويكا حتى لو عرفوا الـ id
-    if (/^th[pvmy]_/i.test(videoId) && !studentAllowsThanawica(req.student)) {
-      return jsonError(res, 403, "المصدر غير متاح لشعبتك");
-    }
+
+    // Fallback: ثناويكا / يوتيوب / cdn
     const src = await getVideoSource(videoId, req.headers);
 
     // كوكي جلسة
@@ -2759,6 +2856,172 @@ function playlistBodyFromSession(session) {
   }
   return body;
 }
+
+
+// ═══════════════════════════════════════════════════════════
+// COURSATK = small-server flow (/api/cplay)
+// ═══════════════════════════════════════════════════════════
+function getCoursatkStreamSession(id) {
+  const s = streamSessions.get(id);
+  if (!s || s.kind !== "coursatk-stream") return null;
+  s.lastUsed = now();
+  return s;
+}
+
+async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
+  const lines = String(text || "").split(/\r?\n/);
+  const out = [];
+  let mediaSeq = 0;
+  let currentIv = null;
+  let keyFetched = false;
+  if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
+    session.allowedHosts = new Set(session.allowedHosts || []);
+  }
+  for (const raw of lines) {
+    const tline = raw.trim();
+    if (tline.startsWith("#EXT-X-MEDIA-SEQUENCE:")) mediaSeq = Number(tline.split(":")[1]) || 0;
+  }
+  let seq = mediaSeq;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith("#EXT-X-KEY:")) {
+      const uri = line.match(/URI="([^"]+)"/)?.[1];
+      const ivHex = line.match(/IV=(0x[0-9a-fA-F]+|[0-9a-fA-F]{32})/i)?.[1];
+      if (ivHex) currentIv = parseIvHex(ivHex);
+      if (uri && !keyFetched) {
+        const keyUrl = new URL(uri, baseUrl).href;
+        try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
+        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        if (!keyRes.ok) throw new Error("Key HTTP " + keyRes.status);
+        const wrapped = Buffer.from(await keyRes.arrayBuffer());
+        if (String(uri).includes("/user/auth/") || session.mode === "cdn") {
+          session.plainKey = await unwrapCdnKey(wrapped);
+        } else {
+          session.plainKey = await unwrapKey(wrapped, session.videoId);
+        }
+        session.defaultIv = currentIv;
+        keyFetched = true;
+        console.log("[key] cplay", session.videoId, session.plainKey && session.plainKey.length);
+      }
+      continue;
+    }
+    if (line && !line.startsWith("#")) {
+      const segmentUrl = new URL(line, baseUrl).href;
+      try { session.allowedHosts.add(new URL(segmentUrl).hostname); } catch {}
+      const iv = currentIv || ivFromMediaSequence(seq);
+      const payload = Buffer.from(JSON.stringify({ u: segmentUrl, iv: iv.toString("hex"), s: seq }), "utf8").toString("base64url");
+      out.push("/api/cplay/segment/" + sessionId + "/" + payload);
+      seq++;
+      continue;
+    }
+    out.push(raw);
+  }
+  if (!session.plainKey) throw new Error("فشل تجهيز مفتاح التشفير");
+  res.set({
+    "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*"
+  });
+  res.send(out.join("\n"));
+}
+
+app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
+  try {
+    const session = getCoursatkStreamSession(req.params.sessionId);
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية — افتح الفيديو من جديد");
+    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+
+    let master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    if ((master.status === 401 || master.status === 403) && session.playId) {
+      try {
+        const data = await upstreamJson("/video/" + encodeURIComponent(session.playId) + "/stream-weave/play", {
+          method: "POST",
+          headers: { Accept: "application/json" }
+        });
+        if (data && data.data && data.data.token) {
+          session.token = data.data.token;
+          if (data.data.stream_url) session.streamUrl = data.data.stream_url;
+        }
+      } catch (e) {
+        console.warn("[cplay] refresh token", e.message);
+      }
+      master = await streamFetch(session, session.streamUrl, {}, req.headers);
+    }
+    if (!master.ok) return jsonError(res, 502, "Stream master HTTP " + master.status);
+    const masterText = await master.text();
+    if (!masterText.includes("#EXTM3U")) return jsonError(res, 502, "قائمة تشغيل غير صالحة");
+
+    const mLines = masterText.split(/\r?\n/);
+    let variant = null;
+    for (let i = 0; i < mLines.length; i++) {
+      if (mLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
+        const next = (mLines[i + 1] || "").trim();
+        if (next && !next.startsWith("#")) {
+          variant = new URL(next, session.streamUrl).href;
+          break;
+        }
+      }
+    }
+    if (variant) {
+      const variantRes = await streamFetch(session, variant, {}, req.headers);
+      if (!variantRes.ok) return jsonError(res, 502, "Variant HTTP " + variantRes.status);
+      return rewriteCoursatkPlaylist(req.params.sessionId, session, await variantRes.text(), variant, res, req.headers);
+    }
+    return rewriteCoursatkPlaylist(req.params.sessionId, session, masterText, session.streamUrl, res, req.headers);
+  } catch (e) {
+    console.error("[cplay-manifest]", e && e.stack || e);
+    return jsonError(res, 502, (e && e.message) || "فشل قائمة التشغيل");
+  }
+});
+
+app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, res) => {
+  try {
+    const session = getCoursatkStreamSession(req.params.sessionId);
+    if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
+    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+    if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح — حدّث الصفحة");
+
+    let meta;
+    try {
+      meta = JSON.parse(Buffer.from(req.params.encoded, "base64url").toString("utf8"));
+    } catch {
+      return jsonError(res, 400, "segment meta غير صالح");
+    }
+    const url = meta && meta.u;
+    if (!url || !allowedStreamUrl(url, session)) return jsonError(res, 403, "رابط غير مسموح");
+    const iv = parseIvHex(meta.iv) || session.defaultIv || ivFromMediaSequence(meta.s || 0);
+
+    const upstream = await streamFetch(session, url, { Range: req.headers.range || undefined }, req.headers);
+    if (!upstream.ok && upstream.status !== 206) {
+      let body = "";
+      try { body = (await upstream.text()).slice(0, 100); } catch {}
+      console.error("[cplay-seg]", upstream.status, hostOf(url), body);
+      return jsonError(res, 502, "Segment HTTP " + upstream.status);
+    }
+    const encrypted = Buffer.from(await upstream.arrayBuffer());
+    if (encrypted.length > CONFIG.MAX_PROXY_BYTES) return jsonError(res, 413, "المقطع كبير");
+    let plain;
+    try {
+      plain = decryptSegment(encrypted, session.plainKey, iv);
+    } catch (e) {
+      console.warn("[cplay-dec]", e.message);
+      plain = encrypted;
+    }
+    res.status(200);
+    res.set({
+      "Content-Type": "video/mp2t",
+      "Content-Length": String(plain.length),
+      "Cache-Control": "no-store",
+      "Access-Control-Allow-Origin": "*"
+    });
+    return res.send(plain);
+  } catch (e) {
+    console.error("[cplay-seg]", e && e.stack || e);
+    if (!res.headersSent) return jsonError(res, 502, (e && e.message) || "فشل المقطع");
+    res.end();
+  }
+});
+
 
 app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
   try {
@@ -2926,13 +3189,6 @@ app.get("/api/hls/:pid/seg/:idx", requireStudent, async (req, res) => {
   }
 });
 
-// ── مسارات قديمة (مقفولة) — عشان محدش يستخدم الشكل اللي بيفضح البيانات ──
-app.get("/api/stream/manifest/:sessionId", (_req, res) => {
-  return jsonError(res, 410, "المسار لم يعد متاحًا");
-});
-app.get("/api/stream/segment/:sessionId/:encoded", (_req, res) => {
-  return jsonError(res, 410, "المسار لم يعد متاحًا");
-});
 
 // ═══════════════════════════════════════════════════════════
 // ADMIN AUTH
@@ -4568,7 +4824,7 @@ app.use((err, req, res, _next) => {
   const status = (err && (err.status || err.statusCode)) || 500;
   res.status(status >= 400 && status < 600 ? status : 500).json({
     success: false,
-    message: status === 400 ? "طلب غير صالح" : "حصل خطأ في السيرفر — جرّب تاني"
+    message: (err && err.message) ? String(err.message).slice(0, 200) : (status === 400 ? "طلب غير صالح" : "حصل خطأ في السيرفر — جرّب تاني")
   });
 });
 
@@ -4598,24 +4854,13 @@ setInterval(() => {
 CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
 await loadDecryptionUtils();
 try {
-  if (CONFIG.THANAWICA_ENABLED) {
-    try {
-      const cookieFile = path.join(__dirname, "thanawica_cookies.txt");
-      if (fs.existsSync(cookieFile)) {
-        process.env.THANAWICA_COOKIES = fs.readFileSync(cookieFile, "utf8").trim();
-        console.log("[thanawica] cookies loaded from file");
-      }
-    } catch (e) {}
-    await loadMaintenanceFromFirebase().catch(() => {});
-    try {
-      await thanawicaLogin(CONFIG.THANAWICA_CODE || process.env.THANAWICA_CODE || "");
-      console.log("[API] Thanawica ONLY — Coursatk catalog disabled");
-    } catch (e) {
-      console.warn("[API] Thanawica session:", e.message);
-    }
+  if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
+    await loadMaintenanceFromFirebase();
+    await thanawicaLogin(CONFIG.THANAWICA_CODE);
+    console.log("[API] Thanawica hybrid ON — chemistry/math from thanawica.com");
   }
 } catch (e) {
-  console.warn("[API] Thanawica boot:", e.message);
+  console.warn("[API] Thanawica login skipped:", e.message);
 }
 
 // Load site packages/agents from Firebase if configured
