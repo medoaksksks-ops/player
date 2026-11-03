@@ -68,11 +68,34 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
     return orig(...args.map((a) => (typeof a === "function" && a.length < 4 ? wrapAsync(a) : a)));
   };
 }
-app.set("trust proxy", 1);
+// Trust only the configured number of reverse-proxy hops. Keep the deployment
+// default at one hop for the existing hosted setup; set TRUST_PROXY_HOPS=0
+// when the app is exposed directly, or match the actual proxy chain.
+const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || "1", 10);
+app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
+
+// Credentialed CORS must use an explicit allowlist (never reflect arbitrary Origin).
+const allowedOrigins = new Set(
+  (process.env.CORS_ALLOWED_ORIGINS || "https://coursatk.online,https://www.coursatk.online,https://thanawya-club.vercel.app")
+    .split(",").map((x) => x.trim()).filter(Boolean)
+);
 app.use(cors({
-  origin: true, // يعكس الـ Origin عشان credentials تشتغل
-  credentials: true
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
+
+// Baseline browser security headers. CSP is intentionally not forced here because
+// this API also serves existing frontend/player assets with inline scripts.
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  next();
+});
 app.use(express.json({ limit: "20mb" }));
 app.use(
   compression({
@@ -353,10 +376,10 @@ setInterval(() => {
 // CONFIG (in-code — no Railway vars required for core secrets)
 // ═══════════════════════════════════════════════════════════
 const CONFIG = {
-  PORT: Number(process.env.PORT || 3000),
+  PORT: Number(process.env.PORT || 8080),
   // Upstream Coursatk — token loaded from runtime/Firebase/env (never exposed to client)
   COURSATK_API: "https://api.coursatk.online/api/v1",
-  COURSATK_TOKEN: "", // set via admin panel or env COURSATK_TOKEN
+  COURSATK_TOKEN: process.env.COURSATK_TOKEN || "", // provide via Fly Secrets or admin settings
   DEFAULT_YEAR_ID: 4,
   STREAM_HOSTS: [
     "api.coursatk.online",
@@ -376,13 +399,13 @@ const CONFIG = {
     "Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36",
   PLAYER_JS: "https://player.stream-weave.com/assets/player.js?v=1.1.1",
   // Firebase Realtime Database (NOT Firestore)
-  FIREBASE: "https://dr-gamal-357a2-default-rtdb.firebaseio.com",
+  FIREBASE: "https://plus-f09b5-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
     username: "Hema",
     // password set below — hashed at boot
     passwordHash: "",
-    passwordPlain: "ibrahim@2009*#",
+    passwordPlain: process.env.BOOTSTRAP_ADMIN_PASSWORD || "",
     permissions: {
       students_create: true,
       students_edit: true,
@@ -419,7 +442,7 @@ const CONFIG = {
 const RUNTIME_PATH = path.join(__dirname, "data", "runtime.json");
 
 const runtime = {
-  firebaseUrl: (process.env.FIREBASE_URL || "https://dr-gamal-357a2-default-rtdb.firebaseio.com").replace(/\/$/, ""),
+  firebaseUrl: (process.env.FIREBASE_URL || "https://plus-f09b5-default-rtdb.firebaseio.com").replace(/\/$/, ""),
   coursatkToken: process.env.COURSATK_TOKEN || "",
   siteName: "كورساتك",
   packages: [
@@ -439,7 +462,7 @@ function loadRuntimeFile() {
   try {
     if (!fs.existsSync(RUNTIME_PATH)) return;
     const raw = JSON.parse(fs.readFileSync(RUNTIME_PATH, "utf8"));
-    if (raw.firebaseUrl) runtime.firebaseUrl = String(raw.firebaseUrl).replace(/\/$/, "");
+    if (raw.firebaseUrl && String(raw.firebaseUrl).replace(/\/$/, "") === String(process.env.FIREBASE_URL || CONFIG.FIREBASE).replace(/\/$/, "")) runtime.firebaseUrl = String(raw.firebaseUrl).replace(/\/$/, "");
     if (raw.coursatkToken) runtime.coursatkToken = String(raw.coursatkToken);
     if (raw.siteName) runtime.siteName = String(raw.siteName);
     if (Array.isArray(raw.packages)) runtime.packages = raw.packages;
@@ -468,10 +491,10 @@ function saveRuntimeFile() {
 
 function getFirebaseUrl() {
   return (
-    runtime.firebaseUrl ||
     process.env.FIREBASE_URL ||
     CONFIG.FIREBASE ||
-    "https://dr-gamal-357a2-default-rtdb.firebaseio.com"
+    runtime.firebaseUrl ||
+    "https://plus-f09b5-default-rtdb.firebaseio.com"
   ).replace(/\/$/, "");
 }
 
@@ -1160,15 +1183,30 @@ function getBearer(req) {
 // ── Student auth middleware ──
 // كان بيعمل 1-2 طلب Firebase مع كل request (حتى كل مقطع فيديو!) — دلوقتي كاش 15 ثانية + دمج الطلبات المتطابقة
 const AUTH_TTL_MS = 120_000;
+const AUTH_STALE_MS = 5 * 60_000;
+const AUTH_RETRY_MS = 15_000;
 const badTokens = new Map(); // token -> exp (توكنات مش موجودة — بلاش نسأل Firebase عنها كل مرة)
 
 async function getStudentCached(code) {
   const c = authCache.get(code);
   const t = Date.now();
   if (c && t < c.exp) return c.student;
-  const student = await coalesce("stu:" + code, () => fbGet(`students/${code}`));
-  authCache.set(code, { student, exp: Date.now() + AUTH_TTL_MS });
-  return student;
+  if (c && c.retryAt && t < c.retryAt && t < (c.staleUntil || 0)) return c.student;
+  try {
+    const student = await coalesce("stu:" + code, () => fbGet(`students/${code}`));
+    const fetchedAt = Date.now();
+    authCache.set(code, { student, exp: fetchedAt + AUTH_TTL_MS,
+      staleUntil: fetchedAt + AUTH_TTL_MS + AUTH_STALE_MS, retryAt: 0 });
+    return student;
+  } catch (e) {
+    // Firebase timeout عابر لا يقطع مشاهدة طالب تم التحقق منه مؤخرًا.
+    if (c && c.student && Date.now() < (c.staleUntil || c.exp + AUTH_STALE_MS)) {
+      c.retryAt = Date.now() + AUTH_RETRY_MS;
+      console.warn("[auth] Firebase delayed; using short-lived cached student", code);
+      return c.student;
+    }
+    throw e;
+  }
 }
 
 async function requireStudent(req, res, next) {
@@ -1207,7 +1245,10 @@ async function requireStudent(req, res, next) {
 
     // Device still registered?
     // تابلت المدرسة أحيانًا بيضيع device من القائمة أو بيتغير الـ ID — متنهّش الجلسة إلا لو الجهاز محظور
-    const devices = student.devices || {};
+    // Older imports may store devices as a numeric count. Login needs a map keyed by deviceId.
+    const devices = student.devices && typeof student.devices === "object" && !Array.isArray(student.devices)
+      ? { ...student.devices }
+      : {};
     if (sess.deviceId && !devices[sess.deviceId]) {
       const bannedMap = student.bannedDevices || {};
       if (bannedMap[sess.deviceId]) {
@@ -1340,6 +1381,10 @@ function priceForType(type) {
   return SALE_DEFAULT_PRICES[type] || 0;
 }
 const saleMonthKey = (ms) => new Date(ms).toISOString().slice(0, 7);
+// Firebase RTDB forbids ., #, $, [, ], and / inside object keys.
+function firebaseSafeKeyPart(value) {
+  return String(value).replace(/[.#$\[\]\/\u0000-\u001F\u007F]/g, (ch) => "_" + ch.charCodeAt(0).toString(16) + "_");
+}
 const cairoDay = (ms) => new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(ms);
 const fmtMoney = (n) => String(Math.round((Number(n) || 0) * 100) / 100);
 
@@ -1392,14 +1437,23 @@ async function backfillSales() {
   const have = new Set((await readSales(since)).filter((e) => e.kind === "new").map((e) => e.code));
   const byMonth = {};
   for (const [code, st] of Object.entries(all)) {
-    if (!st || !st.createdAt || st.createdAt < since || st.importedAt || st.type === "trial" || have.has(String(code))) continue;
-    const mk = saleMonthKey(st.createdAt);
-    (byMonth[mk] = byMonth[mk] || {})[`new_${code}_${st.createdAt}`] = {
+    const createdAt = Number(st && st.createdAt);
+    if (!st || !Number.isFinite(createdAt) || createdAt <= 0 || createdAt < since ||
+        st.importedAt || st.type === "trial" || have.has(String(code))) continue;
+    const mk = saleMonthKey(createdAt);
+    const safeCode = firebaseSafeKeyPart(code).slice(0, 100);
+    const entryKey = `new_${safeCode}_${Math.trunc(createdAt)}`;
+    (byMonth[mk] = byMonth[mk] || {})[entryKey] = {
       code: String(code), name: String(st.name || "").slice(0, 120), type: String(st.type || "custom"),
-      price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: st.createdAt
+      price: priceForType(st.type), kind: "new", by: String(st.createdBy || ""), ts: createdAt
     };
   }
-  for (const [mk, obj] of Object.entries(byMonth)) await fbPatch(`sales/${mk}`, obj);
+  for (const [mk, obj] of Object.entries(byMonth)) {
+    const clean = Object.fromEntries(Object.entries(obj).filter(([key, value]) =>
+      key && !/[.#$\[\]\/\u0000-\u001F\u007F]/.test(key) && value && typeof value === "object"
+    ));
+    if (Object.keys(clean).length) await fbPatch(`sales/${mk}`, clean);
+  }
   await fbSet("sales_meta", { backfilledAt: now() });
 }
 
@@ -1645,7 +1699,7 @@ function isMediaSegmentHost(urlOrHost) {
   return /floravon\.(online|shop)|c-cdn\.online|cloudfront\.shop/i.test(String(urlOrHost || ""));
 }
 
-async function streamFetch(session, url, extra = {}, clientHeaders = null) {
+async function streamFetch(session, url, extra = {}, clientHeaders = null, fetchOptions = {}) {
   if (!allowedStreamUrl(url, session)) throw new Error(`URL غير مسموح: ${url}`);
   const ch = clientHeaders || {};
   const headers = {
@@ -1656,7 +1710,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
     "X-Requested-With": CONFIG.STREAM_X_REQUESTED_WITH,
     "User-Agent": ch["user-agent"] || CONFIG.STREAM_UA
   };
-  if (!isMediaSegmentHost(url) && session?.token) {
+  if ((!isMediaSegmentHost(url) || fetchOptions.forceAuth === true) && session?.token) {
     headers.Authorization = `Bearer ${session.token}`;
   }
   for (const name of [
@@ -1668,7 +1722,7 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null) {
   for (const [k, v] of Object.entries(extra || {})) {
     if (v != null && v !== "") headers[k] = v;
   }
-  if (isMediaSegmentHost(url)) delete headers.Authorization;
+  if (isMediaSegmentHost(url) && fetchOptions.forceAuth !== true) delete headers.Authorization;
   const hasRange = Boolean(headers.Range || headers.range);
   return upstreamSlot(() =>
     fetchT(url, { headers, cache: "no-store", redirect: "follow" }, {
@@ -1843,7 +1897,10 @@ app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "stude
       return jsonError(res, 403, "انتهت صلاحية الاشتراك");
     }
 
-    const devices = student.devices || {};
+    // Older imports may store devices as a numeric count. Restore into a map keyed by deviceId.
+    const devices = student.devices && typeof student.devices === "object" && !Array.isArray(student.devices)
+      ? { ...student.devices }
+      : {};
     // reject banned devices
     const bannedMap = student.bannedDevices || {};
     if (deviceId && bannedMap[deviceId]) {
@@ -2669,10 +2726,24 @@ async function getStreamSession(id, touch = true) {
   return s;
 }
 
+function setStudentStreamCookie(req, res) {
+  try {
+    const secure = (req.secure || req.headers["x-forwarded-proto"] === "https") ? "; Secure" : "";
+    if (req.sessionToken) {
+      res.setHeader(
+        "Set-Cookie",
+        `ds_session=${encodeURIComponent(req.sessionToken)}; Path=/; HttpOnly; SameSite=None${secure}; Max-Age=${7 * 24 * 3600}`
+      );
+    }
+  } catch {}
+}
+
 app.post("/api/play/:videoId", requireStudent, async (req, res) => {
   try {
     const videoId = String(req.params.videoId || "").trim();
     if (!videoId) return jsonError(res, 400, "videoId مطلوب");
+    // Needed by Safari/native HLS, which cannot attach an Authorization header to video.src.
+    setStudentStreamCookie(req, res);
 
     // ثناويكا ids → المسار القديم تحت
     const isThanawicaId = /^th[pvmy]_/i.test(videoId);
@@ -2864,11 +2935,37 @@ function playlistBodyFromSession(session) {
 function getCoursatkStreamSession(id) {
   const s = streamSessions.get(id);
   if (!s || s.kind !== "coursatk-stream") return null;
-  s.lastUsed = now();
+  const t = now();
+  if ((s.lastUsed && t - s.lastUsed > CONFIG.STREAM_IDLE_MS) ||
+      (s.createdAt && t - s.createdAt > CONFIG.STREAM_MAX_MS)) {
+    streamSessions.delete(id);
+    return null;
+  }
+  s.lastUsed = t;
   return s;
 }
 
-async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders) {
+async function refreshCoursatkPlaySession(session) {
+  if (!session || !session.playId) throw new Error("جلسة المصدر غير مكتملة");
+  const data = await upstreamJson(
+    "/video/" + encodeURIComponent(session.playId) + "/stream-weave/play",
+    { method: "POST", headers: { Accept: "application/json" } }
+  );
+  const payload = data && data.data;
+  if (!payload || !payload.token || !payload.stream_url) {
+    throw new Error("المصدر لم يرجع توكن تشغيل صالح");
+  }
+  session.token = payload.token;
+  session.streamUrl = payload.stream_url;
+  if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
+    session.allowedHosts = new Set(session.allowedHosts || []);
+  }
+  try { session.allowedHosts.add(new URL(payload.stream_url).hostname); } catch {}
+  session.lastTokenRefresh = now();
+  return session;
+}
+
+async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders, refreshAttempted = false) {
   const lines = String(text || "").split(/\r?\n/);
   const out = [];
   let mediaSeq = 0;
@@ -2891,7 +2988,28 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
       if (uri && !keyFetched) {
         const keyUrl = new URL(uri, baseUrl).href;
         try { session.allowedHosts.add(new URL(keyUrl).hostname); } catch {}
-        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders);
+        const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders, { forceAuth: true });
+        if ((keyRes.status === 401 || keyRes.status === 403) && session.playId && !refreshAttempted) {
+          // الرابط القديم للمفتاح قد يكون موقّعًا وانتهت صلاحيته؛ جدّد التشغيل وأعد قراءة playlist جديدة.
+          await refreshCoursatkPlaySession(session);
+          const freshMaster = await streamFetch(session, session.streamUrl, {}, clientHeaders);
+          if (!freshMaster.ok) throw new Error("Refresh master HTTP " + freshMaster.status);
+          const freshText = await freshMaster.text();
+          const freshLines = freshText.split(/\r?\n/);
+          let freshVariant = null;
+          for (let i = 0; i < freshLines.length; i++) {
+            if (freshLines[i].trim().startsWith("#EXT-X-STREAM-INF")) {
+              const next = (freshLines[i + 1] || "").trim();
+              if (next && !next.startsWith("#")) { freshVariant = new URL(next, session.streamUrl).href; break; }
+            }
+          }
+          if (freshVariant) {
+            const freshMedia = await streamFetch(session, freshVariant, {}, clientHeaders);
+            if (!freshMedia.ok) throw new Error("Refresh variant HTTP " + freshMedia.status);
+            return rewriteCoursatkPlaylist(sessionId, session, await freshMedia.text(), freshVariant, res, clientHeaders, true);
+          }
+          return rewriteCoursatkPlaylist(sessionId, session, freshText, session.streamUrl, res, clientHeaders, true);
+        }
         if (!keyRes.ok) throw new Error("Key HTTP " + keyRes.status);
         const wrapped = Buffer.from(await keyRes.arrayBuffer());
         if (String(uri).includes("/user/auth/") || session.mode === "cdn") {
@@ -2932,20 +3050,13 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
     if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
 
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
-    if ((master.status === 401 || master.status === 403) && session.playId) {
+    if ((master.status === 401 || master.status === 403 || master.status === 404) && session.playId) {
       try {
-        const data = await upstreamJson("/video/" + encodeURIComponent(session.playId) + "/stream-weave/play", {
-          method: "POST",
-          headers: { Accept: "application/json" }
-        });
-        if (data && data.data && data.data.token) {
-          session.token = data.data.token;
-          if (data.data.stream_url) session.streamUrl = data.data.stream_url;
-        }
+        await refreshCoursatkPlaySession(session);
+        master = await streamFetch(session, session.streamUrl, {}, req.headers);
       } catch (e) {
-        console.warn("[cplay] refresh token", e.message);
+        console.warn("[cplay] refresh token:", e.message);
       }
-      master = await streamFetch(session, session.streamUrl, {}, req.headers);
     }
     if (!master.ok) return jsonError(res, 502, "Stream master HTTP " + master.status);
     const masterText = await master.text();
@@ -3221,8 +3332,8 @@ app.post("/api/admin/login", rateLimit({ max: 10, windowMs: 60_000, scope: "admi
     }
 
     if (username === CONFIG.BOOTSTRAP_ADMIN.username) {
-      const ok = scryptVerify(password, CONFIG.BOOTSTRAP_ADMIN.passwordHash) ||
-        password === CONFIG.BOOTSTRAP_ADMIN.passwordPlain;
+      const ok = Boolean(CONFIG.BOOTSTRAP_ADMIN.passwordHash) &&
+        scryptVerify(password, CONFIG.BOOTSTRAP_ADMIN.passwordHash);
       if (!ok) return failAuth();
       adminId = "bootstrap";
       perms = CONFIG.BOOTSTRAP_ADMIN.permissions;
@@ -3800,7 +3911,7 @@ app.get("/api/admin/runtime", requireAdmin("admins_manage"), async (_req, res) =
   res.json({
     success: true,
     data: {
-      firebaseUrl: runtime.firebaseUrl || "",
+      firebaseUrl: getFirebaseUrl() || "",
       storageBucket: runtime.storageBucket || getStorageBucket(),
       firebaseConfigured: Boolean(getFirebaseUrl()),
       coursatkTokenSet: Boolean(getCoursatkTokenSync()),
@@ -3822,8 +3933,12 @@ app.put("/api/admin/runtime", requireAdmin("admins_manage"), async (req, res) =>
       if (url && !url.startsWith("https://")) {
         return jsonError(res, 400, "رابط Firebase يجب أن يبدأ بـ https://");
       }
-      runtime.firebaseUrl = url;
-      CONFIG.FIREBASE = url;
+      const fixedUrl = String(process.env.FIREBASE_URL || CONFIG.FIREBASE).replace(/\/$/, "");
+      if (url && url !== fixedUrl) {
+        return jsonError(res, 409, "رابط Firebase ثابت في إعدادات Fly؛ حدّثه من Secrets");
+      }
+      runtime.firebaseUrl = fixedUrl;
+      CONFIG.FIREBASE = fixedUrl;
     }
     if (b.coursatkToken != null && String(b.coursatkToken).trim()) {
       runtime.coursatkToken = String(b.coursatkToken).trim();
@@ -4851,7 +4966,10 @@ setInterval(() => {
 }, 60_000).unref();
 
 // Boot: hash bootstrap password properly + load crypto
-CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
+if (CONFIG.BOOTSTRAP_ADMIN.passwordPlain) {
+  CONFIG.BOOTSTRAP_ADMIN.passwordHash = scryptHash(CONFIG.BOOTSTRAP_ADMIN.passwordPlain);
+  CONFIG.BOOTSTRAP_ADMIN.passwordPlain = "";
+}
 await loadDecryptionUtils();
 try {
   if (CONFIG.THANAWICA_ENABLED && CONFIG.THANAWICA_CODE) {
@@ -4902,9 +5020,9 @@ try {
   console.warn("[API] section seed skip:", e.message);
 }
 
-const server = app.listen(CONFIG.PORT, () => {
+const server = app.listen(CONFIG.PORT, "0.0.0.0", () => {
   console.log(`[API ${APP_VERSION}] :${CONFIG.PORT} protected · segment-decrypt ON · segment-cache ${Math.round(SEG_CACHE_MAX / 1048576)}MB`);
-  console.log(`[API] bootstrap admin ready (Hema)`);
+  console.log(`[API] bootstrap admin ${CONFIG.BOOTSTRAP_ADMIN.passwordHash ? "enabled" : "disabled (set BOOTSTRAP_ADMIN_PASSWORD)"}`);
 });
 // Railway/الـ proxy بيفضّل الاتصال مفتوح أطول من الـ default بتاع Node (5 ثواني) — ده كان بيسبب ECONNRESET متقطع
 server.keepAliveTimeout = 65_000;
@@ -4916,3 +5034,4 @@ process.on("SIGTERM", () => {
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 10_000).unref();
 });
+
