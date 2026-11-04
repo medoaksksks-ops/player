@@ -1,6 +1,6 @@
 /**
  * Coursatk API — protected backend
- * VERSION v1.2 — 5h catalog cache & low upstream load (per-student video sessions, segment cache, request coalescing,
+ * VERSION v1.18 — anti-bulk-video-download limits + 5h catalog cache & low upstream load (per-student video sessions, segment cache, request coalescing,
  *                upstream/Firebase timeouts, auth cache, crash guards, sliding stream sessions)
  * - Student codes (7-digit) + devices + sessions in Firebase RTDB
  * - Admin panel API (users, permissions, sections, subject IDs)
@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.13-admin-server-stats";
+const APP_VERSION = "v1.19-token-bound-strong-video-limits";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -106,6 +106,28 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
 // when the app is exposed directly, or match the actual proxy chain.
 const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || "1", 10);
 app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
+
+// Block browser-originated requests from the specified domains.
+// This checks Origin and Referer; non-browser clients can omit or forge these headers,
+// so enforce the same deny rule at the CDN/WAF if a hard network-level block is required.
+const BLOCKED_REQUEST_HOSTS = new Set(["mesari.online", "api.mesari.online"]);
+function isBlockedRequestSource(value) {
+  if (!value || typeof value !== "string") return false;
+  try {
+    const hostname = new URL(value).hostname.toLowerCase().replace(/\.$/, "");
+    return BLOCKED_REQUEST_HOSTS.has(hostname) || hostname.endsWith(".mesari.online");
+  } catch {
+    return false;
+  }
+}
+app.use((req, res, next) => {
+  const origin = req.get("origin");
+  const referer = req.get("referer");
+  if (isBlockedRequestSource(origin) || isBlockedRequestSource(referer)) {
+    return res.status(403).json({ ok: false, error: "FORBIDDEN", message: "هذا النطاق غير مسموح له بالوصول." });
+  }
+  next();
+});
 
 // Public CORS: allow browser requests from any origin (without cookies/credentials).
 app.use(cors({
@@ -314,7 +336,7 @@ setInterval(() => {
 
 
 // ═══════════════════════════════════════════════════════════
-// Login fail lock — 5 محاولات غلط → قفل الجهاز 15 دقيقة (مع قفل IP احتياطي)
+// Login fail lock — 5 محاولات غلط على أي أكواد مجتمعة → قفل الجهاز 15 دقيقة (مع قفل IP احتياطي)
 // ═══════════════════════════════════════════════════════════
 const LOGIN_MAX_FAILS = 5;
 const LOGIN_LOCK_MS = 15 * 60_000; // ربع ساعة
@@ -322,6 +344,10 @@ const loginFails = new Map(); // key -> { count, lockedUntil }
 
 /** مفتاح القفل: للجهاز (deviceId) أولوية — مع IP كطبقة تانية */
 function loginFailKey(kind, deviceOrIp, id) {
+  // Student login attempts are counted per device/IP, NOT per code.
+  // Trying different student codes does not reset or split the five-attempt limit.
+  if (kind === "student") return kind + ":" + String(deviceOrIp || "unknown");
+  // Admin lockout remains scoped to the supplied admin username.
   return kind + ":" + String(deviceOrIp || "unknown") + ":" + String(id || "").toLowerCase();
 }
 
@@ -1776,6 +1802,48 @@ async function streamFetch(session, url, extra = {}, clientHeaders = null, fetch
 }
 
 // ═══════════════════════════════════════════════════════════
+// Anti bulk-download protection — all video limits are keyed to the authenticated
+// student session token (hashed; never stored as a raw rate-limit key).
+function studentTokenRateKey(req) {
+  const token = getBearer(req); // includes Authorization, x-session-token and HttpOnly ds_session cookie
+  return token
+    ? "student-token:" + crypto.createHash("sha256").update(token).digest("hex")
+    : "no-token-ip:" + clientIp(req);
+}
+
+// Opening videos: strict per-token limits to stop automated catalog/video sweeps.
+const playbackStartLimit = rateLimit({
+  max: 3,
+  windowMs: 60_000,
+  scope: "playback-start-3-per-minute",
+  banAfter: 5,
+  banMs: 15 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const playbackStartLongLimit = rateLimit({
+  max: 8,
+  windowMs: 10 * 60_000,
+  scope: "playback-start-8-per-10m",
+  banAfter: 4,
+  banMs: 30 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const playbackManifestLimit = rateLimit({
+  max: 15,
+  windowMs: 60_000,
+  scope: "playback-manifest-15-per-minute",
+  banAfter: 8,
+  banMs: 10 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const playbackManifestLongLimit = rateLimit({
+  max: 60,
+  windowMs: 10 * 60_000,
+  scope: "playback-manifest-60-per-10m",
+  keyFn: studentTokenRateKey
+});
+
+// ═══════════════════════════════════════════════════════════
 // PUBLIC (no auth)
 // ═══════════════════════════════════════════════════════════
 // Global: soft only (prevents total abuse, won't block normal admin/import)
@@ -1807,6 +1875,68 @@ app.use(
     keyFn: (req) => "t:" + (getBearer(req) || clientIp(req))
   })
 );
+// حماية موحدة لكل واجهات API: 20 طلبًا في الدقيقة لكل جلسة/عميل.
+// نستخدم بصمة التوكن بدل IP وحده حتى لا تتأثر أجهزة الطلاب الأخرى على شبكة المدرسة.
+// مقاطع الفيديو مستثناة من حد API العام، لكنها محمية بحدود تشغيل ومقاطع منفصلة أدناه.
+const apiRequestLimit = rateLimit({
+  max: 20,
+  windowMs: 60_000,
+  scope: "api-all-20",
+  keyFn: (req) => {
+    const token = getBearer(req);
+    return token ? "token:" + crypto.createHash("sha256").update(token).digest("hex") : "ip:" + clientIp(req);
+  },
+  skip: (req) => {
+    const url = req.originalUrl || req.url || "";
+    return req.method === "OPTIONS" ||
+      url.startsWith("/health") ||
+      /\/api\/(?:cplay\/segment|hls\/[^/?]+\/seg|stream\/segment)\//.test(url);
+  }
+});
+app.use((req, res, next) => {
+  if (!req.path.startsWith("/api/")) return next();
+  return apiRequestLimit(req, res, next);
+});
+
+// مقاطع الفيديو: 60/دقيقة + 12/10 ثوانٍ + 300/10 دقائق، وكلها مرتبطة بتوكن الطالب.
+// تم اختيار حد يسمح بالتشغيل المتواصل المعتاد ويصعّب السحب الآلي المتوازي/المتتابع.
+const videoSegmentLimit = rateLimit({
+  max: 60,
+  windowMs: 60_000,
+  scope: "video-segments-60-per-minute",
+  banAfter: 5,
+  banMs: 15 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const videoSegmentBurstLimit = rateLimit({
+  max: 12,
+  windowMs: 10_000,
+  scope: "video-segment-burst-12-per-10s",
+  banAfter: 4,
+  banMs: 15 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const videoSegmentSustainedLimit = rateLimit({
+  max: 300,
+  windowMs: 10 * 60_000,
+  scope: "video-segments-300-per-10m",
+  banAfter: 4,
+  banMs: 30 * 60_000,
+  keyFn: studentTokenRateKey
+});
+const applySegmentLimits = (req, res, next) => videoSegmentLimit(req, res, (err) => {
+  if (err) return next(err);
+  videoSegmentBurstLimit(req, res, (err2) => {
+    if (err2) return next(err2);
+    videoSegmentSustainedLimit(req, res, next);
+  });
+});
+app.use("/api/cplay/segment/", applySegmentLimits);
+app.use("/api/hls/", (req, res, next) => {
+  if (/^\/[^/]+\/seg\//.test(req.path)) return applySegmentLimits(req, res, next);
+  next();
+});
+app.use("/api/stream/segment/", applySegmentLimits);
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -1881,7 +2011,7 @@ app.get("/api/public/site", rateLimit({ max: 120, windowMs: 60_000, scope: "publ
  * POST /api/auth/login
  * body: { code: "1234567", deviceId: "uuid", deviceName?: "Chrome" }
  */
-app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "student-login", keyFn: (req) => `${clientIp(req)}:${String(req.body?.deviceId || "no-device").slice(0, 120)}` }), async (req, res) => {
+app.post("/api/auth/login", rateLimit({ max: 10, windowMs: 60_000, scope: "student-login", keyFn: (req) => `${clientIp(req)}:${String(req.body?.deviceId || "no-device").slice(0, 120)}` }), async (req, res) => {
   try {
     const code = String(req.body?.code || "").trim();
     const deviceId = String(req.body?.deviceId || "").trim();
@@ -2780,7 +2910,7 @@ function setStudentStreamCookie(req, res) {
   } catch {}
 }
 
-app.post("/api/play/:videoId", requireStudent, async (req, res) => {
+app.post("/api/play/:videoId", requireStudent, playbackStartLimit, playbackStartLongLimit, async (req, res) => {
   try {
     const videoId = String(req.params.videoId || "").trim();
     if (!videoId) return jsonError(res, 400, "videoId مطلوب");
@@ -3119,7 +3249,7 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
   res.send(out.join("\n"));
 }
 
-app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
+app.get("/api/cplay/manifest/:sessionId", requireStudent, playbackManifestLimit, playbackManifestLongLimit, async (req, res) => {
   try {
     const session = getCoursatkStreamSession(req.params.sessionId);
     if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية — افتح الفيديو من جديد");
@@ -3209,7 +3339,7 @@ app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, re
 });
 
 
-app.get("/api/hls/:pid/master.m3u8", requireStudent, async (req, res) => {
+app.get("/api/hls/:pid/master.m3u8", requireStudent, playbackManifestLimit, playbackManifestLongLimit, async (req, res) => {
   try {
     const session = await getStreamSession(req.params.pid);
     assertStreamOwner(session, req);
