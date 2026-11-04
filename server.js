@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v2.1-shared-play-auto-refresh";
+const APP_VERSION = "v1.8-cplay-light";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -74,17 +74,10 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
 const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || "1", 10);
 app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
 
-// Credentialed CORS must use an explicit allowlist (never reflect arbitrary Origin).
-const allowedOrigins = new Set(
-  (process.env.CORS_ALLOWED_ORIGINS || "https://coursatk.online,https://www.coursatk.online,https://thanawya-club.vercel.app")
-    .split(",").map((x) => x.trim()).filter(Boolean)
-);
+// Public CORS: allow browser requests from any origin (without cookies/credentials).
 app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
-    return callback(null, false);
-  },
-  credentials: true,
+  origin: "*",
+  credentials: false,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 
@@ -291,7 +284,7 @@ setInterval(() => {
 // Login fail lock — 5 محاولات غلط → قفل ربع ساعة (حسب الموبايل/الجهاز)
 // ═══════════════════════════════════════════════════════════
 const LOGIN_MAX_FAILS = 5;
-const LOGIN_LOCK_MS = 24 * 60 * 60_000; // حظر الجهاز لمدة 24 ساعة بعد 5 محاولات خاطئة
+const LOGIN_LOCK_MS = 15 * 60_000; // ربع ساعة
 const loginFails = new Map(); // key -> { count, lockedUntil }
 
 /** مفتاح القفل: للجهاز (deviceId) أولوية — مع IP كطبقة تانية */
@@ -402,10 +395,10 @@ const CONFIG = {
   FIREBASE: "https://plus-f09b5-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
-    username: "Ali",
-    // كلمة المرور تُحوّل إلى hash عند تشغيل السيرفر
+    username: "Hema",
+    // password set below — hashed at boot
     passwordHash: "",
-    passwordPlain: process.env.BOOTSTRAP_ADMIN_PASSWORD || "Ali1@#",
+    passwordPlain: process.env.BOOTSTRAP_ADMIN_PASSWORD || "",
     permissions: {
       students_create: true,
       students_edit: true,
@@ -1652,107 +1645,29 @@ async function upstreamJsonRaw(apiPath, options = {}) {
   return data;
 }
 
-// كاش بيانات الكتالوج والمحتوى: 10 ساعات في الذاكرة + Firebase ليستمر بعد إعادة تشغيل السيرفر.
-// لا يشمل طلبات POST الخاصة بإنشاء جلسة تشغيل الفيديو أو أي توكن تشغيل.
-const upCache = new Map(); // apiPath -> { data, exp, stale, fetchedAt }
-const UP_CACHE_TTL_MS = Math.max(
-  60_000,
-  Number(process.env.COURSATK_CACHE_TTL_MS || 10 * 60 * 60_000)
-);
-const UP_STALE_MS = Math.max(UP_CACHE_TTL_MS, Number(process.env.COURSATK_CACHE_STALE_MS || 24 * 60 * 60_000));
-
-function isCacheableCoursatkGet(apiPath) {
-  const p = String(apiPath || "").split("?")[0];
-  return (
-    /^\/user\/subjects(?:\/[^/]+\/teachers)?$/.test(p) ||
-    /^\/user\/teachers\/[^/]+\/chapters$/.test(p) ||
-    /^\/user\/chapters\/[^/]+\/lectures$/.test(p) ||
-    /^\/user\/lectures\/[^/]+\/content$/.test(p) ||
-    /^\/video\/[^/]+\/platforms$/.test(p) ||
-    /^\/video\/[^/]+$/.test(p) ||
-    /^\/user\/videos\/[^/]+$/.test(p) ||
-    /^\/videos\/[^/]+$/.test(p)
-  );
+// الردود دي واحدة لكل الطلاب (توكن واحد) → نخزّنها ونجيبها مرة واحدة بس، ولو السيرفر الأصلي وقع نرجّع آخر نسخة
+const upCache = new Map(); // path -> { data, exp, stale }
+const UP_STALE_MS = 30 * 60_000;
+function upTtl(apiPath) {
+  return /\/lectures\/[^/]+\/content/.test(apiPath) ? 60_000 : 180_000;
 }
-
-function upstreamCacheFirebasePath(apiPath) {
-  const hash = crypto.createHash("sha256").update(String(apiPath)).digest("hex");
-  return `coursatk_cache_v1/${hash}`;
-}
-
-async function readUpstreamCacheFromFirebase(apiPath) {
-  try {
-    if (!getFirebaseUrl()) return null;
-    const row = await fbGet(upstreamCacheFirebasePath(apiPath));
-    if (!row || row.apiPath !== apiPath || !Object.prototype.hasOwnProperty.call(row, "data")) return null;
-    const fetchedAt = Number(row.fetchedAt) || 0;
-    if (!fetchedAt) return null;
-    return {
-      data: row.data,
-      fetchedAt,
-      exp: Number(row.expiresAt) || (fetchedAt + UP_CACHE_TTL_MS),
-      stale: Number(row.staleUntil) || (fetchedAt + UP_STALE_MS)
-    };
-  } catch (e) {
-    console.warn("[upstream cache] Firebase read:", e.message);
-    return null;
-  }
-}
-
-async function writeUpstreamCacheToFirebase(apiPath, entry) {
-  try {
-    if (!getFirebaseUrl()) return;
-    await fbSet(upstreamCacheFirebasePath(apiPath), {
-      apiPath,
-      data: entry.data,
-      fetchedAt: entry.fetchedAt,
-      expiresAt: entry.exp,
-      staleUntil: entry.stale
-    });
-  } catch (e) {
-    // فشل حفظ الكاش لا يمنع الطالب من استلام الرد.
-    console.warn("[upstream cache] Firebase write:", e.message);
-  }
-}
-
 async function upstreamJson(apiPath, options = {}) {
   const isGet = !options.method || String(options.method).toUpperCase() === "GET";
-  if (!isGet || !isCacheableCoursatkGet(apiPath)) {
-    return upstreamJsonRaw(apiPath, options);
+  if (!isGet) return upstreamJsonRaw(apiPath, options);
+  const hit = upCache.get(apiPath);
+  if (hit && Date.now() < hit.exp) return hit.data;
+  try {
+    const data = await coalesce("up:" + apiPath, () => upstreamJsonRaw(apiPath, options));
+    const t = Date.now();
+    upCache.set(apiPath, { data, exp: t + upTtl(apiPath), stale: t + UP_STALE_MS });
+    return data;
+  } catch (e) {
+    if (hit && Date.now() < hit.stale) {
+      console.warn("[upstream] served stale:", apiPath, e.message);
+      return hit.data;
+    }
+    throw e;
   }
-
-  return coalesce("up:" + apiPath, async () => {
-    let hit = upCache.get(apiPath) || null;
-    if (hit && Date.now() < hit.exp) return hit.data;
-
-    // عند انتهاء كاش الذاكرة، افحص نسخة Firebase لاحتمال أن instance أخرى حدّثتها.
-    const remote = await readUpstreamCacheFromFirebase(apiPath);
-    if (remote && (!hit || remote.fetchedAt > hit.fetchedAt)) {
-      hit = remote;
-      upCache.set(apiPath, remote);
-    }
-    if (hit && Date.now() < hit.exp) return hit.data;
-
-    try {
-      const data = await upstreamJsonRaw(apiPath, options);
-      const t = Date.now();
-      const entry = {
-        data,
-        fetchedAt: t,
-        exp: t + UP_CACHE_TTL_MS,
-        stale: t + UP_STALE_MS
-      };
-      upCache.set(apiPath, entry);
-      await writeUpstreamCacheToFirebase(apiPath, entry);
-      return data;
-    } catch (e) {
-      if (hit && Date.now() < hit.stale) {
-        console.warn("[upstream] served stale cache:", apiPath, e.message);
-        return hit.data;
-      }
-      throw e;
-    }
-  });
 }
 
 function allowedStreamUrl(raw, session = null) {
@@ -1909,44 +1824,6 @@ app.get("/api/public/site", rateLimit({ max: 120, windowMs: 60_000, scope: "publ
   });
 });
 
-// حظر جهاز تسجيل الدخول محفوظ في Firebase حتى لا يختفي بعد إعادة تشغيل السيرفر.
-function studentDeviceLockPath(deviceId) {
-  const hash = crypto.createHash("sha256").update(String(deviceId)).digest("hex");
-  return `login_device_locks/${hash}`;
-}
-async function checkPersistentStudentDeviceLock(deviceId) {
-  try {
-    if (!getFirebaseUrl()) return null;
-    const row = await fbGet(studentDeviceLockPath(deviceId));
-    if (!row) return null;
-    const until = Number(row.blockedUntil) || 0;
-    if (until > Date.now()) return { locked: true, sec: Math.ceil((until - Date.now()) / 1000) };
-    if (until && until <= Date.now()) await fbDelete(studentDeviceLockPath(deviceId));
-  } catch (e) {
-    console.warn("[login device lock] read:", e.message);
-  }
-  return null;
-}
-async function recordPersistentStudentDeviceFail(deviceId) {
-  try {
-    if (!getFirebaseUrl()) return null;
-    const path = studentDeviceLockPath(deviceId);
-    const row = (await fbGet(path)) || {};
-    const count = (Number(row.count) || 0) + 1;
-    const blockedUntil = count >= LOGIN_MAX_FAILS ? Date.now() + LOGIN_LOCK_MS : 0;
-    await fbSet(path, { count: blockedUntil ? 0 : count, blockedUntil, updatedAt: Date.now() });
-    return blockedUntil ? { locked: true, sec: Math.ceil(LOGIN_LOCK_MS / 1000) } : { locked: false, remaining: LOGIN_MAX_FAILS - count };
-  } catch (e) {
-    console.warn("[login device lock] write:", e.message);
-    return null;
-  }
-}
-async function clearPersistentStudentDeviceLock(deviceId) {
-  try { if (getFirebaseUrl()) await fbDelete(studentDeviceLockPath(deviceId)); } catch (e) {
-    console.warn("[login device lock] clear:", e.message);
-  }
-}
-
 // ═══════════════════════════════════════════════════════════
 // STUDENT AUTH
 // ═══════════════════════════════════════════════════════════
@@ -1968,14 +1845,7 @@ app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "stude
       return jsonError(res, 400, "deviceId مطلوب");
     }
 
-    // قفل شامل للجهاز: المحاولات تُحسب حتى لو جرّب أكوادًا مختلفة.
-    const deviceWideLock = await checkPersistentStudentDeviceLock(deviceId) || checkLoginLock("student", "dev:" + deviceId, "__device_global__");
-    if (deviceWideLock && deviceWideLock.locked) {
-      res.setHeader("Retry-After", String(deviceWideLock.sec));
-      return jsonError(res, 429, `الجهاز محظور مؤقتًا بعد 5 محاولات خاطئة — حاول بعد ${Math.ceil(deviceWideLock.sec / 3600)} ساعة`);
-    }
-
-    const lock = checkLoginLockAny("student", deviceId, ip, code);
+        const lock = checkLoginLockAny("student", deviceId, ip, code);
     if (lock && lock.locked) {
       res.setHeader("Retry-After", String(lock.sec));
       return jsonError(res, 429, `الموبايل اتقفل مؤقتًا بعد محاولات غلط — جرّب بعد ${Math.ceil(lock.sec / 60)} دقيقة`);
@@ -1983,19 +1853,12 @@ app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "stude
 
     const student = await fbGet(`students/${code}`);
     if (!student || student.active === false) {
-      const persistentDeviceFail = await recordPersistentStudentDeviceFail(deviceId);
-      const deviceFail = persistentDeviceFail || recordLoginFail("student", "dev:" + deviceId, "__device_global__");
-      if (persistentDeviceFail) recordLoginFail("student", "dev:" + deviceId, "__device_global__");
       const fail = recordLoginFailBoth("student", deviceId, ip, code);
-      if (deviceFail.locked) {
-        res.setHeader("Retry-After", String(deviceFail.sec));
-        return jsonError(res, 429, "تم حظر هذا الجهاز لمدة 24 ساعة بعد 5 محاولات خاطئة");
-      }
       if (fail.locked) {
         res.setHeader("Retry-After", String(fail.sec));
-        return jsonError(res, 429, "محاولات خاطئة كثيرة — حاول بعد 24 ساعة");
+        return jsonError(res, 429, `محاولات خاطئة كثيرة — حاول بعد 15 دقيقة`);
       }
-      return jsonError(res, 401, `كود غير صحيح أو موقوف (متبقي ${Math.min(fail.remaining ?? 5, deviceFail.remaining ?? 5)} محاولات)`);
+      return jsonError(res, 401, `كود غير صحيح أو موقوف (متبقي ${fail.remaining} محاولات)`);
     }
 
     // Activate subscription on FIRST login only
@@ -2077,8 +1940,6 @@ app.post("/api/auth/login", rateLimit({ max: 12, windowMs: 60_000, scope: "stude
     studentSessions.set(token, sess);
     try { await fbSet(`sessions/${token}`, sess); } catch (e) { console.warn("[login] session fb:", e.message); }
     clearLoginFailBoth("student", deviceId, ip, code);
-    clearLoginFail("student", "dev:" + deviceId, "__device_global__");
-    await clearPersistentStudentDeviceLock(deviceId);
 
     // Resolve subject IDs for section (hardcoded fallback + Firebase)
     let subjectIds = [];
@@ -2883,33 +2744,33 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     // كورساتك: مسار خفيف زي السيرفر الصغير (من غير buildPlaylist)
     if (!isThanawicaId) {
       try {
-        const payload = await getSharedCoursatkPlayPayload(videoId);
-        if (payload && payload.token && payload.stream_url) {
+        const data = await upstreamJson(
+          "/video/" + encodeURIComponent(videoId) + "/stream-weave/play",
+          { method: "POST", headers: { Accept: "application/json" } }
+        );
+        if (data && data.success && data.data && data.data.token && data.data.stream_url) {
           const id = crypto.randomUUID();
           const hosts = new Set(CONFIG.STREAM_HOSTS);
-          try { hosts.add(new URL(payload.stream_url).hostname); } catch {}
+          try { hosts.add(new URL(data.data.stream_url).hostname); } catch {}
           streamSessions.set(id, {
             id,
             kind: "coursatk-stream",
-            videoId: String(payload.video_id || videoId),
-            token: payload.token,
-            streamUrl: payload.stream_url,
+            videoId: String(data.data.video_id || videoId),
+            token: data.data.token,
+            streamUrl: data.data.stream_url,
             playId: videoId,
             createdAt: now(),
             lastUsed: now(),
-            lastTokenRefresh: now(),
             plainKey: null,
             defaultIv: null,
             allowedHosts: hosts,
-            // جلسة محلية مستقلة لكل طالب، مع مشاركة جلسة كورساتك الأصلية.
-            ownerCode: req.session.code,
-            ownerToken: req.sessionToken
+            ownerCode: req.session.code
           });
           return res.json({
             success: true,
             data: {
               session: id,
-              video_id: payload.video_id || videoId,
+              video_id: data.data.video_id || videoId,
               manifest_url: "/api/cplay/manifest/" + id,
               play_url: "/api/cplay/manifest/" + id
             }
@@ -3077,34 +2938,16 @@ function getCoursatkStreamSession(id) {
   return s;
 }
 
-// جلسة كورساتك الأصلية مشتركة لكل الطلاب لنفس الفيديو لمدة 10 ساعات.
-// كل طالب يظل له session ID محلي مستقل للتحقق من صلاحيات حسابه داخل دروسك بلس.
-const coursatkPlayCache = new Map(); // videoId -> { payload, expiresAt }
-const COURSATK_PLAY_CACHE_TTL_MS = Math.max(60_000, Number(process.env.COURSATK_PLAY_SESSION_TTL_MS || 10 * 60 * 60_000));
-
-async function getSharedCoursatkPlayPayload(videoId, forceRefresh = false) {
-  const key = String(videoId);
-  return coalesce("coursatk-play-shared:" + key, async () => {
-    const cached = coursatkPlayCache.get(key);
-    if (!forceRefresh && cached && Date.now() < cached.expiresAt) return cached.payload;
-    const response = await upstreamJsonRaw(
-      "/video/" + encodeURIComponent(key) + "/stream-weave/play",
-      { method: "POST", headers: { Accept: "application/json" } }
-    );
-    const payload = response && response.data;
-    if (!response?.success || !payload?.token || !payload?.stream_url) {
-      throw new Error("كورساتك لم يرجع جلسة تشغيل صالحة");
-    }
-    const entry = { payload, expiresAt: Date.now() + COURSATK_PLAY_CACHE_TTL_MS };
-    coursatkPlayCache.set(key, entry);
-    return payload;
-  });
-}
-
-async function refreshCoursatkPlaySession(session, forceRefresh = true) {
+async function refreshCoursatkPlaySession(session) {
   if (!session || !session.playId) throw new Error("جلسة المصدر غير مكتملة");
-  // عند رفض الجلسة القديمة من المصدر، اطلب جلسة جديدة فعليًا وتشاركها كل جلسات الطلاب للفيديو نفسه.
-  const payload = await getSharedCoursatkPlayPayload(session.playId, forceRefresh);
+  const data = await upstreamJson(
+    "/video/" + encodeURIComponent(session.playId) + "/stream-weave/play",
+    { method: "POST", headers: { Accept: "application/json" } }
+  );
+  const payload = data && data.data;
+  if (!payload || !payload.token || !payload.stream_url) {
+    throw new Error("المصدر لم يرجع توكن تشغيل صالح");
+  }
   session.token = payload.token;
   session.streamUrl = payload.stream_url;
   if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
@@ -3141,7 +2984,7 @@ async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, c
         const keyRes = await streamFetch(session, keyUrl, {}, clientHeaders, { forceAuth: true });
         if ((keyRes.status === 401 || keyRes.status === 403) && session.playId && !refreshAttempted) {
           // الرابط القديم للمفتاح قد يكون موقّعًا وانتهت صلاحيته؛ جدّد التشغيل وأعد قراءة playlist جديدة.
-          await refreshCoursatkPlaySession(session, true);
+          await refreshCoursatkPlaySession(session);
           const freshMaster = await streamFetch(session, session.streamUrl, {}, clientHeaders);
           if (!freshMaster.ok) throw new Error("Refresh master HTTP " + freshMaster.status);
           const freshText = await freshMaster.text();
@@ -3202,7 +3045,7 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
     if ((master.status === 401 || master.status === 403 || master.status === 404) && session.playId) {
       try {
-        await refreshCoursatkPlaySession(session, true);
+        await refreshCoursatkPlaySession(session);
         master = await streamFetch(session, session.streamUrl, {}, req.headers);
       } catch (e) {
         console.warn("[cplay] refresh token:", e.message);
