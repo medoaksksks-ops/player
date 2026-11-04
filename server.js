@@ -1,6 +1,6 @@
 /**
  * Coursatk API — protected backend
- * VERSION v1.1 — scaling & stability (shared video sources, segment cache, request coalescing,
+ * VERSION v1.2 — 5h catalog cache & low upstream load (per-student video sessions, segment cache, request coalescing,
  *                upstream/Firebase timeouts, auth cache, crash guards, sliding stream sessions)
  * - Student codes (7-digit) + devices + sessions in Firebase RTDB
  * - Admin panel API (users, permissions, sections, subject IDs)
@@ -40,7 +40,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.join(__dirname, "data");
 const MEDIA_DIR = path.join(DATA_DIR, "media");
 try { fs.mkdirSync(MEDIA_DIR, { recursive: true }); } catch {}
-const APP_VERSION = "v1.8-cplay-light";
+const APP_VERSION = "v1.13-admin-server-stats";
 
 // ═══════════════════════════════════════════════════════════
 // Crash guards — أي خطأ غير متوقع يتسجل بدل ما السيرفر يقع (ويضيّع كل جلسات التشغيل)
@@ -60,6 +60,39 @@ function wrapAsync(fn) {
 }
 
 const app = express();
+
+// Lightweight operational metrics for the protected admin dashboard.
+const serverMetrics = {
+  startedAt: Date.now(),
+  requests: 0,
+  responses4xx: 0,
+  responses5xx: 0,
+  upstreamCalls: 0,
+  upstreamFailures: 0,
+  upstreamCacheHits: 0,
+  playbackSessionsCreated: 0,
+  playbackSessionsRefreshed: 0,
+  recentIssues: []
+};
+function addServerIssue(kind, message, extra = {}) {
+  const item = { at: Date.now(), kind: String(kind), message: String(message || "").slice(0, 240), ...extra };
+  serverMetrics.recentIssues.unshift(item);
+  if (serverMetrics.recentIssues.length > 40) serverMetrics.recentIssues.length = 40;
+}
+app.use((req, res, next) => {
+  serverMetrics.requests++;
+  const started = Date.now();
+  res.on("finish", () => {
+    const status = res.statusCode || 0;
+    if (status >= 500) {
+      serverMetrics.responses5xx++;
+      addServerIssue("http_5xx", `${req.method} ${req.path} returned ${status}`, { status, durationMs: Date.now() - started });
+    } else if (status >= 400) {
+      serverMetrics.responses4xx++;
+    }
+  });
+  next();
+});
 // Express 4 مبيمسكش أخطاء الـ async handlers → كانت بتعمل unhandledRejection وتقفّل السيرفر. نلفّهم كلهم.
 for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
   const orig = app[m].bind(app);
@@ -281,7 +314,7 @@ setInterval(() => {
 
 
 // ═══════════════════════════════════════════════════════════
-// Login fail lock — 5 محاولات غلط → قفل ربع ساعة (حسب الموبايل/الجهاز)
+// Login fail lock — 5 محاولات غلط → قفل الجهاز 15 دقيقة (مع قفل IP احتياطي)
 // ═══════════════════════════════════════════════════════════
 const LOGIN_MAX_FAILS = 5;
 const LOGIN_LOCK_MS = 15 * 60_000; // ربع ساعة
@@ -395,10 +428,10 @@ const CONFIG = {
   FIREBASE: "https://plus-f09b5-default-rtdb.firebaseio.com",
   // Bootstrap admin (always valid even if Firebase empty)
   BOOTSTRAP_ADMIN: {
-    username: "Hema",
+    username: "Ali",
     // password set below — hashed at boot
     passwordHash: "",
-    passwordPlain: process.env.BOOTSTRAP_ADMIN_PASSWORD || "",
+    passwordPlain: process.env.BOOTSTRAP_ADMIN_PASSWORD || "Ali1@#",
     permissions: {
       students_create: true,
       students_edit: true,
@@ -1061,6 +1094,10 @@ async function refreshCoursatkTokenFromFb() {
 const studentSessions = new Map(); // token -> session
 const adminSessions = new Map();
 const streamSessions = new Map();
+// Shared Coursatk playback session cache: one upstream session per video for all students.
+const coursatkSessionByVideo = new Map();
+const coursatkPlayInflight = new Map();
+const coursatkRefreshInflight = new Map();
 
 // ── رسائل لحظية (SSE) — اتصال دائم زي واتساب ─────────────
 const msgSubs = new Map(); // key: studentCode|admin:code|admin:inbox -> Set<{res, role}>
@@ -1631,6 +1668,7 @@ async function upstreamHeaders(extra = {}) {
 }
 
 async function upstreamJsonRaw(apiPath, options = {}) {
+  serverMetrics.upstreamCalls++;
   const isGet = !options.method || String(options.method).toUpperCase() === "GET";
   const headers = await upstreamHeaders(options.headers || {});
   const r = await upstreamSlot(() =>
@@ -1639,23 +1677,34 @@ async function upstreamJsonRaw(apiPath, options = {}) {
   const text = await r.text();
   let data;
   try { data = JSON.parse(text); } catch {
+    serverMetrics.upstreamFailures++;
+    addServerIssue("coursatk_response", `Coursatk returned non-JSON (${r.status})`, { status: r.status });
     throw new Error(`Upstream non-JSON (${r.status})`);
   }
-  if (!r.ok) throw new Error(data?.message || `Upstream HTTP ${r.status}`);
+  if (!r.ok) {
+    serverMetrics.upstreamFailures++;
+    addServerIssue("coursatk_http", data?.message || `Coursatk HTTP ${r.status}`, { status: r.status });
+    throw new Error(data?.message || `Upstream HTTP ${r.status}`);
+  }
   return data;
 }
 
 // الردود دي واحدة لكل الطلاب (توكن واحد) → نخزّنها ونجيبها مرة واحدة بس، ولو السيرفر الأصلي وقع نرجّع آخر نسخة
 const upCache = new Map(); // path -> { data, exp, stale }
-const UP_STALE_MS = 30 * 60_000;
+const UP_CACHE_TTL_MS = 5 * 60 * 60_000; // 5 ساعات
+const UP_STALE_MS = 24 * 60 * 60_000; // نحتفظ بآخر نسخة حتى 24 ساعة عند تعطل كورساتك
 function upTtl(apiPath) {
-  return /\/lectures\/[^/]+\/content/.test(apiPath) ? 60_000 : 180_000;
+  // بيانات المواد والمدرسين والفصول والمحاضرات: طلب واحد كل 5 ساعات لكل مسار
+  return UP_CACHE_TTL_MS;
 }
 async function upstreamJson(apiPath, options = {}) {
   const isGet = !options.method || String(options.method).toUpperCase() === "GET";
   if (!isGet) return upstreamJsonRaw(apiPath, options);
   const hit = upCache.get(apiPath);
-  if (hit && Date.now() < hit.exp) return hit.data;
+  if (hit && Date.now() < hit.exp) {
+    serverMetrics.upstreamCacheHits++;
+    return hit.data;
+  }
   try {
     const data = await coalesce("up:" + apiPath, () => upstreamJsonRaw(apiPath, options));
     const t = Date.now();
@@ -1664,6 +1713,7 @@ async function upstreamJson(apiPath, options = {}) {
   } catch (e) {
     if (hit && Date.now() < hit.stale) {
       console.warn("[upstream] served stale:", apiPath, e.message);
+      addServerIssue("coursatk_stale_cache", `تم تقديم نسخة مخزنة بسبب تعطل كورساتك: ${apiPath}`);
       return hit.data;
     }
     throw e;
@@ -2067,7 +2117,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
         upstreamJson(`/user/subjects/${encodeURIComponent(yearId)}`)
       );
       yearList = Array.isArray(yearData.data) ? yearData.data : [];
-      cacheSet(cacheKey, yearList, 15 * 60_000);
+      cacheSet(cacheKey, yearList, 5 * 60 * 60_000);
     }
     const byId = new Map(yearList.map((s) => [Number(s.id), s]));
 
@@ -2093,7 +2143,7 @@ app.get("/api/subjects/:id", requireStudent, async (req, res) => {
           year_id: yearId,
           is_published: true
         };
-        cacheSet(ck, item, 20 * 60_000);
+        cacheSet(ck, item, 5 * 60 * 60_000);
         return item;
       } catch (err) {
         console.warn(`[subjects] resolve ${sid}:`, err.message);
@@ -2213,10 +2263,9 @@ app.get("/api/lectures/:id/content", requireStudent, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 // STREAM (student token) — decrypted segments
-// v1.1: مصدر الفيديو (play + playlist + مفتاح التشفير) بيتجهز مرة واحدة لكل فيديو ويتشارك بين كل الطلاب،
-//       والمقاطع المفكوكة بتتخزن في الرامات — 100 طالب على نفس الفيديو = طلب واحد للسيرفر الأصلي.
+// كاش مصادر مسار ثناويكا فقط؛ جلسات تشغيل كورساتك لا تُشارك بين الطلاب.
 // ═══════════════════════════════════════════════════════════
-const SOURCE_TTL_MS = Number(process.env.SOURCE_TTL_MS || 15 * 60_000); // مدة إعادة استخدام المصدر لطلاب جدد
+const SOURCE_TTL_MS = Number(process.env.SOURCE_TTL_MS || 15 * 60_000); // مدة كاش مصدر ثناويكا
 const sourceCache = new Map(); // videoId -> { src, exp }
 const SID_TOKEN = "{{SID}}"; // مش موجود في base64url فمفيش تصادم
 
@@ -2741,43 +2790,24 @@ app.post("/api/play/:videoId", requireStudent, async (req, res) => {
     // ثناويكا ids → المسار القديم تحت
     const isThanawicaId = /^th[pvmy]_/i.test(videoId);
 
-    // كورساتك: مسار خفيف زي السيرفر الصغير (من غير buildPlaylist)
+    // كورساتك: جلسة مشتركة واحدة لكل فيديو. كل الطلاب يشاركون نفس sessionId
+    // ولا ننشئ جلسة upstream جديدة إلا عند عدم وجود جلسة صالحة/محفوظة.
     if (!isThanawicaId) {
       try {
-        const data = await upstreamJson(
-          "/video/" + encodeURIComponent(videoId) + "/stream-weave/play",
-          { method: "POST", headers: { Accept: "application/json" } }
-        );
-        if (data && data.success && data.data && data.data.token && data.data.stream_url) {
-          const id = crypto.randomUUID();
-          const hosts = new Set(CONFIG.STREAM_HOSTS);
-          try { hosts.add(new URL(data.data.stream_url).hostname); } catch {}
-          streamSessions.set(id, {
-            id,
-            kind: "coursatk-stream",
-            videoId: String(data.data.video_id || videoId),
-            token: data.data.token,
-            streamUrl: data.data.stream_url,
-            playId: videoId,
-            createdAt: now(),
-            lastUsed: now(),
-            plainKey: null,
-            defaultIv: null,
-            allowedHosts: hosts,
-            ownerCode: req.session.code
-          });
+        const shared = await getOrCreateSharedCoursatkSession(videoId);
+        if (shared) {
           return res.json({
             success: true,
             data: {
-              session: id,
-              video_id: data.data.video_id || videoId,
-              manifest_url: "/api/cplay/manifest/" + id,
-              play_url: "/api/cplay/manifest/" + id
+              session: shared.id,
+              video_id: shared.videoId || videoId,
+              manifest_url: "/api/cplay/manifest/" + shared.id,
+              play_url: "/api/cplay/manifest/" + shared.id
             }
           });
         }
       } catch (e) {
-        console.warn("[play] light coursatek failed, fallback:", e.message);
+        console.warn("[play] shared coursatk failed, fallback:", e.message);
         // fall through to getVideoSource (youtube/mp4/cdn)
       }
     }
@@ -2928,34 +2958,87 @@ function playlistBodyFromSession(session) {
 function getCoursatkStreamSession(id) {
   const s = streamSessions.get(id);
   if (!s || s.kind !== "coursatk-stream") return null;
-  const t = now();
-  if ((s.lastUsed && t - s.lastUsed > CONFIG.STREAM_IDLE_MS) ||
-      (s.createdAt && t - s.createdAt > CONFIG.STREAM_MAX_MS)) {
-    streamSessions.delete(id);
-    return null;
-  }
-  s.lastUsed = t;
+  // لا نحذف الجلسة لمجرد مرور وقت خمول؛ نحتفظ بها حتى يرفضها upstream.
+  s.lastUsed = now();
   return s;
+}
+
+async function getOrCreateSharedCoursatkSession(videoId) {
+  const key = String(videoId);
+  const cachedId = coursatkSessionByVideo.get(key);
+  const cached = cachedId && streamSessions.get(cachedId);
+  if (cached && cached.kind === "coursatk-stream") return cached;
+  if (coursatkPlayInflight.has(key)) return coursatkPlayInflight.get(key);
+
+  const pending = (async () => {
+    // Recheck after acquiring the in-process single-flight slot.
+    const againId = coursatkSessionByVideo.get(key);
+    const again = againId && streamSessions.get(againId);
+    if (again && again.kind === "coursatk-stream") return again;
+    const data = await upstreamJson(
+      "/video/" + encodeURIComponent(key) + "/stream-weave/play",
+      { method: "POST", headers: { Accept: "application/json" } }
+    );
+    const payload = data && data.data;
+    if (!data?.success || !payload?.token || !payload?.stream_url) {
+      throw new Error("كورساتك لم يرجع جلسة تشغيل صالحة");
+    }
+    const id = crypto.randomUUID();
+    const hosts = new Set(CONFIG.STREAM_HOSTS);
+    try { hosts.add(new URL(payload.stream_url).hostname); } catch {}
+    const session = {
+      id,
+      kind: "coursatk-stream",
+      videoId: String(payload.video_id || key),
+      token: payload.token,
+      streamUrl: payload.stream_url,
+      playId: key,
+      createdAt: now(),
+      lastUsed: now(),
+      lastTokenRefresh: now(),
+      plainKey: null,
+      defaultIv: null,
+      allowedHosts: hosts
+    };
+    streamSessions.set(id, session);
+    coursatkSessionByVideo.set(key, id);
+    serverMetrics.playbackSessionsCreated++;
+    return session;
+  })();
+  coursatkPlayInflight.set(key, pending);
+  try { return await pending; }
+  finally { if (coursatkPlayInflight.get(key) === pending) coursatkPlayInflight.delete(key); }
 }
 
 async function refreshCoursatkPlaySession(session) {
   if (!session || !session.playId) throw new Error("جلسة المصدر غير مكتملة");
-  const data = await upstreamJson(
-    "/video/" + encodeURIComponent(session.playId) + "/stream-weave/play",
-    { method: "POST", headers: { Accept: "application/json" } }
-  );
-  const payload = data && data.data;
-  if (!payload || !payload.token || !payload.stream_url) {
-    throw new Error("المصدر لم يرجع توكن تشغيل صالح");
-  }
-  session.token = payload.token;
-  session.streamUrl = payload.stream_url;
-  if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
-    session.allowedHosts = new Set(session.allowedHosts || []);
-  }
-  try { session.allowedHosts.add(new URL(payload.stream_url).hostname); } catch {}
-  session.lastTokenRefresh = now();
-  return session;
+  const key = String(session.playId);
+  if (coursatkRefreshInflight.has(key)) return coursatkRefreshInflight.get(key);
+  const pending = (async () => {
+    const data = await upstreamJson(
+      "/video/" + encodeURIComponent(session.playId) + "/stream-weave/play",
+      { method: "POST", headers: { Accept: "application/json" } }
+    );
+    const payload = data && data.data;
+    if (!payload || !payload.token || !payload.stream_url) {
+      throw new Error("المصدر لم يرجع توكن تشغيل صالح");
+    }
+    session.token = payload.token;
+    session.streamUrl = payload.stream_url;
+    session.videoId = String(payload.video_id || session.videoId || key);
+    if (!session.allowedHosts || typeof session.allowedHosts.add !== "function") {
+      session.allowedHosts = new Set(session.allowedHosts || []);
+    }
+    try { session.allowedHosts.add(new URL(payload.stream_url).hostname); } catch {}
+    session.lastTokenRefresh = now();
+    session.lastUsed = now();
+    serverMetrics.playbackSessionsRefreshed++;
+    // يظل نفس sessionId صالحًا لكل الطلاب بعد تبديل توكن المصدر.
+    return session;
+  })();
+  coursatkRefreshInflight.set(key, pending);
+  try { return await pending; }
+  finally { if (coursatkRefreshInflight.get(key) === pending) coursatkRefreshInflight.delete(key); }
 }
 
 async function rewriteCoursatkPlaylist(sessionId, session, text, baseUrl, res, clientHeaders, refreshAttempted = false) {
@@ -3040,8 +3123,7 @@ app.get("/api/cplay/manifest/:sessionId", requireStudent, async (req, res) => {
   try {
     const session = getCoursatkStreamSession(req.params.sessionId);
     if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية — افتح الفيديو من جديد");
-    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
-
+    // Coursatk session is intentionally shared by all authenticated students for this video.
     let master = await streamFetch(session, session.streamUrl, {}, req.headers);
     if ((master.status === 401 || master.status === 403 || master.status === 404) && session.playId) {
       try {
@@ -3082,7 +3164,7 @@ app.get("/api/cplay/segment/:sessionId/:encoded", requireStudent, async (req, re
   try {
     const session = getCoursatkStreamSession(req.params.sessionId);
     if (!session) return jsonError(res, 404, "جلسة التشغيل منتهية");
-    if (session.ownerCode !== req.session.code) return jsonError(res, 403, "جلسة ليست لك");
+    // Same shared upstream playback session is used by every authenticated student.
     if (!session.plainKey) return jsonError(res, 404, "مفتاح غير متاح — حدّث الصفحة");
 
     let meta;
@@ -3398,6 +3480,81 @@ app.get("/api/admin/me", requireAdmin(null), (req, res) => {
       permissions: req.admin.permissions || {},
       bootstrap: !!req.admin.bootstrap,
       isOwner: isOwnerName(req.admin.username)
+    }
+  });
+});
+
+// ── OWNER/admin dashboard: server health, cache and shared playback sessions ──
+app.get("/api/admin/server-stats", requireAdmin(null), (req, res) => {
+  const t = Date.now();
+  const mem = process.memoryUsage();
+  const playbackSessions = [];
+  for (const [videoId, sessionId] of coursatkSessionByVideo.entries()) {
+    const session = streamSessions.get(sessionId);
+    if (!session || session.kind !== "coursatk-stream") continue;
+    playbackSessions.push({
+      videoId: String(videoId),
+      sessionId: String(session.id),
+      createdAt: session.createdAt || null,
+      lastUsed: session.lastUsed || null,
+      lastRefresh: session.lastTokenRefresh || null,
+      ageSeconds: session.createdAt ? Math.max(0, Math.floor((t - session.createdAt) / 1000)) : null,
+      idleSeconds: session.lastUsed ? Math.max(0, Math.floor((t - session.lastUsed) / 1000)) : null,
+      refreshing: coursatkRefreshInflight.has(String(videoId))
+    });
+  }
+  playbackSessions.sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+  const catalogEntries = [...upCache.entries()].map(([key, value]) => ({
+    key: String(key).slice(0, 180),
+    expiresAt: value.exp,
+    staleUntil: value.stale,
+    fresh: t < value.exp,
+    staleAvailable: t < value.stale
+  }));
+  res.json({
+    success: true,
+    data: {
+      version: APP_VERSION,
+      status: serverMetrics.responses5xx === 0 ? "healthy" : "attention",
+      uptimeSeconds: Math.floor(process.uptime()),
+      startedAt: serverMetrics.startedAt,
+      now: t,
+      requests: {
+        total: serverMetrics.requests,
+        clientErrors4xx: serverMetrics.responses4xx,
+        serverErrors5xx: serverMetrics.responses5xx
+      },
+      coursatk: {
+        configured: Boolean(getCoursatkTokenSync()),
+        apiCalls: serverMetrics.upstreamCalls,
+        failures: serverMetrics.upstreamFailures,
+        catalogCacheHits: serverMetrics.upstreamCacheHits,
+        activeRequests: upstreamSlot.stats().active,
+        queuedRequests: upstreamSlot.stats().queued
+      },
+      sessions: {
+        sharedVideoCount: coursatkSessionByVideo.size,
+        activeStreamSessionCount: [...streamSessions.values()].filter(x => x && x.kind === "coursatk-stream").length,
+        creatingCount: coursatkPlayInflight.size,
+        refreshingCount: coursatkRefreshInflight.size,
+        createdSinceBoot: serverMetrics.playbackSessionsCreated,
+        refreshedSinceBoot: serverMetrics.playbackSessionsRefreshed,
+        items: playbackSessions.slice(0, 250)
+      },
+      caches: {
+        catalogEntries,
+        catalogCount: upCache.size,
+        sourceCount: sourceCache.size,
+        segmentCount: segCache.size,
+        segmentMB: Math.round(segCacheBytes / 1048576),
+        memory: {
+          rssMB: Math.round(mem.rss / 1048576),
+          heapUsedMB: Math.round(mem.heapUsed / 1048576),
+          heapTotalMB: Math.round(mem.heapTotal / 1048576),
+          externalMB: Math.round(mem.external / 1048576)
+        }
+      },
+      recentIssues: serverMetrics.recentIssues.slice(0, 20)
     }
   });
 });
