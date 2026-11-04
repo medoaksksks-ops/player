@@ -74,17 +74,10 @@ for (const m of ["get", "post", "put", "patch", "delete", "use"]) {
 const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || "1", 10);
 app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops >= 0 ? trustProxyHops : 1);
 
-// Credentialed CORS must use an explicit allowlist (never reflect arbitrary Origin).
-const allowedOrigins = new Set(
-  (process.env.CORS_ALLOWED_ORIGINS || "https://coursatk.online,https://www.coursatk.online,https://thanawya-club.vercel.app")
-    .split(",").map((x) => x.trim()).filter(Boolean)
-);
+// Public CORS: allow browser requests from any origin (without cookies/credentials).
 app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
-    return callback(null, false);
-  },
-  credentials: true,
+  origin: "*",
+  credentials: false,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 }));
 
